@@ -799,6 +799,7 @@ from hermes_cli.model_setup_flows import (
     _model_flow_xai_oauth,
     _model_flow_qwen_oauth,
     _model_flow_minimax_oauth,
+    _model_flow_google_gemini_cli,
     _model_flow_custom,
     _model_flow_azure_foundry,
     _model_flow_named_custom,
@@ -3926,6 +3927,8 @@ def select_provider_and_model(args=None):
         _model_flow_qwen_oauth(config, current_model)
     elif selected_provider == "minimax-oauth":
         _model_flow_minimax_oauth(config, current_model, args=args)
+    elif selected_provider == "google-gemini-cli":
+        _model_flow_google_gemini_cli(config, current_model)
     elif selected_provider == "copilot-acp":
         _model_flow_copilot_acp(config, current_model)
     elif selected_provider == "copilot":
