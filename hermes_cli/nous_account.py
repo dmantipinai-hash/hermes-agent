@@ -38,6 +38,7 @@ class NousPortalSubscriptionInfo:
     plan: Optional[str] = None
     tier: Optional[int] = None
     monthly_charge: Optional[float] = None
+    monthly_credits: Optional[float] = None
     current_period_end: Optional[str] = None
     credits_remaining: Optional[float] = None
     rollover_credits: Optional[float] = None
@@ -57,6 +58,10 @@ class NousPaidServiceAccessInfo:
     subscription_credits_remaining: Optional[float] = None
     purchased_credits_remaining: Optional[float] = None
     total_usable_credits: Optional[float] = None
+    member_spend_cap_exceeded: Optional[bool] = None
+    member_spend_cap_usd: Optional[float] = None
+    member_spend_usd: Optional[float] = None
+    member_spend_cap_remaining_usd: Optional[float] = None
 
 
 @dataclass(frozen=True)
@@ -79,6 +84,8 @@ class NousPortalAccountInfo:
     fresh: bool
     user_id: Optional[str] = None
     org_id: Optional[str] = None
+    org_slug: Optional[str] = None
+    org_name: Optional[str] = None
     client_id: Optional[str] = None
     product_id: Optional[str] = None
     nous_client: Optional[str] = None
@@ -137,6 +144,29 @@ def nous_portal_billing_url(account_info: Optional[NousPortalAccountInfo] = None
     if not isinstance(base, str) or not base.strip():
         base = DEFAULT_NOUS_PORTAL_URL
     return f"{base.rstrip('/')}/billing"
+
+
+def nous_portal_topup_url(account_info: Optional[NousPortalAccountInfo] = None) -> str:
+    """Return the portal top-up URL that auto-opens the top-up modal.
+
+    Prefers the org-pinned page ``{base}/orgs/{slug}/billing?topup=open`` (skips
+    the legacy shim's re-resolution + multi-org disambiguation). Falls back to the
+    legacy ``{base}/billing?topup=open`` when the account has no ``org_slug`` (the
+    portal's ``slug`` is nullable; the legacy page forwards the param through to
+    the org-pinned page). Never builds ``/orgs/None/billing``.
+
+    The ``?topup=open`` query is the NAS enabler that lands the user in the
+    top-up flow rather than just on the billing page.
+    """
+    base_billing = nous_portal_billing_url(account_info)  # {base}/billing
+    base = base_billing[: -len("/billing")]  # strip the trailing /billing
+
+    slug = getattr(account_info, "org_slug", None) if account_info is not None else None
+    if isinstance(slug, str) and slug.strip():
+        from urllib.parse import quote
+
+        return f"{base}/orgs/{quote(slug.strip(), safe='')}/billing?topup=open"
+    return f"{base}/billing?topup=open"
 
 
 def format_nous_portal_entitlement_message(
@@ -241,6 +271,23 @@ def _no_paid_access_message(
     total_usable = access.total_usable_credits if access else None
     subscription_credits = access.subscription_credits_remaining if access else None
     purchased_credits = access.purchased_credits_remaining if access else None
+
+    if access and access.member_spend_cap_exceeded:
+        cap = access.member_spend_cap_usd
+        spent = access.member_spend_usd
+        credit_detail = _credit_detail(total_usable, subscription_credits, purchased_credits)
+        cap_detail = ""
+        if cap is not None and spent is not None:
+            cap_detail = f" Your organisation's per-member spend cap is ${cap:.2f} and you've spent ${spent:.2f} of it."
+        elif cap is not None:
+            cap_detail = f" Your organisation's per-member spend cap is ${cap:.2f}."
+        return (
+            f"Your Nous Portal access is paused because you've exceeded the"
+            f" per-member spend cap set by your organisation.{cap_detail}"
+            f"{credit_detail} Ask your organisation admin to raise the"
+            f" member spend cap at {billing_url}, then run `hermes model`"
+            f" to refresh."
+        )
 
     if has_active_subscription and active_subscription_is_paid:
         credit_detail = _credit_detail(total_usable, subscription_credits, purchased_credits)
@@ -606,12 +653,10 @@ def _info_from_account_payload(
     state: dict[str, Any],
     portal_base_url: Optional[str],
 ) -> NousPortalAccountInfo:
-    user = payload.get("user") if isinstance(payload.get("user"), dict) else {}
-    organisation = (
-        payload.get("organisation")
-        if isinstance(payload.get("organisation"), dict)
-        else {}
-    )
+    raw_user = payload.get("user")
+    user: dict[str, Any] = raw_user if isinstance(raw_user, dict) else {}
+    raw_org = payload.get("organisation")
+    organisation: dict[str, Any] = raw_org if isinstance(raw_org, dict) else {}
     subscription = _subscription_from_payload(payload.get("subscription"))
     access = _paid_service_access_from_payload(payload.get("paid_service_access"))
     paid_access = access.allowed if access else None
@@ -623,6 +668,8 @@ def _info_from_account_payload(
         source="account_api",
         fresh=True,
         org_id=_coerce_str(organisation.get("id")) or (access.organisation_id if access else None),
+        org_slug=_coerce_str(organisation.get("slug")),
+        org_name=_coerce_str(organisation.get("name")),
         client_id=_coerce_str(state.get("client_id")),
         portal_base_url=portal_base_url,
         inference_base_url=_coerce_str(state.get("inference_base_url")),
@@ -662,6 +709,7 @@ def _subscription_from_payload(value: Any) -> Optional[NousPortalSubscriptionInf
         plan=_coerce_str(value.get("plan")),
         tier=_coerce_int(value.get("tier")),
         monthly_charge=_coerce_float(value.get("monthly_charge")),
+        monthly_credits=_coerce_float(value.get("monthly_credits")),
         current_period_end=_coerce_str(value.get("current_period_end")),
         credits_remaining=_coerce_float(value.get("credits_remaining")),
         rollover_credits=_coerce_float(value.get("rollover_credits")),
@@ -686,6 +734,10 @@ def _paid_service_access_from_payload(value: Any) -> Optional[NousPaidServiceAcc
         subscription_credits_remaining=_coerce_float(value.get("subscription_credits_remaining")),
         purchased_credits_remaining=_coerce_float(value.get("purchased_credits_remaining")),
         total_usable_credits=_coerce_float(value.get("total_usable_credits")),
+        member_spend_cap_exceeded=_coerce_bool(value.get("member_spend_cap_exceeded")),
+        member_spend_cap_usd=_coerce_float(value.get("member_spend_cap_usd")),
+        member_spend_usd=_coerce_float(value.get("member_spend_usd")),
+        member_spend_cap_remaining_usd=_coerce_float(value.get("member_spend_cap_remaining_usd")),
     )
 
 

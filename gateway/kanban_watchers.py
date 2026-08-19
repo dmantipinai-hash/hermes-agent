@@ -23,6 +23,44 @@ from typing import Any, Callable, Optional
 logger = logging.getLogger("gateway.run")
 
 
+def _wake_scope_id(adapter: Any, sub: dict) -> Optional[str]:
+    """Return the tenant scope (Slack workspace) a subscription's wake keys to.
+
+    ``build_session_key()`` includes ``SessionSource.scope_id`` on platforms
+    where one bot serves several isolated tenants, so a wake source must carry
+    the same scope as inbound messages from that chat to resolve to the same
+    session.
+
+    The subscription's persisted ``delivery_metadata`` wins over the adapter's
+    live chat → scope mapping, because it records the scope the subscription was
+    created from; the mapping only covers rows that stored no metadata. ``None``
+    means the chat has no scope, which is what an unscoped platform's key
+    contains.
+    """
+    delivery_meta = sub.get("delivery_metadata")
+    if isinstance(delivery_meta, dict):
+        for key in ("scope_id", "slack_team_id", "team_id"):
+            value = delivery_meta.get(key)
+            if value:
+                return str(value)
+    resolver = getattr(adapter, "scope_id_for_chat", None)
+    if callable(resolver):
+        try:
+            resolved = resolver(str(sub.get("chat_id") or ""))
+        except Exception as exc:
+            # An adapter-side lookup failure yields no scope, never an error.
+            logger.debug(
+                "kanban notifier: scope lookup failed for chat %s: %s",
+                sub.get("chat_id"),
+                exc,
+                exc_info=True,
+            )
+            return None
+        if resolved:
+            return str(resolved)
+    return None
+
+
 def _resolve_auto_decompose_settings(
     load_config: Callable[[], Any],
 ) -> "tuple[bool, int]":
@@ -54,6 +92,22 @@ def _resolve_auto_decompose_settings(
         per_tick = 1
     return enabled, per_tick
 
+
+
+def _kanban_dispatch_allowed() -> bool:
+    """Return False while the global emergency stop (`hermes pause`) is engaged.
+
+    Checked every dispatcher tick BEFORE spawning new workers so a pause takes
+    effect on the next tick without a gateway restart. In-flight workers are
+    never touched — this only stops NEW spawns. Fails open: if the estop
+    module is unimportable, dispatch proceeds (the sentinel gate must not
+    become a new crash surface for the dispatcher).
+    """
+    try:
+        from agent.estop import check_paused
+    except ImportError:
+        return True
+    return not check_paused("kanban", logger)
 
 def _acquire_singleton_lock(lock_path) -> "tuple[Optional[object], str]":
     """Take an exclusive, non-blocking advisory lock for the sole dispatcher.
@@ -781,6 +835,20 @@ class GatewayKanbanWatchersMixin:
                         max_in_progress = None
                     else:
                         logger.info(f"kanban dispatcher: max_in_progress={max_in_progress}")
+            # When the operator never set kanban.max_in_progress, fall back to a
+            # memory-derived default (OOF-30/OOF-77): unbounded fan-out on small
+            # hosted VMs has repeatedly swap-thrashed the whole machine. Explicit
+            # config always wins; None stays None on hosts where total memory
+            # can't be read (macOS/Windows dev machines).
+            effective_max_in_progress = _kb.resolve_max_in_progress(max_in_progress)
+            if max_in_progress is None and effective_max_in_progress is not None:
+                logger.info(
+                    "kanban dispatcher: kanban.max_in_progress unset; using "
+                    "memory-derived default max_in_progress=%d "
+                    "(set kanban.max_in_progress in config.yaml to override)",
+                    effective_max_in_progress,
+                )
+            max_in_progress = effective_max_in_progress
 
             raw_failure_limit = kanban_cfg.get("failure_limit", _kb.DEFAULT_FAILURE_LIMIT)
             try:

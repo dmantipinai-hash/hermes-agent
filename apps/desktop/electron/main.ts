@@ -65,6 +65,28 @@ import {
   savedProfileSsh,
   tokenPreview
 } from './connection-config'
+import {
+  backendScopeKey,
+  backendScopePrefix,
+  buildAgentRoster,
+  connectionDialFieldsChanged,
+  mergeConnectionInput,
+  migrateV1ToRegistry,
+  normalizeConnectionInput,
+  normalizeRegistry,
+  rememberSshEnumeration,
+  removeConnection,
+  resolvedConnectionId,
+  resolveRegistryLocalRoute,
+  setConnectionLaunchMode,
+  setLastUsedConnection,
+  setPrimaryConnection,
+  shouldDeferLocalEnumeration,
+  shouldRetrySshInventory,
+  updateEligibility,
+  upsertConnection
+} from './connection-registry'
+import { describeCrashReason, installCrashForensics } from './crash-forensics'
 import { adoptServedDashboardToken } from './dashboard-token'
 import { loadOrCreateInstallationId, sshOwnershipId } from './desktop-installation'
 import {
@@ -6739,18 +6761,43 @@ async function bootstrapSshConnectionInner(profile, sshConfig, reuseToken, sourc
 
   persistSshConnectionToken(profile, source, result.token)
 
-  removeForceCleanup()
-  sshConnections.set(scope, {
-    ssh,
-    fingerprint,
-    localPort: result.localPort,
-    remotePort: result.remotePort,
-    pid: result.pid,
-    host: sshConfig.host,
-    hostLabel,
-    hermesVersion: result.hermesVersion || '',
-    remotePlatform: result.platform?.os || '',
-    reused: result.reused
+  try {
+    secureTokenStorage = Boolean(safeStorage.isEncryptionAvailable())
+  } catch {
+    secureTokenStorage = false
+  }
+
+  return {
+    version: registry.version,
+    primary: registry.primary,
+    launchMode: registry.launchMode,
+    lastUsed: registry.lastUsed,
+    secureTokenStorage,
+    connections: registry.connections.map(sanitizeRegistryConnection)
+  }
+}
+
+/**
+ * Save (create or edit) a registry connection from a renderer payload.
+ * Edits merge over the stored entry (mergeConnectionInput) so fields the
+ * editor doesn't carry — cloud `org`, ssh `remoteHermesPath`/`remoteProfile` —
+ * survive a rename. Token handling mirrors coerceDesktopConnectionConfig: an
+ * incoming plaintext token is encrypted (honoring the same allowPlainTextToken
+ * opt-in seam as Settings → Gateway); an absent token field inherits the
+ * stored envelope on edit; switching auth away from 'token' clears it
+ * (normalizeConnectionInput drops tokens on non-token entries).
+ */
+async function saveRegistryConnection(input: any = {}) {
+  const registry = readDesktopConnectionsRegistry()
+  const existing = input.id ? registry.connections.find(c => c.id === input.id) : null
+  const incomingToken = typeof input.token === 'string' ? input.token.trim() : ''
+
+  const token = resolvePersistedRemoteToken({
+    incomingToken,
+    persistToken: true,
+    existingToken: existing?.token,
+    allowPlainText: input.allowPlainTextToken,
+    encryptSecret: encryptDesktopSecret
   })
 
   sshRememberLog(
@@ -8279,7 +8326,23 @@ function createWindow() {
     }
   })
 
-  wireCommonWindowHandlers(mainWindow, zoomWiringForWindowKind('chat'))
+  return { ok: true, registry: sanitizeConnectionsRegistry(registry) }
+})
+ipcMain.handle('hermes:connections:set-launch-mode', async (_event, mode) => {
+  const registry = setConnectionLaunchMode(readDesktopConnectionsRegistry(), String(mode || ''))
+  writeDesktopConnectionsRegistry(registry)
+
+  return { ok: true, registry: sanitizeConnectionsRegistry(registry) }
+})
+ipcMain.handle('hermes:connections:set-last-used', async (_event, id) => {
+  const registry = setLastUsedConnection(readDesktopConnectionsRegistry(), String(id || ''))
+  writeDesktopConnectionsRegistry(registry)
+
+  return { ok: true, registry: sanitizeConnectionsRegistry(registry) }
+})
+ipcMain.handle('hermes:connections:test', async (_event, id) => {
+  const registry = readDesktopConnectionsRegistry()
+  const entry = registry.connections.find(c => c.id === String(id || ''))
 
   mainWindow.webContents.on('render-process-gone', (_event, details) => {
     rememberLog(`[renderer] render-process-gone reason=${details?.reason} exitCode=${details?.exitCode}`)

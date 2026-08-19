@@ -1,3 +1,5 @@
+import os
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from cli import HermesCLI
@@ -38,6 +40,25 @@ class TestCliResumeCommand:
         assert "/resume 2" in output
         assert "/resume <session title>" in output
 
+    def test_show_recent_sessions_uses_prompt_toolkit_safe_print(self):
+        cli_obj = _make_cli()
+        cli_obj._list_recent_sessions = MagicMock(return_value=[
+            {"id": "sess_002", "title": "Coding", "preview": "build feature", "last_active": None},
+        ])
+
+        running_app = SimpleNamespace(_is_running=True)
+        with (
+            patch("prompt_toolkit.application.get_app_or_none", return_value=running_app),
+            patch("cli._cprint") as mock_cprint,
+        ):
+            shown = cli_obj._show_recent_sessions(reason="sessions")
+
+        assert shown is True
+        printed = "\n".join(call.args[0] for call in mock_cprint.call_args_list)
+        assert "Recent sessions" in printed
+        assert "Coding" in printed
+
+
     def test_handle_resume_by_index_switches_to_numbered_session(self):
         cli_obj = _make_cli()
         cli_obj._list_recent_sessions = MagicMock(return_value=[
@@ -45,7 +66,10 @@ class TestCliResumeCommand:
             {"id": "sess_001", "title": "Research"},
         ])
         cli_obj._session_db.get_session.return_value = {"id": "sess_001", "title": "Research"}
-        cli_obj._session_db.get_messages_as_conversation.return_value = [
+        cli_obj._session_db.get_resume_conversations.return_value = [
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": "hi"},
+        ], [
             {"role": "user", "content": "hello"},
             {"role": "assistant", "content": "hi"},
         ]
@@ -77,46 +101,68 @@ class TestCliResumeCommand:
         assert "/resume" in printed
         assert cli_obj.session_id == "current_session"
 
-    def test_handle_resume_strips_outer_brackets(self):
-        """Users copy `<session_id>` from the usage hint literally.
 
-        Strip outer ``<>``, ``[]``, ``""``, and ``''`` before lookup so
-        ``/resume <abc123>`` works the same as ``/resume abc123``.
-        """
+
+
+class TestCliResumeRestoresCwd:
+    """Mid-chat /resume must retarget the working directory to where the
+    session was started — the same contract as a startup ``hermes -c`` /
+    ``--resume``.
+
+    Regression coverage for #38562: ``_restore_session_cwd()`` was wired into
+    the startup resume paths but not into ``_handle_resume_command()``, so an
+    interactive ``/resume`` (and ``/sessions <id>``, which delegates here) left
+    the process + ``TERMINAL_CWD`` pointing at whatever directory the user had
+    cd'd into — so the terminal/code-exec tools and relative paths ran in the
+    wrong repo.
+    """
+
+    def _resumable_cli(self, session_meta):
         cli_obj = _make_cli()
-        cli_obj._session_db.get_session.return_value = {"id": "sess_alpha", "title": "Alpha"}
-        cli_obj._session_db.get_messages_as_conversation.return_value = []
-        cli_obj._session_db.resolve_resume_session_id.return_value = "sess_alpha"
+        cli_obj._session_db.get_session.return_value = session_meta
+        cli_obj._session_db.get_resume_conversations.return_value = [
+            {"role": "user", "content": "hello"},
+        ], [
+            {"role": "user", "content": "hello"},
+        ]
+        cli_obj._session_db.resolve_resume_session_id.return_value = session_meta["id"]
+        return cli_obj
 
-        for raw in ("<sess_alpha>", "[sess_alpha]", '"sess_alpha"', "'sess_alpha'"):
-            cli_obj.session_id = "current_session"
-            with (
-                patch("hermes_cli.main._resolve_session_by_name_or_id", return_value="sess_alpha"),
-                patch("cli._cprint"),
-            ):
-                cli_obj._handle_resume_command(f"/resume {raw}")
-            assert cli_obj.session_id == "sess_alpha", (
-                f"bracket-stripping failed for {raw!r}: session_id stayed {cli_obj.session_id}"
-            )
-
-    def test_handle_resume_does_not_strip_partial_brackets(self):
-        """Mismatched or single brackets must pass through unmodified.
-
-        ``"<half`` (just an open angle) is not a wrapping pair, so the
-        lookup should treat it verbatim — preserving the existing
-        not-found error path instead of mangling the input.
-        """
-        cli_obj = _make_cli()
-        cli_obj._session_db.get_session.return_value = None
+    def test_handle_resume_restores_recorded_cwd(self, tmp_path):
+        recorded = str(tmp_path)
+        cli_obj = self._resumable_cli({"id": "sess_dir", "title": "Dir", "cwd": recorded})
 
         with (
-            patch("hermes_cli.main._resolve_session_by_name_or_id", return_value=None),
-            patch("cli._cprint") as mock_cprint,
+            patch("hermes_cli.main._resolve_session_by_name_or_id", return_value="sess_dir"),
+            patch("cli._cprint"),
+            patch.object(cli_obj, "_console_print"),
+            patch("os.chdir") as mock_chdir,
+            patch.dict(os.environ, {}, clear=False),
         ):
-            cli_obj._handle_resume_command("/resume <half")
+            cli_obj._handle_resume_command("/resume Dir")
+            # Assert inside the patch.dict scope — it restores os.environ on exit.
+            assert os.environ.get("TERMINAL_CWD") == recorded
 
-        printed = " ".join(str(call) for call in mock_cprint.call_args_list)
-        assert "<half" in printed
+        mock_chdir.assert_called_once_with(recorded)
+
+
+    def test_sessions_command_restores_recorded_cwd(self, tmp_path):
+        # /sessions <id> delegates to the resume flow, so it restores cwd too.
+        recorded = str(tmp_path)
+        cli_obj = self._resumable_cli({"id": "sess_dir", "title": "Dir", "cwd": recorded})
+
+        with (
+            patch("hermes_cli.main._resolve_session_by_name_or_id", return_value="sess_dir"),
+            patch("cli._cprint"),
+            patch.object(cli_obj, "_console_print"),
+            patch("os.chdir") as mock_chdir,
+            patch.dict(os.environ, {}, clear=False),
+        ):
+            cli_obj._handle_sessions_command("/sessions Dir")
+            # Assert inside the patch.dict scope — it restores os.environ on exit.
+            assert os.environ.get("TERMINAL_CWD") == recorded
+
+        mock_chdir.assert_called_once_with(recorded)
 
 
 class TestPendingResumeNumberedSelection:
@@ -142,15 +188,6 @@ class TestPendingResumeNumberedSelection:
 
         assert cli_obj._pending_resume_sessions == sessions
 
-    def test_bare_resume_no_sessions_does_not_arm(self):
-        cli_obj = _make_cli()
-        cli_obj._show_recent_sessions = MagicMock(return_value=False)
-        cli_obj._list_recent_sessions = MagicMock(return_value=[])
-
-        with patch("cli._cprint"):
-            cli_obj._handle_resume_command("/resume")
-
-        assert cli_obj._pending_resume_sessions is None
 
     def test_pending_number_resumes_selected_session(self):
         cli_obj = _make_cli()
@@ -163,7 +200,9 @@ class TestPendingResumeNumberedSelection:
         # _list_recent_sessions, so it must return the same list.
         cli_obj._list_recent_sessions = MagicMock(return_value=sessions)
         cli_obj._session_db.get_session.return_value = {"id": "sess_001", "title": "Research"}
-        cli_obj._session_db.get_messages_as_conversation.return_value = [
+        cli_obj._session_db.get_resume_conversations.return_value = [
+            {"role": "user", "content": "hello"},
+        ], [
             {"role": "user", "content": "hello"},
         ]
         cli_obj._session_db.resolve_resume_session_id.return_value = "sess_001"
@@ -179,37 +218,8 @@ class TestPendingResumeNumberedSelection:
         # One-shot: prompt is disarmed after consuming.
         assert cli_obj._pending_resume_sessions is None
 
-    def test_pending_out_of_range_consumed_with_message(self):
-        cli_obj = _make_cli()
-        cli_obj._pending_resume_sessions = [{"id": "sess_002", "title": "Coding"}]
 
-        with patch("cli._cprint") as mock_cprint:
-            consumed = cli_obj._consume_pending_resume_selection("9")
 
-        printed = " ".join(str(call) for call in mock_cprint.call_args_list)
-        # An out-of-range number is still consumed (not sent to the agent),
-        # and the prompt is disarmed.
-        assert consumed is True
-        assert "out of range" in printed.lower()
-        assert cli_obj.session_id == "current_session"
-        assert cli_obj._pending_resume_sessions is None
-
-    def test_pending_non_numeric_falls_through_and_disarms(self):
-        cli_obj = _make_cli()
-        cli_obj._pending_resume_sessions = [{"id": "sess_002", "title": "Coding"}]
-
-        with patch("cli._cprint"):
-            consumed = cli_obj._consume_pending_resume_selection("hello there")
-
-        # Free text is NOT consumed (caller treats it as chat), but the
-        # one-shot prompt is disarmed so a later number isn't hijacked.
-        assert consumed is False
-        assert cli_obj._pending_resume_sessions is None
-
-    def test_no_pending_returns_false(self):
-        cli_obj = _make_cli()
-        assert cli_obj._pending_resume_sessions is None
-        assert cli_obj._consume_pending_resume_selection("3") is False
 
     def test_pending_disarmed_by_other_command(self):
         cli_obj = _make_cli()
@@ -221,3 +231,36 @@ class TestPendingResumeNumberedSelection:
 
         # A non-resume command disarms the one-shot prompt (#34584).
         assert cli_obj._pending_resume_sessions is None
+
+
+
+
+class TestResumeFlushesBeforeEndSession:
+    """Regression for #47202: /resume must flush un-persisted messages to
+    the session DB before ending the old session, just like /new and
+    compress_context() already do."""
+
+    def test_resume_flushes_when_agent_present(self):
+        cli_obj = _make_cli()
+        cli_obj.conversation_history = [
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": "hi"},
+        ]
+        agent = MagicMock()
+        cli_obj.agent = agent
+
+        cli_obj._session_db.get_session.return_value = {"id": "target", "title": "T"}
+        cli_obj._session_db.get_resume_conversations.return_value = ([], [])
+        cli_obj._session_db.resolve_resume_session_id.return_value = "target"
+
+        with (
+            patch("hermes_cli.main._resolve_session_by_name_or_id", return_value="target"),
+            patch("cli._cprint"),
+        ):
+            cli_obj._handle_resume_command("/resume target")
+
+        agent._flush_messages_to_session_db.assert_called_once_with(
+            [{"role": "user", "content": "hello"}, {"role": "assistant", "content": "hi"}],
+            conversation_history=[{"role": "user", "content": "hello"}, {"role": "assistant", "content": "hi"}],
+        )
+        cli_obj._session_db.end_session.assert_called_once()

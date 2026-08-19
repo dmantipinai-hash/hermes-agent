@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "updated_at": "2026-06-01T08:20:18Z",
+  "updated_at": "2026-08-17T19:11:38Z",
   "metadata": {
     "source": "hermes-agent repo",
     "docs": "https://hermes-agent.nousresearch.com/docs/reference/model-catalog"
@@ -9,9 +9,21 @@
     "openrouter": {
       "metadata": {
         "display_name": "OpenRouter",
-        "note": "Descriptions drive picker badges. Live /api/v1/models filters curated ids by tool-calling support and free pricing."
+        "note": "Descriptions drive picker badges. Live /api/v1/models filters curated ids by tool-calling support and free pricing. The entry labeled \"default\": true is the model Hermes silently lands on when the user never picked one."
       },
       "models": [
+        {
+          "id": "anthropic/claude-fable-5",
+          "description": ""
+        },
+        {
+          "id": "anthropic/claude-opus-5",
+          "description": ""
+        },
+        {
+          "id": "anthropic/claude-opus-5-fast",
+          "description": "2x price, higher output speed"
+        },
         {
           "id": "anthropic/claude-opus-4.8",
           "description": ""
@@ -21,11 +33,35 @@
           "description": "2x price, higher output speed"
         },
         {
-          "id": "anthropic/claude-sonnet-4.6",
+          "id": "anthropic/claude-sonnet-5",
           "description": ""
         },
         {
           "id": "anthropic/claude-haiku-4.5",
+          "description": ""
+        },
+        {
+          "id": "openai/gpt-5.6-sol",
+          "description": ""
+        },
+        {
+          "id": "openai/gpt-5.6-sol-pro",
+          "description": ""
+        },
+        {
+          "id": "openai/gpt-5.6-terra",
+          "description": ""
+        },
+        {
+          "id": "openai/gpt-5.6-terra-pro",
+          "description": ""
+        },
+        {
+          "id": "openai/gpt-5.6-luna",
+          "description": ""
+        },
+        {
+          "id": "openai/gpt-5.6-luna-pro",
           "description": ""
         },
         {
@@ -41,19 +77,15 @@
           "description": ""
         },
         {
-          "id": "google/gemini-3-pro-preview",
-          "description": ""
-        },
-        {
           "id": "google/gemini-3.1-pro-preview",
           "description": ""
         },
         {
-          "id": "google/gemini-3.5-flash",
+          "id": "google/gemini-3.7-flash",
           "description": ""
         },
         {
-          "id": "x-ai/grok-4.3",
+          "id": "x-ai/grok-4.6",
           "description": ""
         },
         {
@@ -61,24 +93,33 @@
           "description": ""
         },
         {
+          "id": "deepseek/deepseek-v4-pro-0813",
+          "description": "dated snapshot of v4-pro"
+        },
+        {
           "id": "deepseek/deepseek-v4-flash",
           "description": ""
         },
         {
-          "id": "qwen/qwen3.7-max",
+          "id": "deepseek/deepseek-v4-flash-0731",
+          "description": "dated snapshot of v4-flash"
+        },
+        {
+          "id": "qwen/qwen3.8-max",
           "description": ""
         },
         {
-          "id": "qwen/qwen3.6-35b-a3b",
-          "description": ""
-        },
-        {
-          "id": "moonshotai/kimi-k2.6",
+          "id": "moonshotai/kimi-k3",
           "description": "recommended"
         },
         {
           "id": "minimax/minimax-m3",
           "description": ""
+        },
+        {
+          "id": "z-ai/glm-5.2",
+          "description": "default",
+          "default": true
         },
         {
           "id": "z-ai/glm-5.1",
@@ -89,7 +130,7 @@
           "description": ""
         },
         {
-          "id": "tencent/hy3-preview",
+          "id": "tencent/hy3",
           "description": ""
         },
         {
@@ -101,6 +142,14 @@
           "description": ""
         },
         {
+          "id": "meta/muse-spark-1.2",
+          "description": ""
+        },
+        {
+          "id": "sakana/fugu-ultra",
+          "description": ""
+        },
+        {
           "id": "openrouter/pareto-code",
           "description": "auto-routes to cheapest coder meeting openrouter.min_coding_score"
         },
@@ -109,15 +158,19 @@
           "description": "free"
         },
         {
-          "id": "openrouter/owl-alpha",
+          "id": "poolside/laguna-m.1:free",
           "description": "free"
         },
         {
-          "id": "tencent/hy3-preview:free",
+          "id": "tencent/hy3:free",
           "description": "free"
         },
         {
           "id": "nvidia/nemotron-3-super-120b-a12b:free",
+          "description": "free"
+        },
+        {
+          "id": "nvidia/nemotron-3-ultra-550b-a55b:free",
           "description": "free"
         },
         {
@@ -129,17 +182,41 @@
     "nous": {
       "metadata": {
         "display_name": "Nous Portal",
-        "note": "Free-tier gating is determined live via Portal pricing (partition_nous_models_by_tier), not this manifest."
+        "note": "Free-tier gating is determined live via Portal pricing (partition_nous_models_by_tier), not this manifest. The entry labeled \"default\": true is the model Hermes silently lands on when the user never picked one."
       },
       "models": [
+        {
+          "id": "anthropic/claude-fable-5"
+        },
+        {
+          "id": "anthropic/claude-opus-5"
+        },
         {
           "id": "anthropic/claude-opus-4.8"
         },
         {
-          "id": "anthropic/claude-sonnet-4.6"
+          "id": "anthropic/claude-sonnet-5"
         },
         {
           "id": "anthropic/claude-haiku-4.5"
+        },
+        {
+          "id": "openai/gpt-5.6-sol"
+        },
+        {
+          "id": "openai/gpt-5.6-sol-pro"
+        },
+        {
+          "id": "openai/gpt-5.6-terra"
+        },
+        {
+          "id": "openai/gpt-5.6-terra-pro"
+        },
+        {
+          "id": "openai/gpt-5.6-luna"
+        },
+        {
+          "id": "openai/gpt-5.6-luna-pro"
         },
         {
           "id": "openai/gpt-5.5"
@@ -151,34 +228,38 @@
           "id": "openai/gpt-5.4-mini"
         },
         {
-          "id": "google/gemini-3-pro-preview"
-        },
-        {
           "id": "google/gemini-3.1-pro-preview"
         },
         {
-          "id": "google/gemini-3.5-flash"
+          "id": "google/gemini-3.7-flash"
         },
         {
-          "id": "x-ai/grok-4.3"
+          "id": "x-ai/grok-4.6"
         },
         {
           "id": "deepseek/deepseek-v4-pro"
         },
         {
+          "id": "deepseek/deepseek-v4-pro-0813"
+        },
+        {
           "id": "deepseek/deepseek-v4-flash"
         },
         {
-          "id": "qwen/qwen3.7-max"
+          "id": "deepseek/deepseek-v4-flash-0731"
         },
         {
-          "id": "qwen/qwen3.6-35b-a3b"
+          "id": "qwen/qwen3.8-max"
         },
         {
-          "id": "moonshotai/kimi-k2.6"
+          "id": "moonshotai/kimi-k3"
         },
         {
           "id": "minimax/minimax-m3"
+        },
+        {
+          "id": "z-ai/glm-5.2",
+          "default": true
         },
         {
           "id": "z-ai/glm-5.1"
@@ -187,13 +268,16 @@
           "id": "xiaomi/mimo-v2.5-pro"
         },
         {
-          "id": "tencent/hy3-preview"
+          "id": "tencent/hy3"
         },
         {
           "id": "stepfun/step-3.7-flash"
         },
         {
           "id": "nvidia/nemotron-3-super-120b-a12b"
+        },
+        {
+          "id": "sakana/fugu-ultra"
         }
       ]
     }

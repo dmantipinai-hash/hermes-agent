@@ -56,7 +56,7 @@ except ImportError:  # pragma: no cover - dependency gate
     CRYPTO_AVAILABLE = False
 
 from gateway.config import Platform, PlatformConfig
-from gateway.platforms.helpers import MessageDeduplicator
+from gateway.platforms.helpers import MessageDeduplicator, greedy_pack_blocks
 from gateway.platforms.base import (
     BasePlatformAdapter,
     MessageEvent,
@@ -68,6 +68,25 @@ from gateway.platforms.base import (
 )
 from hermes_constants import get_hermes_home
 from utils import atomic_json_write
+from agent.secret_scope import UnscopedSecretError, get_secret
+
+
+def _wx_secret(name: str, default: Optional[str] = None) -> Optional[str]:
+    """Scope-aware WEIXIN_* read with the default-profile startup fallback.
+
+    Secondary profiles construct their adapters under
+    ``_profile_runtime_scope`` — the scope is authoritative and a scoped miss
+    returns ``default`` (no cross-profile borrow from ``os.environ``). The
+    DEFAULT profile's adapter constructs and sends *unscoped* under
+    multiplexing, where a bare ``get_secret`` would raise
+    ``UnscopedSecretError`` and crash its Weixin path; there ``os.environ`` is
+    that profile's own value, so fall back to it. Same pattern as the Slack
+    ``SLACK_APP_TOKEN`` read (#59739) and WhatsApp's ``_get_wsecret``.
+    """
+    try:
+        return get_secret(name, default)
+    except UnscopedSecretError:
+        return os.getenv(name, default)
 
 ILINK_BASE_URL = "https://ilinkai.weixin.qq.com"
 WEIXIN_CDN_BASE_URL = "https://novac2c.cdn.weixin.qq.com/c2c"
@@ -123,6 +142,12 @@ def _make_ssl_connector() -> Optional["aiohttp.TCPConnector"]:
     When ``certifi`` is installed, use its Mozilla CA bundle to guarantee
     verification. Otherwise fall back to aiohttp's default (which honors
     ``SSL_CERT_FILE`` env var via ``trust_env=True``).
+
+    Uses a tight ``keepalive_timeout=2`` (default aiohttp: 30s) so idle
+    connections drain promptly behind proxies like Cloudflare Warp that
+    leave peer-initiated FIN in ``CLOSE_WAIT`` (same class as #18451).
+    ``enable_cleanup_closed=True`` helps the connector clean up sockets
+    that the remote side has already closed.
     """
     try:
         import ssl
@@ -132,7 +157,12 @@ def _make_ssl_connector() -> Optional["aiohttp.TCPConnector"]:
     if not AIOHTTP_AVAILABLE:
         return None
     ssl_ctx = ssl.create_default_context(cafile=certifi.where())
-    return aiohttp.TCPConnector(ssl=ssl_ctx)
+    return aiohttp.TCPConnector(
+        ssl=ssl_ctx,
+        # Tighter keepalive so idle CLOSE_WAIT drains promptly (#18451, #69089).
+        keepalive_timeout=2,
+        enable_cleanup_closed=True,
+    )
 
 ITEM_TEXT = 1
 ITEM_IMAGE = 2
@@ -378,12 +408,16 @@ async def _api_post(
 ) -> Dict[str, Any]:
     body = _json_dumps({**payload, "base_info": _base_info()})
     url = f"{base_url.rstrip('/')}/{endpoint}"
-    timeout = aiohttp.ClientTimeout(total=timeout_ms / 1000)
-    async with session.post(url, data=body, headers=_headers(token, body), timeout=timeout) as response:
-        raw = await response.text()
-        if not response.ok:
-            raise RuntimeError(f"iLink POST {endpoint} HTTP {response.status}: {raw[:200]}")
-        return json.loads(raw)
+    # Use asyncio.wait_for() instead of aiohttp ClientTimeout to avoid
+    # "Timeout context manager should be used inside a task" errors when
+    # invoked via asyncio.run_coroutine_threadsafe() from cron jobs.
+    async def _do() -> Dict[str, Any]:
+        async with session.post(url, data=body, headers=_headers(token, body)) as response:
+            raw = await response.text()
+            if not response.ok:
+                raise RuntimeError(f"iLink POST {endpoint} HTTP {response.status}: {raw[:200]}")
+            return json.loads(raw)
+    return await asyncio.wait_for(_do(), timeout=timeout_ms / 1000)
 
 
 async def _api_get(
@@ -398,12 +432,16 @@ async def _api_get(
         "iLink-App-Id": ILINK_APP_ID,
         "iLink-App-ClientVersion": str(ILINK_APP_CLIENT_VERSION),
     }
-    timeout = aiohttp.ClientTimeout(total=timeout_ms / 1000)
-    async with session.get(url, headers=headers, timeout=timeout) as response:
-        raw = await response.text()
-        if not response.ok:
-            raise RuntimeError(f"iLink GET {endpoint} HTTP {response.status}: {raw[:200]}")
-        return json.loads(raw)
+    # Use asyncio.wait_for() instead of aiohttp ClientTimeout to avoid
+    # "Timeout context manager should be used inside a task" errors when
+    # invoked via asyncio.run_coroutine_threadsafe() from cron jobs.
+    async def _do() -> Dict[str, Any]:
+        async with session.get(url, headers=headers) as response:
+            raw = await response.text()
+            if not response.ok:
+                raise RuntimeError(f"iLink GET {endpoint} HTTP {response.status}: {raw[:200]}")
+            return json.loads(raw)
+    return await asyncio.wait_for(_do(), timeout=timeout_ms / 1000)
 
 
 async def _get_updates(
@@ -650,12 +688,10 @@ def _mime_from_filename(filename: str) -> str:
 
 
 def _split_table_row(line: str) -> List[str]:
-    row = line.strip()
-    if row.startswith("|"):
-        row = row[1:]
-    if row.endswith("|"):
-        row = row[:-1]
-    return [cell.strip() for cell in row.split("|")]
+    """Delegate to the canonical table-row splitter in agent.markdown_tables."""
+    from agent.markdown_tables import split_table_row
+
+    return split_table_row(line)
 
 
 def _normalize_markdown_blocks(content: str) -> str:
@@ -848,24 +884,14 @@ def _should_split_short_chat_block_for_weixin(block: str) -> bool:
 def _pack_markdown_blocks_for_weixin(content: str, max_length: int) -> List[str]:
     if len(content) <= max_length:
         return [content]
-
-    packed: List[str] = []
-    current = ""
-    for block in _split_markdown_blocks(content):
-        candidate = block if not current else f"{current}\n\n{block}"
-        if len(candidate) <= max_length:
-            current = candidate
-            continue
-        if current:
-            packed.append(current)
-            current = ""
-        if len(block) <= max_length:
-            current = block
-            continue
-        packed.extend(BasePlatformAdapter.truncate_message(block, max_length))
-    if current:
-        packed.append(current)
-    return packed
+    # Block extraction stays weixin-local (_split_markdown_blocks uses the
+    # anchored _FENCE_RE + per-line rstrip semantics); the greedy packing
+    # loop is the shared core's.
+    return greedy_pack_blocks(
+        _split_markdown_blocks(content),
+        max_length,
+        overflow=lambda block: BasePlatformAdapter.truncate_message(block, max_length),
+    )
 
 
 def _split_text_for_weixin_delivery(
@@ -953,9 +979,25 @@ def _extract_text(item_list: List[Dict[str, Any]]) -> str:
             return text
     for item in item_list:
         if item.get("type") == ITEM_VOICE:
-            voice_text = str((item.get("voice_item") or {}).get("text") or "")
-            if voice_text:
-                return voice_text
+            # #27300: Tencent Cloud's `voice_item.text` is their STT output,
+            # which is wrong for any non-Chinese audio (the original report
+            # was a Russian voice message that came back as English
+            # gibberish). Return empty so the central STT pipeline in
+            # ``gateway/run.py`` produces the body from the downloaded
+            # audio instead.
+            voice_item = item.get("voice_item") or {}
+            if not (voice_item.get("media") or {}):
+                # No raw audio to download — Weixin supplied only its own
+                # speech-to-text result. Use it, but preserve the voice
+                # origin so the agent can distinguish this from text the
+                # user typed (#65022).
+                voice_text = str(voice_item.get("text") or "")
+                if voice_text:
+                    return (
+                        "[Voice transcription provided by Weixin]\n"
+                        f"{voice_text}"
+                    )
+            continue
     return ""
 
 
@@ -1130,6 +1172,9 @@ async def qr_login(
 class WeixinAdapter(BasePlatformAdapter):
     """Native Hermes adapter for Weixin personal accounts."""
 
+    supports_code_blocks = True  # Weixin renders fenced code blocks
+    splits_long_messages = True  # send() chunks via _split_text()
+
     MAX_MESSAGE_LENGTH = 2000
 
     # WeChat does not support editing sent messages — streaming must use the
@@ -1148,11 +1193,11 @@ class WeixinAdapter(BasePlatformAdapter):
         self._poll_task: Optional[asyncio.Task] = None
         self._dedup = MessageDeduplicator(ttl_seconds=MESSAGE_DEDUP_TTL_SECONDS)
 
-        self._account_id = str(extra.get("account_id") or os.getenv("WEIXIN_ACCOUNT_ID", "")).strip()
-        self._token = str(config.token or extra.get("token") or os.getenv("WEIXIN_TOKEN", "")).strip()
-        self._base_url = str(extra.get("base_url") or os.getenv("WEIXIN_BASE_URL", ILINK_BASE_URL)).strip().rstrip("/")
+        self._account_id = str(extra.get("account_id") or _wx_secret("WEIXIN_ACCOUNT_ID", "")).strip()
+        self._token = str(config.token or extra.get("token") or _wx_secret("WEIXIN_TOKEN", "")).strip()
+        self._base_url = str(extra.get("base_url") or _wx_secret("WEIXIN_BASE_URL", ILINK_BASE_URL)).strip().rstrip("/")
         self._cdn_base_url = str(
-            extra.get("cdn_base_url") or os.getenv("WEIXIN_CDN_BASE_URL", WEIXIN_CDN_BASE_URL)
+            extra.get("cdn_base_url") or _wx_secret("WEIXIN_CDN_BASE_URL", WEIXIN_CDN_BASE_URL)
         ).strip().rstrip("/")
         self._send_chunk_delay_seconds = float(
             extra.get("send_chunk_delay_seconds") or os.getenv("WEIXIN_SEND_CHUNK_DELAY_SECONDS", "1.5")
@@ -1164,7 +1209,25 @@ class WeixinAdapter(BasePlatformAdapter):
             extra.get("send_chunk_retry_delay_seconds")
             or os.getenv("WEIXIN_SEND_CHUNK_RETRY_DELAY_SECONDS", "1.0")
         )
-        self._dm_policy = str(extra.get("dm_policy") or os.getenv("WEIXIN_DM_POLICY", "open")).strip().lower()
+        self._send_text_gate = asyncio.Lock()
+        self._rate_limit_circuit_threshold = max(
+            1,
+            int(
+                extra.get("rate_limit_circuit_threshold")
+                or os.getenv("WEIXIN_RATE_LIMIT_CIRCUIT_THRESHOLD", "1")
+            ),
+        )
+        self._rate_limit_circuit_window_seconds = float(
+            extra.get("rate_limit_circuit_window_seconds")
+            or os.getenv("WEIXIN_RATE_LIMIT_CIRCUIT_WINDOW_SECONDS", "30.0")
+        )
+        self._rate_limit_circuit_open_seconds = float(
+            extra.get("rate_limit_circuit_open_seconds")
+            or os.getenv("WEIXIN_RATE_LIMIT_CIRCUIT_OPEN_SECONDS", "30.0")
+        )
+        self._rate_limit_circuit_until = 0.0
+        self._rate_limit_events: List[float] = []
+        self._dm_policy = str(extra.get("dm_policy") or os.getenv("WEIXIN_DM_POLICY", "pairing")).strip().lower()
         self._group_policy = str(extra.get("group_policy") or os.getenv("WEIXIN_GROUP_POLICY", "disabled")).strip().lower()
         allow_from = extra.get("allow_from")
         if allow_from is None:
@@ -1232,7 +1295,7 @@ class WeixinAdapter(BasePlatformAdapter):
             return [str(item).strip() for item in value if str(item).strip()]
         return [str(value).strip()] if str(value).strip() else []
 
-    async def connect(self) -> bool:
+    async def connect(self, *, is_reconnect: bool = False) -> bool:
         if not check_weixin_requirements():
             message = "Weixin startup failed: aiohttp and cryptography are required"
             self._set_fatal_error("weixin_missing_dependency", message, retryable=False)
@@ -1364,6 +1427,36 @@ class WeixinAdapter(BasePlatformAdapter):
                 await asyncio.sleep(BACKOFF_DELAY_SECONDS if consecutive_failures >= MAX_CONSECUTIVE_FAILURES else RETRY_DELAY_SECONDS)
                 if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
                     consecutive_failures = 0
+                    # Recycle the poll session after a full failure streak.
+                    # Failed connection attempts through a local HTTP proxy
+                    # (e.g. Clash on 127.0.0.1:7890) can strand sockets that
+                    # never return to the connector's keepalive pool, so the
+                    # tight keepalive_timeout never reaps them. On macOS the
+                    # default 256-fd soft limit turns that drip into
+                    # `[Errno 24] Too many open files` and a gateway crash
+                    # (#79889). Closing the session tears down its connector
+                    # and every socket it holds; a fresh session starts the
+                    # next attempt from zero fds.
+                    await self._recycle_poll_session()
+
+    async def _recycle_poll_session(self) -> None:
+        """Replace ``_poll_session`` with a fresh one, closing the old.
+
+        Swap-then-close so concurrent ``_process_message`` tasks that grab
+        ``self._poll_session`` never observe a closed session; in-flight
+        requests on the old session finish or fail independently.
+        """
+        if not self._running or aiohttp is None:
+            return
+        old = self._poll_session
+        self._poll_session = aiohttp.ClientSession(
+            trust_env=True, connector=_make_ssl_connector()
+        )
+        if old is not None and not old.closed:
+            try:
+                await old.close()
+            except Exception as exc:
+                logger.debug("[%s] old poll session close failed: %s", self.name, exc)
 
     async def _process_message_safe(self, message: Dict[str, Any]) -> None:
         try:
@@ -1398,7 +1491,9 @@ class WeixinAdapter(BasePlatformAdapter):
                 return
             if self._group_policy == "allowlist" and effective_chat_id not in self._group_allow_from:
                 return
-        elif not self._is_dm_allowed(sender_id):
+            if self._group_policy == "pairing":
+                return
+        elif not self._is_dm_intake_allowed(sender_id):
             return
 
         context_token = str(message.get("context_token") or "").strip()
@@ -1441,12 +1536,30 @@ class WeixinAdapter(BasePlatformAdapter):
         else:
             await self.handle_message(event)
 
+    def _open_dm_opted_in(self) -> bool:
+        if os.getenv("GATEWAY_ALLOW_ALL_USERS", "").lower() in {"true", "1", "yes"}:
+            return True
+        return os.getenv("WEIXIN_ALLOW_ALL_USERS", "").lower() in {"true", "1", "yes"}
+
     def _is_dm_allowed(self, sender_id: str) -> bool:
         if self._dm_policy == "disabled":
             return False
         if self._dm_policy == "allowlist":
             return sender_id in self._allow_from
-        return True
+        if self._dm_policy == "open":
+            return self._open_dm_opted_in()
+        return False
+
+    def _is_dm_intake_allowed(self, sender_id: str) -> bool:
+        if self._dm_policy == "disabled":
+            return False
+        if self._dm_policy == "allowlist":
+            return sender_id in self._allow_from
+        if self._dm_policy == "pairing":
+            return True
+        if self._dm_policy == "open":
+            return self._open_dm_opted_in()
+        return False
 
     @property
     def enforces_own_access_policy(self) -> bool:
@@ -1466,6 +1579,7 @@ class WeixinAdapter(BasePlatformAdapter):
             event.source,
             group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
             thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
+            profile=event.source.profile,
         )
 
     def _enqueue_text_event(self, event: MessageEvent) -> None:
@@ -1597,8 +1711,13 @@ class WeixinAdapter(BasePlatformAdapter):
     async def _download_voice(self, item: Dict[str, Any]) -> Optional[str]:
         voice_item = item.get("voice_item") or {}
         media = voice_item.get("media") or {}
-        if voice_item.get("text"):
-            return None
+        # #27300: previously short-circuited when ``voice_item.text`` was set
+        # on the assumption that Tencent Cloud's STT was good enough.
+        # For non-Chinese audio that text is garbage (e.g. a Russian
+        # message comes back as English phonemes) — we must always
+        # download the raw audio so ``gateway/run.py``'s central STT
+        # pipeline can re-transcribe with the user's configured
+        # mlx-whisper / whisper.cpp / faster-whisper backend.
         try:
             data = await _download_and_decrypt_media(
                 self._poll_session,
@@ -1637,6 +1756,37 @@ class WeixinAdapter(BasePlatformAdapter):
             content, self.MAX_MESSAGE_LENGTH, self._split_multiline_messages,
         )
 
+    def _rate_limit_cooldown_remaining(self) -> float:
+        return max(0.0, self._rate_limit_circuit_until - time.monotonic())
+
+    def _rate_limit_error(self) -> RuntimeError:
+        return RuntimeError(
+            f"iLink sendmessage rate limited; cooldown active for {self._rate_limit_cooldown_remaining():.1f}s"
+        )
+
+    def _open_rate_limit_circuit(self) -> None:
+        if self._rate_limit_circuit_open_seconds <= 0:
+            return
+        self._rate_limit_circuit_until = max(
+            self._rate_limit_circuit_until,
+            time.monotonic() + self._rate_limit_circuit_open_seconds,
+        )
+
+    def _record_rate_limit_event(self) -> bool:
+        """Record a genuine iLink rate limit and return True if breaker opened."""
+        now = time.monotonic()
+        window_start = now - self._rate_limit_circuit_window_seconds
+        self._rate_limit_events = [ts for ts in self._rate_limit_events if ts >= window_start]
+        self._rate_limit_events.append(now)
+        if len(self._rate_limit_events) >= self._rate_limit_circuit_threshold:
+            self._open_rate_limit_circuit()
+            return self._rate_limit_cooldown_remaining() > 0
+        return False
+
+    def _reset_rate_limit_circuit(self) -> None:
+        self._rate_limit_events.clear()
+        self._rate_limit_circuit_until = 0.0
+
     async def _send_text_chunk(
         self,
         *,
@@ -1652,9 +1802,28 @@ class WeixinAdapter(BasePlatformAdapter):
         degraded fallback, which keeps cron-initiated push messages working
         even when no user message has refreshed the session recently.
         """
+        async with self._send_text_gate:
+            await self._send_text_chunk_locked(
+                chat_id=chat_id,
+                chunk=chunk,
+                context_token=context_token,
+                client_id=client_id,
+            )
+
+    async def _send_text_chunk_locked(
+        self,
+        *,
+        chat_id: str,
+        chunk: str,
+        context_token: Optional[str],
+        client_id: str,
+    ) -> None:
+        """Send a text chunk while holding the adapter-wide outbound text gate."""
         last_error: Optional[Exception] = None
         retried_without_token = False
         for attempt in range(self._send_chunk_retries + 1):
+            if self._rate_limit_cooldown_remaining() > 0:
+                raise self._rate_limit_error()
             try:
                 resp = await _send_message(
                     self._send_session,
@@ -1700,6 +1869,9 @@ class WeixinAdapter(BasePlatformAdapter):
                             last_error = RuntimeError(
                                 f"iLink sendmessage rate limited: ret={ret} errcode={errcode} errmsg={errmsg}"
                             )
+                            if self._record_rate_limit_event():
+                                last_error = self._rate_limit_error()
+                                break
                             if attempt >= self._send_chunk_retries:
                                 break
                             wait = self._send_chunk_retry_delay_seconds * 3  # 3x backoff for rate limit
@@ -1713,6 +1885,7 @@ class WeixinAdapter(BasePlatformAdapter):
                         raise RuntimeError(
                             f"iLink sendmessage error: ret={ret} errcode={errcode} errmsg={errmsg}"
                         )
+                self._reset_rate_limit_circuit()
                 return
             except Exception as exc:
                 last_error = exc
@@ -1800,10 +1973,47 @@ class WeixinAdapter(BasePlatformAdapter):
             logger.error("[%s] send failed to=%s: %s", self.name, _safe_id(chat_id), exc)
             return SendResult(success=False, error=str(exc))
 
+    async def _ensure_typing_ticket(self, chat_id: str) -> Optional[str]:
+        """Return a valid typing ticket, refreshing from getConfig if expired.
+
+        The iLink typing ticket has a 600-second TTL.  When a long-running
+        session exceeds that window the cached ticket evicts, and both
+        ``send_typing`` and ``stop_typing`` silently no-op — leaving the
+        WeChat client stuck showing the typing indicator forever.  This
+        method transparently refreshes the ticket so the stop signal can
+        always be delivered.
+        """
+        ticket = self._typing_cache.get(chat_id)
+        if ticket:
+            return ticket
+        if not self._send_session or not self._token:
+            return None
+        # Ticket expired or never fetched — refresh via getConfig.
+        # Use the most recent context_token for this peer if available.
+        context_token = self._token_store.get(self._account_id, chat_id)
+        try:
+            response = await _get_config(
+                self._send_session,
+                base_url=self._base_url,
+                token=self._token,
+                user_id=chat_id,
+                context_token=context_token,
+            )
+            typing_ticket = str(response.get("typing_ticket") or "")
+            if typing_ticket:
+                self._typing_cache.set(chat_id, typing_ticket)
+                return typing_ticket
+        except Exception as exc:
+            logger.debug(
+                "[%s] typing ticket refresh failed for %s: %s",
+                self.name, _safe_id(chat_id), exc,
+            )
+        return None
+
     async def send_typing(self, chat_id: str, metadata: Optional[Dict[str, Any]] = None) -> None:
         if not self._send_session or not self._token:
             return
-        typing_ticket = self._typing_cache.get(chat_id)
+        typing_ticket = await self._ensure_typing_ticket(chat_id)
         if not typing_ticket:
             return
         try:
@@ -1821,7 +2031,7 @@ class WeixinAdapter(BasePlatformAdapter):
     async def stop_typing(self, chat_id: str) -> None:
         if not self._send_session or not self._token:
             return
-        typing_ticket = self._typing_cache.get(chat_id)
+        typing_ticket = await self._ensure_typing_ticket(chat_id)
         if not typing_ticket:
             return
         try:
@@ -2151,10 +2361,10 @@ async def send_weixin_direct(
 
     This bypasses the long-poll adapter lifecycle and uses the raw API directly.
     """
-    account_id = str(extra.get("account_id") or os.getenv("WEIXIN_ACCOUNT_ID", "")).strip()
-    base_url = str(extra.get("base_url") or os.getenv("WEIXIN_BASE_URL", ILINK_BASE_URL)).strip().rstrip("/")
-    cdn_base_url = str(extra.get("cdn_base_url") or os.getenv("WEIXIN_CDN_BASE_URL", WEIXIN_CDN_BASE_URL)).strip().rstrip("/")
-    resolved_token = str(token or extra.get("token") or os.getenv("WEIXIN_TOKEN", "")).strip()
+    account_id = str(extra.get("account_id") or _wx_secret("WEIXIN_ACCOUNT_ID", "")).strip()
+    base_url = str(extra.get("base_url") or _wx_secret("WEIXIN_BASE_URL", ILINK_BASE_URL)).strip().rstrip("/")
+    cdn_base_url = str(extra.get("cdn_base_url") or _wx_secret("WEIXIN_CDN_BASE_URL", WEIXIN_CDN_BASE_URL)).strip().rstrip("/")
+    resolved_token = str(token or extra.get("token") or _wx_secret("WEIXIN_TOKEN", "")).strip()
     if not resolved_token:
         return {"error": "Weixin token missing. Configure WEIXIN_TOKEN or platforms.weixin.token."}
     if not account_id:

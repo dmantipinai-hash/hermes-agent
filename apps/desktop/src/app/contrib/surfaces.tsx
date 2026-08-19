@@ -9,10 +9,13 @@
 
 import { useStore } from '@nanostores/react'
 import { type ComponentProps, lazy, memo, type ReactNode, Suspense, useMemo } from 'react'
-import { Navigate, Route, Routes, useParams } from 'react-router-dom'
+import { Navigate, Route, Routes, useParams } from 'react-router'
 
-import { ContribBoundary } from '@/contrib/react/boundary'
+import { ContribBoundary, ContribRender } from '@/contrib/react/boundary'
 import { useContributions } from '@/contrib/react/use-contributions'
+import { $activeConnectionId } from '@/store/connections'
+import { $gateway } from '@/store/gateway'
+import { $activeGatewayProfile } from '@/store/profile'
 import { $freshDraftReady, $gatewayState } from '@/store/session'
 
 import { ChatView } from '../chat'
@@ -24,6 +27,7 @@ import { useStatusbarItems } from '../shell/hooks/use-statusbar-items'
 import { ModelMenuPanel } from '../shell/model-menu-panel'
 import { StatusbarControls } from '../shell/statusbar-controls'
 
+import { latestChatActions, latestSidebarActions } from './latest-actions'
 import { setStatusbarItemGroup, useStatusbarContributions } from './panes'
 import type { SidebarActions, WiringActions } from './types'
 
@@ -47,12 +51,14 @@ export const SidebarSurface = memo(function SidebarSurface({
   actions: SidebarActions
   currentView: ComponentProps<typeof ChatSidebar>['currentView']
 }) {
-  return <ChatSidebar currentView={currentView} {...actions} />
+  const latestActions = useMemo(() => latestSidebarActions(actions), [actions])
+
+  return <ChatSidebar currentView={currentView} {...latestActions} />
 })
 
 export const TerminalSurface = memo(function TerminalSurface() {
   return (
-    <div className="relative flex h-full min-h-0 flex-col overflow-hidden bg-(--ui-editor-surface-background)">
+    <div className="relative flex h-full min-h-0 flex-col overflow-hidden bg-(--ui-terminal-surface-background)">
       <TerminalPaneChrome />
     </div>
   )
@@ -72,9 +78,12 @@ export const StatusbarSurface = memo(function StatusbarSurface({
   chatOpen: boolean
   commandCenterOpen: boolean
 }) {
+  const activeConnectionId = useStore($activeConnectionId)
+  const activeGatewayProfile = useStore($activeGatewayProfile)
   const gatewayState = useStore($gatewayState)
   const freshDraftReady = useStore($freshDraftReady)
-  const { inferenceStatus, statusSnapshot } = useStatusSnapshot(gatewayState, actions.requestGateway)
+  const gatewayScope = `${activeConnectionId ?? ''}\0${activeGatewayProfile}`
+  const { inferenceStatus, statusSnapshot } = useStatusSnapshot(gatewayState, actions.requestGateway, gatewayScope)
   const extraLeftItems = useStatusbarContributions('left')
   const extraRightItems = useStatusbarContributions('right')
 
@@ -98,10 +107,9 @@ export const StatusbarSurface = memo(function StatusbarSurface({
 })
 
 /** The workspace pane: the real route table (chat + full-page views + plugin
- *  routes). Subscribes to `$gatewayState` and ROUTES_AREA itself; the gateway
- *  instance + voice cap arrive as props so a reconnect/config load re-renders
- *  only this surface. ChatView subscribes to its own session atoms, so
- *  streaming never round-trips through the controller. */
+ *  routes). Subscribes to the gateway instance/state and ROUTES_AREA itself;
+ *  the voice cap arrives as a prop. ChatView subscribes to its own session
+ *  atoms, so streaming never round-trips through the controller. */
 export const ChatRoutesSurface = memo(function ChatRoutesSurface({
   actions,
   maxVoiceRecordingSeconds
@@ -109,18 +117,11 @@ export const ChatRoutesSurface = memo(function ChatRoutesSurface({
   actions: WiringActions
   maxVoiceRecordingSeconds?: number
 }) {
+  const activeGatewayProfile = useStore($activeGatewayProfile)
+  const gateway = useStore($gateway)
   const gatewayState = useStore($gatewayState)
   useContributions(ROUTES_AREA)
   const routeContributions = contributedRoutes()
-
-  // Recapture the live gateway instance whenever the connection state flips.
-  // getGateway reads a controller ref, so gatewayState is the intentional
-  // re-eval trigger (not a value the computation itself reads).
-  const gateway = useMemo(
-    () => actions.getGateway(),
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    [actions, gatewayState]
-  )
 
   const modelMenuContent = useMemo(
     () =>
@@ -128,39 +129,21 @@ export const ChatRoutesSurface = memo(function ChatRoutesSurface({
         <ModelMenuPanel
           gateway={gateway || undefined}
           onSelectModel={actions.selectModel}
+          profile={activeGatewayProfile}
           requestGateway={actions.requestGateway}
         />
       ) : null,
-    [actions, gateway, gatewayState]
+    [actions, activeGatewayProfile, gateway, gatewayState]
   )
+
+  const chatActions = useMemo(() => latestChatActions(actions), [actions])
 
   const chatView = (
     <ChatView
       gateway={gateway}
       maxVoiceRecordingSeconds={maxVoiceRecordingSeconds}
       modelMenuContent={modelMenuContent}
-      onAddContextRef={actions.onAddContextRef}
-      onAddUrl={actions.onAddUrl}
-      onAttachDroppedItems={actions.onAttachDroppedItems}
-      onAttachImageBlob={actions.onAttachImageBlob}
-      onBranchInNewChat={actions.onBranchInNewChat}
-      onCancel={actions.onCancel}
-      onDeleteSelectedSession={actions.onDeleteSelectedSession}
-      onDismissError={actions.onDismissError}
-      onEdit={actions.onEdit}
-      onPasteClipboardImage={actions.onPasteClipboardImage}
-      onPickFiles={actions.onPickFiles}
-      onPickFolders={actions.onPickFolders}
-      onPickImages={actions.onPickImages}
-      onReload={actions.onReload}
-      onRemoveAttachment={actions.onRemoveAttachment}
-      onRestoreToMessage={actions.onRestoreToMessage}
-      onRetryResume={actions.onRetryResume}
-      onSteer={actions.onSteer}
-      onSubmit={actions.onSubmit}
-      onThreadMessagesChange={actions.onThreadMessagesChange}
-      onToggleSelectedPin={actions.onToggleSelectedPin}
-      onTranscribeAudio={actions.onTranscribeAudio}
+      {...chatActions}
     />
   )
 
@@ -186,12 +169,17 @@ export const ChatRoutesSurface = memo(function ChatRoutesSurface({
       <Route element={null} path="profiles" />
       <Route element={null} path="settings" />
       <Route element={null} path="starmap" />
+      <Route element={null} path="webhooks" />
       {/* Registry-contributed pages (core features + plugins) render in the
           workspace pane like any built-in view — behind the same blast wall
           as every other contribution mount. */}
       {routeContributions.map(route => (
         <Route
-          element={page(<ContribBoundary id={route.key}>{route.render()}</ContribBoundary>)}
+          element={page(
+            <ContribBoundary id={route.key}>
+              <ContribRender render={route.render} />
+            </ContribBoundary>
+          )}
           key={route.key}
           path={route.path.slice(1)}
         />

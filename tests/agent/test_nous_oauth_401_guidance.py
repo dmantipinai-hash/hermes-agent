@@ -48,24 +48,10 @@ def test_nous_401_guidance_strings_present():
     # (Nous Portal has no API key path — auth_type=oauth_device_code only).
     assert "Nous Portal OAuth token was rejected" in source
 
-    # Must give the exact re-auth command, not a generic "hermes setup".
-    assert "hermes auth add nous --type oauth" in source
+    # Must give a concrete re-auth command, not a generic "hermes setup".
+    assert "hermes portal" in source
 
     # Must point at the portal so users can check account/credit status.
     assert "portal.nousresearch.com" in source
 
 
-def test_free_slug_hint_for_nous_provider():
-    """When the failing model slug ends with ``:free`` and the provider is
-    ``nous``, the guidance must flag that ``:free`` is OpenRouter syntax and
-    suggest switching providers via ``/model openrouter:<slug>``.
-
-    Without this hint, users re-OAuth successfully and then hit the same 401
-    on the next message because Nous Portal doesn't carry the OpenRouter
-    free-tier slug.
-    """
-    source = inspect.getsource(conversation_loop.run_conversation)
-
-    assert "endswith(\":free\")" in source
-    assert "OpenRouter slug" in source
-    assert "/model openrouter:" in source

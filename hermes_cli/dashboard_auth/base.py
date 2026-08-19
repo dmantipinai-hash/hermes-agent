@@ -27,18 +27,30 @@ class Session:
 
 @dataclass(frozen=True)
 class TokenPrincipal:
-    """A non-interactive (bearer-token) verified identity.
+    """A verified non-interactive (service-to-service) caller.
 
-    Returned by ``verify_token`` on a ``supports_token`` provider. Carries the
-    principal identifier (an opaque label the provider chooses — e.g.
-    ``"drain-control"``), the provider's stable ``name``, and a tuple of scope
-    strings the middleware attaches to ``request.state`` so route handlers can
-    authorize per-scope. Opaque to Hermes — providers define what scopes mean.
+    The token analog of :class:`Session`. Where a ``Session`` represents an
+    interactive human identity behind a session cookie, a ``TokenPrincipal``
+    represents a machine/service caller that authenticated by presenting a
+    bearer token in the ``Authorization`` request header on a single
+    request — no login, no cookie, no refresh.
+
+    Returned by :meth:`DashboardAuthProvider.verify_token` and attached to
+    ``request.state.token_principal`` by the token-auth middleware seam so a
+    route handler can see *who* called it.
+
+    Fields:
+      * ``principal`` — stable identifier for the caller (e.g. the provider
+        name, a service account id, or an agent id). Opaque to the seam.
+      * ``provider`` — the ``name`` of the provider that verified the token.
+      * ``scopes`` — capability strings this principal is authorised for.
+        Empty tuple means "unscoped" (the provider vouches for the caller but
+        attaches no capability list); a route MAY enforce a required scope.
     """
 
     principal: str
     provider: str
-    scopes: Tuple[str, ...] = ()
+    scopes: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -72,20 +84,21 @@ class InvalidCodeError(Exception):
 
 
 class InvalidCredentialsError(Exception):
-    """Username/password (or other interactive credential) rejected.
+    """A username/password pair was rejected by a password provider.
 
-    Raised by password-login providers (e.g. BasicAuthProvider) when the
-    supplied credentials don't match. The login route maps this to HTTP 401
-    with a generic "invalid username or password" body — it must NOT
-    distinguish "unknown user" from "wrong password" (both return the same
-    generic 401) to avoid a user-enumeration side channel.
+    Raised by :meth:`DashboardAuthProvider.complete_password_login`. The
+    ``/auth/password-login`` route translates this to HTTP 401 with a
+    deliberately generic detail (never distinguishing "unknown user" from
+    "wrong password") so the endpoint can't be used as a username oracle.
     """
 
 
 class RefreshExpiredError(Exception):
-    """The refresh token is dead.
+    """This provider rejects the refresh token as dead or invalid.
 
-    Middleware clears cookies and forces re-login (302 → ``/login``).
+    In a multi-provider deployment this does not prove token ownership, so
+    middleware may try remaining providers. It clears cookies and forces
+    re-login only after every reachable provider rejects the token.
     """
 
 
@@ -114,29 +127,62 @@ class DashboardAuthProvider(ABC):
         raises ``ProviderError`` if the IDP is unreachable. Middleware
         treats expiry and unreachable differently (expiry → refresh;
         unreachable → 503).
-      * ``refresh_session`` raises ``RefreshExpiredError`` when the
-        refresh token is also invalid; middleware then forces re-login.
-        Raises ``ProviderError`` on network failure.
+      * ``refresh_session`` raises ``RefreshExpiredError`` when the refresh
+        token is invalid for that provider. Middleware tries the remaining
+        providers because an opaque foreign token can be indistinguishable
+        from an expired one; it forces re-login only after every reachable
+        provider rejects the token. Raises ``ProviderError`` on network
+        failure; middleware still tries remaining providers, but returns 503
+        without clearing cookies if none succeeds and any was unavailable.
       * ``revoke_session`` is best-effort and must not raise.
 
     Subclasses MUST set ``name`` (lowercase identifier, stable forever)
     and ``display_name`` (user-facing label on the login page).
+
+    Password (non-redirect) providers:
+      A provider that authenticates with a username + password instead of
+      an OAuth redirect sets ``supports_password = True`` and implements
+      ``complete_password_login``. The login page then renders a
+      credential form (POSTing to ``/auth/password-login``) instead of a
+      "Log in with X" redirect button. Everything downstream of login —
+      ``verify_session`` / ``refresh_session`` / ``revoke_session``, the
+      session cookies, the WS-ticket mint — is identical to the OAuth
+      path, because a password session is just a :class:`Session` with
+      provider-minted opaque tokens. The OAuth methods (``start_login`` /
+      ``complete_login``) remain abstract; a pure-password provider that
+      will never be reached via the redirect flow may implement them as
+      stubs that raise ``NotImplementedError``.
     """
 
     name: str = ""
     display_name: str = ""
 
-    # Capability flags — NOT abstract, so existing session-only providers keep
-    # working without touching them. ``supports_session`` defaults True
-    # (interactive cookie-session providers participate by default);
-    # ``supports_token`` defaults False (the non-interactive bearer-token seam
-    # is opt-in); ``supports_password`` defaults False (username/password
-    # non-redirect login is opt-in). Registry filters
-    # ``list_token_providers`` / ``list_session_providers`` on these so each
-    # auth path only consults the providers that actually back it.
-    supports_session: bool = True
-    supports_token: bool = False
+    # When True, this provider authenticates via username + password
+    # (``complete_password_login``) rather than (or in addition to) the
+    # OAuth redirect flow. The login page renders a credential form for
+    # such providers; the ``/auth/password-login`` route dispatches to
+    # ``complete_password_login``. OAuth-only providers leave this False
+    # and are completely unaffected.
     supports_password: bool = False
+
+    # When True, this provider can verify a non-interactive bearer token
+    # (``verify_token``) presented on a single request by a service-to-service
+    # caller — no login, no cookie, no refresh. This is the generic
+    # API-token capability flag, mirroring ``supports_password``: a route
+    # opts into token auth (see ``token_auth`` middleware seam) and the
+    # gate consults every ``supports_token`` provider in turn until one
+    # recognises the token. OAuth/password providers leave this False and
+    # are completely unaffected. The drain bearer-secret plugin is the
+    # first consumer, but the capability is deliberately generic so any
+    # future machine-credential provider drops in without core changes.
+    supports_token: bool = False
+
+    # When True, this provider does the interactive cookie-session flow (login,
+    # verify, refresh). The login page, /auth/login, and the gate's
+    # verify/refresh loops consult only supports_session providers, so a
+    # token-only credential (e.g. drain) is never offered a login. Mirrors
+    # supports_token.
+    supports_session: bool = True
 
     @abstractmethod
     def start_login(self, *, redirect_uri: str) -> LoginStart: ...
@@ -160,40 +206,67 @@ class DashboardAuthProvider(ABC):
     @abstractmethod
     def revoke_session(self, *, refresh_token: str) -> None: ...
 
-    def verify_token(self, *, token: str) -> Optional[TokenPrincipal]:
-        """Verify a non-interactive bearer token.
+    def complete_password_login(
+        self, *, username: str, password: str
+    ) -> "Session":
+        """Verify a username/password pair and mint a :class:`Session`.
 
-        Default implementation raises :class:`NotImplementedError` — only
-        providers that set ``supports_token = True`` are expected to override
-        this. The token-auth middleware never calls ``verify_token`` on a
-        ``supports_token = False`` provider (it filters via
-        :func:`~hermes_cli.dashboard_auth.list_token_providers` first), so a
-        session-only provider that never opts in will not trip the default.
-        """
-        raise NotImplementedError(
-            f"{type(self).__name__} does not support non-interactive token auth "
-            f"(supports_token is False). Override verify_token and set "
-            f"supports_token = True to opt in."
-        )
+        Only called when ``supports_password`` is True (the
+        ``/auth/password-login`` route guards on the flag). The default
+        raises ``NotImplementedError`` so an OAuth-only provider that
+        forgets to set the flag fails loudly rather than silently
+        accepting credentials.
 
-    def complete_password_login(self, *, username: str, password: str) -> Session:
-        """Exchange username/password for a :class:`Session`.
+        The returned ``Session`` carries provider-minted opaque
+        ``access_token`` / ``refresh_token`` exactly like the OAuth path,
+        so all downstream session handling (cookies, verify, refresh,
+        ws-tickets, logout) is identical.
 
-        Non-redirect login path: a provider that backs a credential form
-        (e.g. BasicAuthProvider) overrides this and sets
-        ``supports_password = True``. The ``/auth/password-login`` route
-        calls it; on :class:`InvalidCredentialsError` the route returns a
-        generic HTTP 401 (no user-vs-password distinction — that would be a
-        user-enumeration side channel).
-
-        Default raises :class:`NotImplementedError` — the password-login
-        route 404s for ``supports_password = False`` providers before ever
-        reaching this method, so OAuth-only providers never trip the default.
+        Failure semantics:
+          * ``InvalidCredentialsError`` — username/password rejected. The
+            route surfaces a generic 401 (no user-vs-password
+            distinction). Implementations SHOULD spend constant time on
+            unknown users (dummy hash verify) to avoid a timing oracle.
+          * ``ProviderError`` — the backing credential store is
+            unreachable (LDAP/DB down); the route surfaces 503.
         """
         raise NotImplementedError(
             f"{type(self).__name__} does not support password login "
-            f"(supports_password is False). Override complete_password_login "
-            f"and set supports_password = True to opt in."
+            "(set supports_password = True and override "
+            "complete_password_login)"
+        )
+
+    def verify_token(self, *, token: str) -> "Optional[TokenPrincipal]":
+        """Verify a non-interactive bearer token; return its principal.
+
+        The token analog of ``verify_session``. Only consulted when
+        ``supports_token`` is True. Called by the ``token_auth`` middleware
+        seam for every request to a token-authable route, in registration
+        order, until one provider returns a non-None principal.
+
+        Contract (mirrors ``verify_session`` stacking semantics):
+          * Return a :class:`TokenPrincipal` if this provider recognises and
+            accepts the token.
+          * Return ``None`` for a token this provider does NOT recognise —
+            never raise, so the seam can fall through to the next provider.
+            A malformed/expired/wrong token is "not recognised" → ``None``.
+          * Raise ``ProviderError`` ONLY for a genuine backing-store outage
+            (the provider can neither confirm nor deny). The seam treats this
+            like ``verify_session``: remember it, keep trying other providers,
+            and surface 503 only if NO provider accepts the token AND at least
+            one was unreachable.
+
+        Implementations MUST use a constant-time comparison
+        (``hmac.compare_digest``) when matching a shared secret so the
+        endpoint isn't a timing oracle.
+
+        The default raises ``NotImplementedError`` so a provider that sets
+        ``supports_token`` but forgets to implement this fails loudly rather
+        than silently accepting every caller.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support token auth "
+            "(set supports_token = True and override verify_token)"
         )
 
 
