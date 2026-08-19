@@ -33,6 +33,15 @@ class Mem0Backend(ABC):
     def delete(self, memory_id: str) -> dict:
         ...
 
+    def get_all(self, *, filters: dict) -> list[dict]:
+        """List every memory matching ``filters`` (the ``mem0_profile`` tool).
+
+        Optional by design: backends whose transport has no list-everything
+        route raise and the tool surfaces the error instead of silently
+        returning an empty profile.
+        """
+        raise NotImplementedError(f"{type(self).__name__} does not support get_all")
+
     def close(self) -> None:
         pass
 
@@ -78,6 +87,9 @@ class PlatformBackend(Mem0Backend):
     def delete(self, memory_id: str) -> dict:
         self._client.delete(memory_id=memory_id)
         return {"result": "Memory deleted.", "memory_id": memory_id}
+
+    def get_all(self, *, filters: dict) -> list[dict]:
+        return _unwrap_results(self._client.get_all(filters=filters))
 
 
 class SelfHostedBackend(Mem0Backend):
@@ -145,6 +157,12 @@ class SelfHostedBackend(Mem0Backend):
     def delete(self, memory_id: str) -> dict:
         self._json("DELETE", f"/memories/{memory_id}")
         return {"result": "Memory deleted.", "memory_id": memory_id}
+
+    def get_all(self, *, filters: dict) -> list[dict]:
+        # The self-hosted FastAPI contract takes the scope as flat query
+        # params on GET /memories (not a filters= body param like /search).
+        params = {k: str(v) for k, v in filters.items() if v}
+        return _unwrap_results(self._json("GET", "/memories", params=params))
 
     def close(self) -> None:
         try:
@@ -294,6 +312,12 @@ class OSSBackend(Mem0Backend):
     def delete(self, memory_id: str) -> dict:
         self._memory.delete(memory_id)
         return {"result": "Memory deleted.", "memory_id": memory_id}
+
+    def get_all(self, *, filters: dict) -> list[dict]:
+        # OSS Memory.get_all takes flat kwargs (user_id=..., agent_id=...),
+        # not a filters= dict like the platform client.
+        kwargs = {k: v for k, v in filters.items() if v}
+        return _unwrap_results(self._memory.get_all(**kwargs))
 
     def close(self):
         try:

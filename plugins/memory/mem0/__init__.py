@@ -114,6 +114,15 @@ def _load_config() -> dict:
 # Tool schemas
 # ---------------------------------------------------------------------------
 
+PROFILE_SCHEMA = {
+    "name": "mem0_profile",
+    "description": (
+        "Retrieve all stored memories about the user — preferences, facts, "
+        "project context. Fast, no reranking. Use at conversation start."
+    ),
+    "parameters": {"type": "object", "properties": {}, "required": []},
+}
+
 SEARCH_SCHEMA = {
     "name": "mem0_search",
     "description": (
@@ -512,7 +521,7 @@ class Mem0MemoryProvider(MemoryProvider):
             self._sync_thread.start()
 
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
-        return [SEARCH_SCHEMA, ADD_SCHEMA, UPDATE_SCHEMA, DELETE_SCHEMA]
+        return [PROFILE_SCHEMA, SEARCH_SCHEMA, ADD_SCHEMA, UPDATE_SCHEMA, DELETE_SCHEMA]
 
     def handle_tool_call(self, tool_name: str, args: dict, **kwargs) -> str:
         if self._backend is None:
@@ -530,6 +539,20 @@ class Mem0MemoryProvider(MemoryProvider):
                 vs = self._config.get("oss", {}).get("vector_store", {})
                 msg += f" Check that your {vs.get('provider', 'vector store')} is running."
             return json.dumps({"error": msg})
+
+        if tool_name == "mem0_profile":
+            try:
+                memories = self._backend.get_all(filters=self._read_filters())
+                self._record_success()
+                if not memories:
+                    return json.dumps({"result": "No memories stored yet."})
+                lines = [m.get("memory", "") for m in memories if m.get("memory")]
+                return json.dumps({"result": "\n".join(lines), "count": len(lines)})
+            except NotImplementedError as e:
+                return tool_error(str(e))
+            except Exception as e:
+                self._record_failure()
+                return tool_error(self._format_error("Failed to fetch profile", e))
 
         if tool_name == "mem0_search":
             query = args.get("query", "")

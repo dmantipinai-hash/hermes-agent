@@ -22,13 +22,20 @@ class FakeClientV2:
         self.captured_get_all = {}
         self.captured_add = []
 
-    def search(self, **kwargs):
-        self.captured_search = kwargs
-        return self._search_results
+    def search(self, query=None, **kwargs):
+        self.captured_search = {"query": query, **kwargs}
+        return self._unwrap(self._search_results)
 
     def get_all(self, **kwargs):
         self.captured_get_all = kwargs
-        return self._all_results
+        return self._unwrap(self._all_results)
+
+    @staticmethod
+    def _unwrap(response):
+        # Mirror _backend._unwrap_results: the provider receives unwrapped lists.
+        if isinstance(response, dict):
+            return response.get("results", [])
+        return response
 
     def add(self, messages, **kwargs):
         self.captured_add.append({"messages": messages, **kwargs})
@@ -47,7 +54,9 @@ class TestMem0FiltersV2:
         provider.initialize("test-session")
         provider._user_id = "u123"
         provider._agent_id = "hermes"
-        monkeypatch.setattr(provider, "_get_client", lambda: client)
+        # The provider talks to a backend object (see _create_backend); the
+        # fake client plays that role directly.
+        provider._backend = client
         return provider
 
     def test_search_uses_filters(self, monkeypatch):
@@ -76,7 +85,7 @@ class TestMem0FiltersV2:
         client = FakeClientV2()
         provider = self._make_provider(monkeypatch, client)
 
-        provider.queue_prefetch("hello")
+        provider._start_prefetch("hello")
         provider._prefetch_thread.join(timeout=2)
 
         assert client.captured_search["query"] == "hello"
@@ -95,11 +104,12 @@ class TestMem0FiltersV2:
         assert call["user_id"] == "u123"
         assert call["agent_id"] == "hermes"
 
-    def test_conclude_uses_write_filters(self, monkeypatch):
+    def test_add_uses_write_attribution(self, monkeypatch):
+        """mem0_add (which superseded the fork's mem0_conclude) attributes writes."""
         client = FakeClientV2()
         provider = self._make_provider(monkeypatch, client)
 
-        provider.handle_tool_call("mem0_conclude", {"conclusion": "user likes dark mode"})
+        provider.handle_tool_call("mem0_add", {"content": "user likes dark mode"})
 
         assert len(client.captured_add) == 1
         call = client.captured_add[0]
@@ -114,12 +124,16 @@ class TestMem0FiltersV2:
         provider._agent_id = "hermes"
         assert provider._read_filters() == {"user_id": "u123"}
 
-    def test_write_filters_include_agent_id(self):
-        """Write filters should include agent_id for attribution."""
-        provider = Mem0MemoryProvider()
-        provider._user_id = "u123"
-        provider._agent_id = "hermes"
-        assert provider._write_filters() == {"user_id": "u123", "agent_id": "hermes"}
+    def test_add_passes_agent_id_for_attribution(self, monkeypatch):
+        """The write path attaches agent_id (attribution) alongside user_id."""
+        client = FakeClientV2()
+        provider = self._make_provider(monkeypatch, client)
+
+        provider.handle_tool_call("mem0_add", {"content": "fact"})
+
+        call = client.captured_add[0]
+        assert call["user_id"] == "u123"
+        assert call["agent_id"] == "hermes"
 
 
 # ---------------------------------------------------------------------------
@@ -133,7 +147,7 @@ class TestMem0ResponseUnwrapping:
     def _make_provider(self, monkeypatch, client):
         provider = Mem0MemoryProvider()
         provider.initialize("test-session")
-        monkeypatch.setattr(provider, "_get_client", lambda: client)
+        provider._backend = client
         return provider
 
     def test_profile_dict_response(self, monkeypatch):
@@ -179,12 +193,14 @@ class TestMem0ResponseUnwrapping:
         assert result["count"] == 1
 
     def test_unwrap_results_edge_cases(self):
-        """_unwrap_results handles all shapes gracefully."""
-        assert Mem0MemoryProvider._unwrap_results({"results": [1, 2]}) == [1, 2]
-        assert Mem0MemoryProvider._unwrap_results([3, 4]) == [3, 4]
-        assert Mem0MemoryProvider._unwrap_results({}) == []
-        assert Mem0MemoryProvider._unwrap_results(None) == []
-        assert Mem0MemoryProvider._unwrap_results("unexpected") == []
+        """_unwrap_results (now in _backend) handles all shapes gracefully."""
+        from plugins.memory.mem0._backend import _unwrap_results
+
+        assert _unwrap_results({"results": [1, 2]}) == [1, 2]
+        assert _unwrap_results([3, 4]) == [3, 4]
+        assert _unwrap_results({}) == []
+        assert _unwrap_results(None) == []
+        assert _unwrap_results("unexpected") == []
 
     def test_prefetch_dict_response(self, monkeypatch):
         client = FakeClientV2(search_results={
@@ -192,9 +208,9 @@ class TestMem0ResponseUnwrapping:
         })
         provider = Mem0MemoryProvider()
         provider.initialize("test-session")
-        monkeypatch.setattr(provider, "_get_client", lambda: client)
+        provider._backend = client
 
-        provider.queue_prefetch("preferences")
+        provider._start_prefetch("preferences")
         provider._prefetch_thread.join(timeout=2)
         result = provider.prefetch("preferences")
 

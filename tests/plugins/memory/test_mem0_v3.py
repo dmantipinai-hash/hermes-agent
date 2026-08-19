@@ -246,7 +246,11 @@ class TestMem0V3Config:
         provider = Mem0MemoryProvider()
         schemas = provider.get_tool_schemas()
         names = [s["name"] for s in schemas]
-        assert names == ["mem0_search", "mem0_add", "mem0_update", "mem0_delete"]
+        # mem0_profile is the fork's listing tool (salvaged PRs #5301/#5117)
+        # on top of upstream's four-tool surface.
+        assert names == [
+            "mem0_profile", "mem0_search", "mem0_add", "mem0_update", "mem0_delete",
+        ]
 
     def test_system_prompt_new_tool_names(self):
         provider = Mem0MemoryProvider()
