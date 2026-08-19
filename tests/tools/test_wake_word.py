@@ -210,6 +210,10 @@ def _install_fake_openwakeword(monkeypatch):
     model_mod.Model = _FakeModel
 
     monkeypatch.setitem(sys.modules, "openwakeword", oww)
+    # The fake backend predicts fine on any framework — the macOS-arm64
+    # tflite runtime gate guards the REAL onnx/tflite backends, not this
+    # download-models regression test.
+    monkeypatch.setattr(ww, "_is_macos_arm64", lambda: False)
     monkeypatch.setitem(sys.modules, "openwakeword.model", model_mod)
     monkeypatch.setattr("tools.lazy_deps.ensure", lambda *a, **k: None)
     return calls

@@ -685,7 +685,9 @@ FAL_MODELS: Dict[str, Dict[str, Any]] = {
             "prompt", "aspect_ratio", "num_images", "output_format",
             "resolution", "quality", "sync_mode",
         },
-        "upscale": True,   # 1k native is sub-2MP
+        # Opt-in only (Aug 2026 policy, f06c41522e): the default-on
+        # upscale chain degraded text/CJK/faces; callers pass upscale=true.
+        "upscale": False,
         # Edit endpoint takes `image_urls` (max 3) + the same knobs;
         # aspect_ratio defaults to "auto" (follows the first input image),
         # so we don't send it on edits.

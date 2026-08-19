@@ -1750,13 +1750,18 @@ def _load_local_whisper_model(model_name: str, device: str = "auto", compute_typ
         os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 
     from faster_whisper import WhisperModel
-    if force_cpu:
+    if force_cpu and (device == "auto" and compute_type == "auto"):
+        # An explicitly pinned stt.local.device / stt.local.compute_type
+        # (#9088) wins over the Apple-Silicon heuristic — the user asked
+        # for that exact configuration.
         logger.info(
             "Apple Silicon/Rosetta detected — loading faster-whisper on CPU "
             "(int8) to avoid native device autodetection crashes"
         )
         return WhisperModel(model_name, device="cpu", compute_type="int8")
 
+    if force_cpu and device == "auto":
+        device = "cpu"  # heuristic still applies to the unpinned axis
     try:
         return WhisperModel(model_name, device=device, compute_type=compute_type)
     except Exception as exc:

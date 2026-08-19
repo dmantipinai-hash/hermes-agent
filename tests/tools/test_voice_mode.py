@@ -124,7 +124,11 @@ class TestPulseSocketReachable:
     def test_stale_socket_file_not_reachable(self, monkeypatch, tmp_path):
         """A socket file with no listener should not count as reachable."""
         import socket as _socket
-        sock_path = tmp_path / "pulse" / "native"
+        # macOS caps AF_UNIX sun_path at 104 bytes — pytest's tmp_path is
+        # too deep, so stand the socket tree in a short OS-tmp dir instead.
+        import tempfile
+        runtime_dir = Path(tempfile.mkdtemp(prefix="xdg-"))
+        sock_path = runtime_dir / "pulse" / "native"
         sock_path.parent.mkdir(parents=True)
         # Create + bind, then close so the path is a stale socket file.
         s = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
@@ -132,14 +136,16 @@ class TestPulseSocketReachable:
         s.close()
         monkeypatch.delenv("PULSE_SERVER", raising=False)
         monkeypatch.delenv("PULSE_RUNTIME_PATH", raising=False)
-        monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+        monkeypatch.setenv("XDG_RUNTIME_DIR", str(runtime_dir))
         from tools.voice_mode import _pulse_socket_reachable
         assert _pulse_socket_reachable() is False
 
     def test_listening_socket_reachable_via_xdg_runtime(self, monkeypatch, tmp_path):
         """A live PulseAudio-style socket under XDG_RUNTIME_DIR is reachable (#35622)."""
         import socket as _socket
-        sock_path = tmp_path / "pulse" / "native"
+        import tempfile
+        runtime_dir = Path(tempfile.mkdtemp(prefix="xdg-"))
+        sock_path = runtime_dir / "pulse" / "native"
         sock_path.parent.mkdir(parents=True)
         server = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
         server.bind(str(sock_path))
@@ -147,7 +153,7 @@ class TestPulseSocketReachable:
         try:
             monkeypatch.delenv("PULSE_SERVER", raising=False)
             monkeypatch.delenv("PULSE_RUNTIME_PATH", raising=False)
-            monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+            monkeypatch.setenv("XDG_RUNTIME_DIR", str(runtime_dir))
             from tools.voice_mode import _pulse_socket_reachable
             assert _pulse_socket_reachable() is True
         finally:
@@ -695,7 +701,12 @@ class TestCleanupTempRecordings:
 # ============================================================================
 
 class TestPlayBeep:
+    @pytest.mark.linux_only
     def test_beep_calls_sounddevice_play(self, mock_sd):
+        # On macOS beep output deliberately routes through afplay (TCC
+        # policy — sounddevice OUTPUT would prompt for microphone access),
+        # so the sounddevice arm only exists off Darwin. Same rationale as
+        # TestPlayAudioFile.test_play_wav_via_sounddevice above.
         np = pytest.importorskip("numpy")
 
         from tools.voice_mode import play_beep
@@ -1376,6 +1387,7 @@ class TestDefaultInputSamplerate:
             assert wf.getframerate() == 48000
 
 
+@pytest.mark.linux_only
 class TestWSL2PowerShellFallback:
     """Regression tests for WSL2 PowerShell TTS fallback (issue #17608).
 

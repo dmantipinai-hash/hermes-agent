@@ -1133,6 +1133,22 @@ def memory_tool(
     if target not in {"memory", "user"}:
         return tool_error(f"Invalid target '{target}'. Use 'memory' or 'user'.", success=False)
 
+    # Param validation runs BEFORE the write gate so a malformed write is
+    # rejected immediately instead of staged and failing at approve time.
+    if action == "add" and not content:
+        return tool_error("Content is required for 'add' action.", success=False)
+    if action == "replace":
+        if not old_text:
+            return tool_error("old_text is required for 'replace' action.", success=False)
+        if not content:
+            return tool_error("content is required for 'replace' action.", success=False)
+
+    # Write gate: off blocks the write; approve stages it (background) or
+    # prompts inline (foreground). on (default) passes straight through.
+    gate_result = _apply_write_gate(action, target, content, old_text)
+    if gate_result is not None:
+        return gate_result
+
     _is_v2 = hasattr(store, "recall") and hasattr(store, "deprecate")
 
     if action == "add":
@@ -1310,7 +1326,7 @@ MEMORY_SCHEMA = {
                 "description": "Why the entry is deprecated (for the 'deprecate' action)."
             },
         },
-        "required": ["target"],
+        "required": ["action", "target"],
     },
 }
 
