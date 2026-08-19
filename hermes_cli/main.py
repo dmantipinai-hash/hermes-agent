@@ -4831,6 +4831,7 @@ _LAZY_COMMAND_EXPORTS = {
         "_branch_head_suffix",
         "_cmd_update_check",
         "_cmd_update_impl",
+        "_cmd_update_pip",
         "_cold_start_windows_gateway_after_update",
         "_count_commits_between",
         "_dependency_sync_would_rewrite",

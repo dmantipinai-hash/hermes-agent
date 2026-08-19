@@ -424,6 +424,34 @@ def _install_method_project_root(project_root: Optional[Path] = None) -> Path:
     return Path(__file__).parent.parent.resolve()
 
 
+def is_uv_tool_install() -> bool:
+    """Return True when the *running* Hermes lives in a ``uv tool`` layout.
+
+    ``uv tool install hermes-agent`` places the install at
+    ``.../uv/tools/hermes-agent/...`` (default ``~/.local/share/uv/tools``,
+    or ``$UV_TOOL_DIR/...``). Such installs live outside any virtualenv, so
+    ``uv pip install`` fails with ``No virtual environment found`` and the
+    update path must use ``uv tool upgrade`` instead.
+
+    Detection is intentionally restricted to properties of the running
+    interpreter (``sys.prefix`` / ``sys.executable``). We deliberately do
+    NOT consult ``uv tool list``: it would also return True when
+    ``hermes-agent`` happens to be uv-tool-installed on the machine while
+    the *active* Hermes is a regular pip/venv install, causing
+    ``hermes update`` to upgrade the wrong copy. It would also block on a
+    subprocess call (~seconds) just to compute a recommendation string.
+    """
+    def _has_uv_tool_marker(path: str) -> bool:
+        norm = os.path.normpath(path).replace(os.sep, "/").lower()
+        return "/uv/tools/hermes-agent/" in norm + "/"
+
+    if _has_uv_tool_marker(sys.prefix):
+        return True
+    if _has_uv_tool_marker(sys.executable or ""):
+        return True
+    return False
+
+
 def detect_install_method(project_root: Optional[Path] = None) -> str:
     """Detect how Hermes was installed: 'apt', 'docker', 'nix', 'nixos',
     'home-manager', 'git', or 'unknown'.
@@ -477,7 +505,7 @@ def detect_install_method(project_root: Optional[Path] = None) -> str:
     # "home-manager" is here because step 3 can return it. A stamp must name
     # every method that this function returns. Without it, the stamp of a
     # home-manager install gives "unknown".
-    supported_methods = {"apt", "docker", "nix", "nixos", "home-manager", "git", "unknown"}
+    supported_methods = {"apt", "docker", "nix", "nixos", "home-manager", "git", "pip", "unknown"}
 
     # 1. Code-scoped stamp — authoritative, immune to shared $HERMES_HOME.
     try:
@@ -531,7 +559,10 @@ def detect_install_method(project_root: Optional[Path] = None) -> str:
                 return "git"
         except OSError:
             pass
-    return "unknown"
+    # No stamp, no managed marker, no .git — what remains is a
+    # pip/pipx/uv-tool install (PyPI layout). Pre-merge fork semantics:
+    # these are updatable via _cmd_update_pip, not "unknown".
+    return "pip"
 
 
 def _running_in_container() -> bool:
@@ -585,6 +616,13 @@ def recommended_update_command_for_method(method: str) -> str:
         # By contract, the current "apt" install method is the Termux APT
         # distribution. It deliberately uses Termux's `pkg` frontend.
         return "pkg upgrade hermes-agent"
+    if method == "pip":
+        if is_uv_tool_install():
+            return "uv tool upgrade hermes-agent"
+        import shutil
+        if shutil.which("uv"):
+            return "uv pip install --upgrade hermes-agent"
+        return "pip install --upgrade hermes-agent"
     return "hermes update"
 
 
