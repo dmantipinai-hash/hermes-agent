@@ -38,8 +38,12 @@ class DaemonThreadPoolExecutor(ThreadPoolExecutor):
     """ThreadPoolExecutor variant whose workers do not block process exit."""
 
     def _adjust_thread_count(self) -> None:
-        # Mirrors CPython's implementation (3.8–3.13) with two changes:
-        # daemon=True and no _threads_queues registration.
+        # Mirrors CPython's implementation with two changes: daemon=True and
+        # no _threads_queues registration. Worker spawning differs by version:
+        # 3.8–3.13 pass (weakref, work_queue, initializer, initargs); 3.14+
+        # fold the initializer into a WorkerContext and pass
+        # (weakref, context, work_queue). Probe the instance, not the version
+        # string — homebrew/point releases backport independently.
         if self._idle_semaphore.acquire(timeout=0):
             return
 
@@ -49,16 +53,28 @@ class DaemonThreadPoolExecutor(ThreadPoolExecutor):
         num_threads = len(self._threads)
         if num_threads < self._max_workers:
             thread_name = "%s_%d" % (self._thread_name_prefix or self, num_threads)
-            t = threading.Thread(
-                name=thread_name,
-                target=_worker,
-                args=(
-                    weakref.ref(self, weakref_cb),
-                    self._work_queue,
-                    self._initializer,
-                    self._initargs,
-                ),
-                daemon=True,
-            )
+            if hasattr(self, "_create_worker_context"):
+                t = threading.Thread(
+                    name=thread_name,
+                    target=_worker,
+                    args=(
+                        weakref.ref(self, weakref_cb),
+                        self._create_worker_context(),
+                        self._work_queue,
+                    ),
+                    daemon=True,
+                )
+            else:
+                t = threading.Thread(
+                    name=thread_name,
+                    target=_worker,
+                    args=(
+                        weakref.ref(self, weakref_cb),
+                        self._work_queue,
+                        self._initializer,
+                        self._initargs,
+                    ),
+                    daemon=True,
+                )
             t.start()
             self._threads.add(t)
