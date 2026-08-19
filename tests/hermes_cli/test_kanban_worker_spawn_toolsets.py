@@ -159,5 +159,9 @@ toolsets:
     assert resolved is not None
     assert "terminal" in resolved
     assert "web" in resolved
-    assert "kanban" in resolved  # recovered worker lifecycle surface
+    # The worker lifecycle surface does NOT need to ride the resolver list:
+    # model_tools._compute_tool_definitions auto-appends the kanban toolset
+    # for dispatcher-owned workers (HERMES_KANBAN_TASK set), so assignee
+    # profiles restricting their chat toolsets still get completion/block/
+    # heartbeat tools at runtime.
     assert resolved != ["kanban"]

@@ -22,7 +22,9 @@ def test_kanban_codex_lane_skill_frontmatter_is_valid():
 
     assert _validate_frontmatter(content) is None
     assert "name: kanban-codex-lane" in content
-    assert "description: Use when" in content
+    # Description rewritten to the 60-char authoring hardline (Aug 2026
+    # sweep); the old "Use when ..." trigger-style opener is gone by design.
+    assert "description: Run Codex CLI as an isolated implementation lane." in content
 
 
 def test_kanban_codex_lane_skill_is_discoverable_with_template(monkeypatch, tmp_path):

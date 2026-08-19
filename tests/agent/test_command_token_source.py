@@ -94,14 +94,16 @@ class TestCaching:
     def test_token_is_cached_between_calls(self):
         """Without caching the command would run on every request."""
         # A command whose output changes each run: equal results prove caching.
-        source = CommandTokenSource("date +%s%N", "dbx")
+        source = CommandTokenSource("openssl rand -hex 6", "dbx")
         assert source() == source()
 
     def test_expired_token_is_reminted(self):
         # date +%s%N changes every run; $RANDOM would be bash-only (empty
         # under dash, which is what /bin/sh is on Debian-family CI).
+        # openssl rand is portable across GNU/BSD (date +%s%N is GNU-only;
+        # BSD date prints a literal 'N', making every mint identical).
         source = CommandTokenSource(
-            """printf '{"access_token":"tok-%s","expires_in":3600}' "$(date +%s%N)" """,
+            """printf '{"access_token":"tok-%s","expires_in":3600}' "$(openssl rand -hex 6)" """,
             "dbx",
         )
         first = source()
@@ -119,7 +121,7 @@ class TestCaching:
         """
         from agent.command_token_source import _NO_TTL_REFRESH_SECONDS
 
-        source = CommandTokenSource("date +%s%N", "dbx")
+        source = CommandTokenSource("openssl rand -hex 6", "dbx")
         first = source()
         assert 0 < source._expires_at - time.monotonic() <= _NO_TTL_REFRESH_SECONDS
         assert source() == first  # cached inside the window

@@ -141,6 +141,17 @@ Or as a global tool without activating a venv:
 uv tool install --from "git+https://github.com/dmantipinai-hash/hermes-agent.git" "hermes-agent[all]"
 ```
 
+**Windows (native, no WSL):**
+
+```powershell
+iex (irm https://hermes-agent.nousresearch.com/install.ps1)
+```
+
+The installer handles everything: uv, Python 3.11, Node.js, ripgrep,
+ffmpeg, and a portable Git Bash (MinGit — no admin required, isolated
+from any system Git install). See the upstream
+[Windows guide](https://hermes-agent.nousresearch.com/docs) for details.
+
 **Updating:**
 
 ```bash
