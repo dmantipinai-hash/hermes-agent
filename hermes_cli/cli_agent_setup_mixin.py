@@ -550,6 +550,25 @@ class CLIAgentSetupMixin:
             # god-file extraction into this mixin a ``global`` here would bind
             # *this module's* namespace, leaving ``cli._active_agent_ref`` None
             # forever — so memory shutdown never ran on /exit (#49287).
+            # Only this root CLI construction site grants mailbox authority.
+            # Delegates, background agents, auxiliary clients, and MCP paths
+            # construct AIAgent elsewhere and retain the default None.
+            from agent.mailbox_principal import grant_top_level_mailbox_principal
+            from hermes_cli.profiles import get_active_profile_name
+
+            _mailbox_profile = get_active_profile_name() or "default"
+            grant_top_level_mailbox_principal(
+                self.agent,
+                platform="cli",
+                sender_profile=_mailbox_profile,
+                actor_identity=f"cli:{_mailbox_profile}:{self.session_id}",
+            )
+            # Start the Kanban mailbox listener for worker principals only.
+            # No-op (returns False) for manager principals and ordinary chat;
+            # the initializer checks mailbox_principal.kind == "worker".
+            from agent.kanban_mailbox import initialize_kanban_mailbox_runtime
+
+            initialize_kanban_mailbox_runtime(self.agent)
             import cli as _cli
             _cli._active_agent_ref = self.agent
             # Route agent status output through prompt_toolkit so ANSI escape

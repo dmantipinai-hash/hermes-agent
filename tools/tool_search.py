@@ -208,7 +208,11 @@ def _core_tool_names() -> frozenset[str]:
 
 # Session-gated GUI toolsets. Off ``_HERMES_CORE_TOOLS`` so non-GUI clients
 # never pay their schema; once a session enables them they stay direct.
-_DIRECT_SURFACE_TOOLSETS = frozenset({"desktop_ui", "project"})
+# "kanban" and "agent_manager" are coordination surfaces a dispatcher worker
+# or explicitly configured coordinator depends on for board traffic
+# (message_agent rides both toolsets); deferring them behind tool_search
+# breaks the worker contract — they are opt-in toolsets, never ambient ones.
+_DIRECT_SURFACE_TOOLSETS = frozenset({"desktop_ui", "project", "kanban", "agent_manager"})
 
 
 def is_deferrable_tool_name(name: str) -> bool:

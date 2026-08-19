@@ -1029,15 +1029,18 @@ def test_real_cli_init_grants_pid_bound_worker_and_visible_tool(
     board, monkeypatch, presentation
 ):
     conn, db_path = board
-    own_task, run_id = _task(conn, assignee="sender", running=True)
+    # The dispatcher claims under ITS profile — the run row's profile column
+    # is stamped at claim time, so the worker env (HERMES_PROFILE=sender)
+    # must be in place before _task() claims, matching production order.
     for key, value in {
-        "HERMES_KANBAN_TASK": own_task,
-        "HERMES_KANBAN_RUN_ID": str(run_id),
         "HERMES_KANBAN_DB": str(db_path),
         "HERMES_KANBAN_BOARD": "default",
         "HERMES_PROFILE": "sender",
     }.items():
         monkeypatch.setenv(key, value)
+    own_task, run_id = _task(conn, assignee="sender", running=True)
+    monkeypatch.setenv("HERMES_KANBAN_TASK", own_task)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
 
     import cli as cli_mod
     from hermes_cli import mcp_startup
