@@ -3712,7 +3712,6 @@ def test_gateway_dispatcher_retries_corrupt_board_after_quarantine(
 ):
     """A corrupt-looking board is retried after the quarantine TTL expires."""
     import asyncio
-    import inspect
     import logging
     import sqlite3
 
@@ -3747,18 +3746,11 @@ def test_gateway_dispatcher_retries_corrupt_board_after_quarantine(
     )
     monkeypatch.setattr(_kb, "kanban_db_path", lambda board=None: corrupt_db)
 
-    real_monotonic = time.monotonic
     time_values = iter([1000.0, 1001.0, 1301.0, 1301.0])
-
-    def _monotonic_for_gateway_dispatcher():
-        caller = inspect.currentframe().f_back  # type: ignore[union-attr]
-        code = caller.f_code if caller is not None else None
-        filename = code.co_filename if code is not None else ""
-        if filename.endswith("gateway/run.py"):
-            return next(time_values, 1301.0)
-        return real_monotonic()
-
-    monkeypatch.setattr("gateway.run.time.monotonic", _monotonic_for_gateway_dispatcher)
+    monkeypatch.setattr(
+        "gateway.kanban_watchers.time",
+        SimpleNamespace(monotonic=lambda: next(time_values, 1301.0)),
+    )
 
     calls = {"tick": 0}
 

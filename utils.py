@@ -299,6 +299,21 @@ def env_bool(key: str, default: bool = False) -> bool:
     return is_truthy_value(os.getenv(key, ""), default=default)
 
 
+def env_float(key: str, default: float = 0.0) -> float:
+    """Read an environment variable as a float, with fallback.
+
+    Mirrors :func:`env_int`: empty/unset → ``default``, unparseable → ``default``.
+    Used by platform adapters for tunable delays (batch spacing, retry backoff).
+    """
+    raw = os.getenv(key, "").strip()
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except (ValueError, TypeError):
+        return default
+
+
 # ─── Proxy Helpers ────────────────────────────────────────────────────────────
 
 

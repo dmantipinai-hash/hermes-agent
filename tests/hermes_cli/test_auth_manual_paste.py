@@ -467,6 +467,11 @@ def test_xai_loopback_login_manual_paste_missing_code_raises(monkeypatch):
 def test_xai_loopback_login_timeout_falls_back_to_manual_paste(monkeypatch):
     """Loopback timeout should offer the existing manual-paste path."""
     monkeypatch.setattr(
+        auth_mod.webbrowser,
+        "open",
+        lambda *_a, **_k: pytest.fail("unit test must not open a real browser"),
+    )
+    monkeypatch.setattr(
         auth_mod, "_xai_oauth_discovery",
         lambda *_a, **_k: {
             "authorization_endpoint": "https://auth.x.ai/oauth2/authorize",
@@ -548,7 +553,10 @@ def test_xai_loopback_login_timeout_falls_back_to_manual_paste(monkeypatch):
 
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf):
-        creds = auth_mod._xai_oauth_loopback_login(manual_paste=False)
+        creds = auth_mod._xai_oauth_loopback_login(
+            manual_paste=False,
+            open_browser=False,
+        )
 
     rendered = buf.getvalue()
     assert "xAI loopback callback timed out." in rendered
@@ -560,6 +568,11 @@ def test_xai_loopback_login_timeout_falls_back_to_manual_paste(monkeypatch):
 
 def test_xai_loopback_login_timeout_noninteractive_reraises(monkeypatch):
     """Non-interactive stdin must keep the original timeout error."""
+    monkeypatch.setattr(
+        auth_mod.webbrowser,
+        "open",
+        lambda *_a, **_k: pytest.fail("unit test must not open a real browser"),
+    )
     monkeypatch.setattr(
         auth_mod, "_xai_oauth_discovery",
         lambda *_a, **_k: {
@@ -617,7 +630,10 @@ def test_xai_loopback_login_timeout_noninteractive_reraises(monkeypatch):
 
     with contextlib.redirect_stdout(io.StringIO()):
         with pytest.raises(auth_mod.AuthError) as exc:
-            auth_mod._xai_oauth_loopback_login(manual_paste=False)
+            auth_mod._xai_oauth_loopback_login(
+                manual_paste=False,
+                open_browser=False,
+            )
     assert exc.value.code == "xai_callback_timeout"
 
 

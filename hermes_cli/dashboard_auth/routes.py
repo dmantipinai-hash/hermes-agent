@@ -29,6 +29,7 @@ from hermes_cli.dashboard_auth import (
 from hermes_cli.dashboard_auth.audit import AuditEvent, audit_log
 from hermes_cli.dashboard_auth.base import (
     InvalidCodeError,
+    InvalidCredentialsError,
     ProviderError,
 )
 from hermes_cli.dashboard_auth.cookies import (
@@ -45,6 +46,40 @@ from hermes_cli.dashboard_auth.login_page import render_login_html
 _log = logging.getLogger(__name__)
 
 router = APIRouter()
+
+
+# ─── Password-login rate limiter ─────────────────────────────────────────────
+#
+# Module-level per-IP attempt tracking for /auth/password-login. Process-local
+# (sessions are too) — sufficient to throttle online guessing against a single
+# dashboard instance. The window/budget match the test contract
+# (test_repeated_failures_eventually_429: 15 rapid attempts → 429).
+_password_attempts: dict[str, list[float]] = {}
+_PASSWORD_RATE_LIMIT_MAX = 10
+_PASSWORD_RATE_LIMIT_WINDOW = 600  # seconds (10 min)
+
+
+def _reset_password_rate_limit() -> None:
+    """Test-only: clear the per-IP attempt counters between tests."""
+    _password_attempts.clear()
+
+
+def _check_password_rate_limit(ip: str) -> bool:
+    """True if ``ip`` is within the attempt budget for the current window.
+
+    Prunes entries older than the window first, then records this attempt.
+    Called BEFORE credential verification so a brute-force attempt is throttled
+    regardless of whether the credentials are valid.
+    """
+    now = time.time()
+    cutoff = now - _PASSWORD_RATE_LIMIT_WINDOW
+    recent = [ts for ts in _password_attempts.get(ip, []) if ts > cutoff]
+    if len(recent) >= _PASSWORD_RATE_LIMIT_MAX:
+        _password_attempts[ip] = recent
+        return False
+    recent.append(now)
+    _password_attempts[ip] = recent
+    return True
 
 
 def _redirect_uri(request: Request) -> str:
@@ -154,7 +189,8 @@ async def api_auth_providers() -> Any:
         )
     return {
         "providers": [
-            {"name": p.name, "display_name": p.display_name}
+            {"name": p.name, "display_name": p.display_name,
+             "supports_password": getattr(p, "supports_password", False)}
             for p in providers
         ],
     }
@@ -173,6 +209,16 @@ async def auth_login(request: Request, provider: str, next: str = ""):
             status_code=404,
             detail=f"Unknown provider: {provider!r}",
         )
+
+    # Password providers don't run the OAuth round trip — route the user to
+    # the login page where the credential form is rendered. This keeps the
+    # ``/auth/login?provider=N`` entry point uniform across provider kinds.
+    if getattr(p, "supports_password", False):
+        target = "/login"
+        if next:
+            from urllib.parse import quote
+            target = f"/login?next={quote(next, safe='')}"
+        return RedirectResponse(url=target, status_code=302)
 
     try:
         ls = p.start_login(redirect_uri=_redirect_uri(request))
@@ -405,6 +451,100 @@ async def auth_logout(request: Request):
     resp = RedirectResponse(url=f"{prefix}/login", status_code=302)
     clear_session_cookies(resp, prefix=prefix)
     clear_pkce_cookie(resp, prefix=prefix)
+    return resp
+
+
+# ---------------------------------------------------------------------------
+# Public: non-redirect (username/password) login
+# ---------------------------------------------------------------------------
+
+
+@router.post("/auth/password-login", name="auth_password_login")
+async def auth_password_login(request: Request):
+    """Exchange username/password for a session via a password provider.
+
+    Non-redirect counterpart to the OAuth round trip: the login page renders
+    a credential form whose submit handler POSTs here as JSON. The route:
+
+      1. rate-limits per IP (429 once the window's attempt budget is spent),
+      2. looks up the provider (404 for unknown OR non-password providers —
+         same response so the endpoint isn't a provider-capability oracle),
+      3. calls ``complete_password_login`` → Session,
+      4. mints session cookies and returns ``{"ok": True, "next": ...}``.
+
+    Failure mapping: ``InvalidCredentialsError`` → generic 401 (no
+    user-vs-password distinction); ``ProviderError`` → 503.
+    """
+    ip = _client_ip(request)
+    if not _check_password_rate_limit(ip):
+        audit_log(
+            AuditEvent.LOGIN_FAILURE,
+            reason="password_rate_limited",
+            ip=ip,
+        )
+        return JSONResponse(
+            {"detail": "Too many login attempts. Please try again later."},
+            status_code=429,
+        )
+
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+
+    provider_name = str(body.get("provider", "") or "")
+    username = str(body.get("username", "") or "")
+    password = str(body.get("password", "") or "")
+    raw_next = str(body.get("next", "") or "")
+
+    p = get_provider(provider_name)
+    # 404 for unknown AND for OAuth-only providers — identical response so the
+    # endpoint can't be probed to learn which providers accept passwords.
+    if p is None or not getattr(p, "supports_password", False):
+        raise HTTPException(status_code=404, detail="Not found")
+
+    try:
+        session = p.complete_password_login(username=username, password=password)
+    except InvalidCredentialsError:
+        # Generic detail — MUST NOT distinguish unknown-user from wrong
+        # password (user-enumeration side channel).
+        audit_log(
+            AuditEvent.LOGIN_FAILURE,
+            provider=provider_name,
+            reason="invalid_credentials",
+            ip=ip,
+        )
+        return JSONResponse(
+            {"detail": "Invalid credentials"}, status_code=401
+        )
+    except ProviderError as e:
+        audit_log(
+            AuditEvent.LOGIN_FAILURE,
+            provider=provider_name,
+            reason="provider_unreachable",
+            ip=ip,
+        )
+        raise HTTPException(
+            status_code=503, detail=f"Provider unreachable: {e}"
+        )
+
+    audit_log(
+        AuditEvent.LOGIN_SUCCESS,
+        provider=provider_name,
+        ip=ip,
+    )
+    # Validate ``next`` against same-origin rules (open-redirect protection).
+    safe_next = _validate_post_login_target(raw_next) or "/"
+    expires_in = max(1, int(session.expires_at - time.time()))
+    resp = JSONResponse({"ok": True, "next": safe_next})
+    set_session_cookies(
+        resp,
+        access_token=session.access_token,
+        refresh_token=session.refresh_token,
+        access_token_expires_in=expires_in,
+        use_https=detect_https(request),
+        prefix=_prefix(request),
+    )
     return resp
 
 

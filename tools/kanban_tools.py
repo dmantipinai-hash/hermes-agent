@@ -560,6 +560,22 @@ def _handle_complete(args: dict, **kw) -> str:
                     created_cards=created_cards,
                     expected_run_id=_worker_run_id(tid),
                 )
+            except kb.MailboxCompletionBlockedError as mailbox_err:
+                run_label = (
+                    str(mailbox_err.current_run_id)
+                    if mailbox_err.current_run_id is not None
+                    else "none"
+                )
+                ids = ", ".join(
+                    str(message_id) for message_id in mailbox_err.message_ids
+                )
+                return tool_error(
+                    f"kanban_complete blocked by unresolved mailbox messages "
+                    f"[{ids}] for current run {run_label}. Your task is still "
+                    f"in-flight (no state change). Let the active mailbox "
+                    f"listener deliver them, respond in a model turn, then "
+                    f"retry kanban_complete with the same handoff."
+                )
             except kb.HallucinatedCardsError as hall_err:
                 # Structured rejection — surface the phantom ids so the
                 # worker can retry with a corrected list or drop the
@@ -718,6 +734,55 @@ def _handle_comment(args: dict, **kw) -> str:
     except Exception as e:
         logger.exception("kanban_comment failed")
         return tool_error(f"kanban_comment: {e}")
+
+
+def _handle_read_thread(args: dict, **kw) -> str:
+    """Read a task's comment thread, optionally only entries newer than a cursor.
+
+    A1 mailbox read-half (ARCHITECTURE-2.0.md §8.1). ``build_worker_context``
+    injects the thread only at spawn; a running worker calls this to see
+    messages that arrived mid-run (e.g. a manager's question via
+    ``message_agent``). Returns comments plus ``last_comment_id`` — pass it
+    back as ``since`` on the next call so reads stay incremental and don't
+    re-flood the context with the whole thread.
+    """
+    tid = _default_task_id(args.get("task_id"))
+    if not tid:
+        return tool_error(
+            "task_id is required (or set HERMES_KANBAN_TASK in the env)"
+        )
+    try:
+        since = int(args.get("since", 0) or 0)
+    except (TypeError, ValueError):
+        return tool_error("since must be an integer comment id")
+    board = args.get("board")
+    try:
+        kb, conn = _connect(board=board)
+        try:
+            comments = kb.list_comments_since(conn, tid, since_id=since)
+        finally:
+            conn.close()
+        last_id = comments[-1].id if comments else since
+        return _ok(
+            task_id=tid,
+            since=since,
+            last_comment_id=last_id,
+            count=len(comments),
+            comments=[
+                {
+                    "id": c.id,
+                    "author": c.author,
+                    "body": c.body,
+                    "created_at": c.created_at,
+                }
+                for c in comments
+            ],
+        )
+    except ValueError as e:
+        return tool_error(f"read_task_thread: {e}")
+    except Exception as e:
+        logger.exception("read_task_thread failed")
+        return tool_error(f"read_task_thread: {e}")
 
 
 def _handle_create(args: dict, **kw) -> str:
@@ -1136,6 +1201,39 @@ KANBAN_COMMENT_SCHEMA = {
     },
 }
 
+READ_TASK_THREAD_SCHEMA = {
+    "name": "read_task_thread",
+    "description": (
+        "Read a task's comment thread incrementally. Pass ``since`` = the "
+        "``last_comment_id`` from your previous call to get only NEW "
+        "comments (your startup context already contains the thread as it "
+        "was at spawn time). Call this BEFORE kanban_block and BEFORE "
+        "kanban_complete: if the manager asked you something mid-run "
+        "(a comment with [question] from another profile), answer it via "
+        "kanban_comment and keep working instead of finishing past it."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "task_id": {
+                "type": "string",
+                "description": _DESC_TASK_ID_DEFAULT,
+            },
+            "since": {
+                "type": "integer",
+                "description": (
+                    "Only return comments with id > since. Use "
+                    "last_comment_id from the previous call; 0 (default) "
+                    "returns the full thread."
+                ),
+                "default": 0,
+            },
+            "board": _board_schema_prop(),
+        },
+        "required": [],
+    },
+}
+
 KANBAN_CREATE_SCHEMA = {
     "name": "kanban_create",
     "description": (
@@ -1382,6 +1480,15 @@ registry.register(
     handler=_handle_comment,
     check_fn=_check_kanban_mode,
     emoji="💬",
+)
+
+registry.register(
+    name="read_task_thread",
+    toolset="kanban",
+    schema=READ_TASK_THREAD_SCHEMA,
+    handler=_handle_read_thread,
+    check_fn=_check_kanban_mode,
+    emoji="📨",
 )
 
 registry.register(

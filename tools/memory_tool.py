@@ -604,10 +604,22 @@ def memory_tool(
     target: str = "memory",
     content: str = None,
     old_text: str = None,
+    entry_type: str = None,
+    importance: float = None,
+    query: str = None,
+    reason: str = None,
+    written_by: str = None,
     store: Optional[MemoryStore] = None,
 ) -> str:
     """
     Single entry point for the memory tool. Dispatches to MemoryStore methods.
+
+    Typed actions (deprecate/read) and the type/importance parameters require
+    the v2 store; on the legacy flat-file store they degrade with a clear
+    error instead of silently misbehaving.
+
+    ``written_by`` records the caller's provenance (e.g. ``main:{session_id}``)
+    for scoped revert; ignored on the legacy store.
 
     Returns JSON string with results.
     """
@@ -617,25 +629,67 @@ def memory_tool(
     if target not in {"memory", "user"}:
         return tool_error(f"Invalid target '{target}'. Use 'memory' or 'user'.", success=False)
 
+    _is_v2 = hasattr(store, "recall") and hasattr(store, "deprecate")
+
     if action == "add":
         if not content:
             return tool_error("Content is required for 'add' action.", success=False)
-        result = store.add(target, content)
+        if _is_v2:
+            result = store.add(
+                target, content, entry_type=entry_type, importance=importance,
+                written_by=written_by,
+            )
+        else:
+            if entry_type or importance is not None:
+                return tool_error(
+                    "Typed memory requires the v2 store (memory.store_v2: true in config).",
+                    success=False,
+                )
+            result = store.add(target, content)
 
     elif action == "replace":
         if not old_text:
             return tool_error("old_text is required for 'replace' action.", success=False)
         if not content:
             return tool_error("content is required for 'replace' action.", success=False)
-        result = store.replace(target, old_text, content)
+        if _is_v2:
+            result = store.replace(target, old_text, content, entry_type=entry_type, importance=importance)
+        else:
+            if entry_type or importance is not None:
+                return tool_error(
+                    "Typed memory requires the v2 store (memory.store_v2: true in config).",
+                    success=False,
+                )
+            result = store.replace(target, old_text, content)
 
     elif action == "remove":
         if not old_text:
             return tool_error("old_text is required for 'remove' action.", success=False)
         result = store.remove(target, old_text)
 
+    elif action == "deprecate":
+        if not _is_v2:
+            return tool_error(
+                "Deprecate requires the v2 store (memory.store_v2: true in config).",
+                success=False,
+            )
+        if not old_text:
+            return tool_error("old_text is required for 'deprecate' action.", success=False)
+        result = store.deprecate(target, old_text, reason=reason or "")
+
+    elif action == "read":
+        if not _is_v2:
+            return tool_error(
+                "Memory search requires the v2 store (memory.store_v2: true in config).",
+                success=False,
+            )
+        search_query = query or content or old_text
+        if not search_query:
+            return tool_error("query is required for 'read' action.", success=False)
+        result = store.recall(search_query, target=target)
+
     else:
-        return tool_error(f"Unknown action '{action}'. Use: add, replace, remove", success=False)
+        return tool_error(f"Unknown action '{action}'. Use: add, replace, remove, deprecate, read", success=False)
 
     return json.dumps(result, ensure_ascii=False)
 
@@ -657,6 +711,10 @@ MEMORY_SCHEMA = {
         "that will still matter later.\n\n"
         "WHEN TO SAVE (do this proactively, don't wait to be asked):\n"
         "- User corrects you or says 'remember this' / 'don't do that again'\n"
+        "- User makes a DECISION (chose X over Y, rejected an approach) — save as type=decision "
+        "with the reason; this prevents re-proposing rejected ideas months later\n"
+        "- User states a constraint or rule ('never do X', 'always Y in this project') — "
+        "save as type=constraint\n"
         "- User shares a preference, habit, or personal detail (name, role, timezone, coding style)\n"
         "- You discover something about the environment (OS, installed tools, project structure)\n"
         "- You learn a convention, API quirk, or workflow specific to this user's setup\n"
@@ -671,7 +729,22 @@ MEMORY_SCHEMA = {
         "- 'user': who the user is -- name, role, preferences, communication style, pet peeves\n"
         "- 'memory': your notes -- environment facts, project conventions, tool quirks, lessons learned\n\n"
         "ACTIONS: add (new entry), replace (update existing -- old_text identifies it), "
-        "remove (delete -- old_text identifies it).\n\n"
+        "remove (hard delete garbage -- old_text identifies it), "
+        "deprecate (mark a decision/constraint obsolete -- kept for audit, hidden from search), "
+        "read (search memory by query before proposing ideas or making decisions).\n\n"
+        "ARCHITECTURE (two tiers): the hot tier is a compact snapshot with a bounded "
+        "char budget injected into the system prompt at session start; entries beyond "
+        "the budget are evicted from the PROMPT only. The cold tier is the full typed "
+        "store (SQLite) holding every record ever saved (type/status/importance, "
+        "audit trail). `read` searches the ENTIRE cold store, including entries you "
+        "cannot see in the current prompt. In addition, records evicted from the "
+        "prompt are re-injected automatically each turn when the user's message "
+        "matches them — so past decisions resurface even without an explicit read. "
+        "When asked how your memory works, describe BOTH tiers.\n\n"
+        "CONTRADICTION RULE: before saving a decision or constraint, run read with the topic "
+        "keywords. If an ACTIVE entry contradicts the new one, deprecate the old entry (with "
+        "reason) and then add the new one. When add returns 'related_active', review those "
+        "entries for conflicts.\n\n"
         "SKIP: trivial/obvious info, things easily re-discovered, raw data dumps, and temporary task state."
     ),
     "parameters": {
@@ -679,7 +752,7 @@ MEMORY_SCHEMA = {
         "properties": {
             "action": {
                 "type": "string",
-                "enum": ["add", "replace", "remove"],
+                "enum": ["add", "replace", "remove", "deprecate", "read"],
                 "description": "The action to perform."
             },
             "target": {
@@ -693,7 +766,28 @@ MEMORY_SCHEMA = {
             },
             "old_text": {
                 "type": "string",
-                "description": "Short unique substring identifying the entry to replace or remove."
+                "description": "Short unique substring identifying the entry to replace, remove, or deprecate."
+            },
+            "type": {
+                "type": "string",
+                "enum": ["fact", "decision", "constraint", "pattern", "preference"],
+                "description": (
+                    "Entry type for 'add'. decision = a choice the user made (include the reason); "
+                    "constraint = a rule/limit to respect; preference = user taste; "
+                    "pattern = recurring behavior; fact = everything else."
+                )
+            },
+            "importance": {
+                "type": "number",
+                "description": "Entry importance 0..1 (default 0.5). Higher importance survives prompt-budget trimming."
+            },
+            "query": {
+                "type": "string",
+                "description": "Search query for the 'read' action."
+            },
+            "reason": {
+                "type": "string",
+                "description": "Why the entry is deprecated (for the 'deprecate' action)."
             },
         },
         "required": ["action", "target"],
@@ -713,6 +807,10 @@ registry.register(
         target=args.get("target", "memory"),
         content=args.get("content"),
         old_text=args.get("old_text"),
+        entry_type=args.get("type"),
+        importance=args.get("importance"),
+        query=args.get("query"),
+        reason=args.get("reason"),
         store=kw.get("store")),
     check_fn=check_memory_requirements,
     emoji="🧠",

@@ -311,6 +311,57 @@ def test_complete_happy_path(worker_env):
         conn.close()
 
 
+def test_complete_surfaces_actionable_mailbox_barrier_error(worker_env):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    conn = kb.connect()
+    try:
+        run_id = kb.get_task(conn, worker_env).current_run_id
+        sent = kb.send_mailbox_message(
+            conn,
+            task_id=worker_env,
+            actor_identity="session:manager",
+            actor_kind="manager",
+            sender_profile="manager",
+            recipient_profile="test-worker",
+            kind="question",
+            body="answer this before completion",
+            wake_requested=False,
+            idempotency_key="tool-barrier",
+        )
+    finally:
+        conn.close()
+
+    out = json.loads(kt._handle_complete({"summary": "too early"}))
+
+    error = out.get("error", "")
+    assert str(sent.message_id) in error
+    assert str(run_id) in error
+    assert "still in-flight" in error
+    assert "mailbox" in error.lower()
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, worker_env).status == "running"
+        assert kb.get_task(conn, worker_env).current_run_id == run_id
+        events = [
+            event for event in kb.list_events(conn, worker_env)
+            if event.kind == "completion_blocked_mailbox"
+        ]
+        assert len(events) == 1
+    finally:
+        conn.close()
+
+
+def test_complete_schema_has_no_mailbox_barrier_bypass_argument():
+    from tools import kanban_tools as kt
+
+    properties = kt.KANBAN_COMPLETE_SCHEMA["parameters"]["properties"]
+    assert "override_mailbox" not in properties
+    assert "force" not in properties
+    assert "ignore_mailbox" not in properties
+
+
 def test_complete_metadata_round_trips_through_show(worker_env):
     """Structured completion metadata should be visible to downstream agents."""
     from tools import kanban_tools as kt
@@ -1147,8 +1198,10 @@ def test_kanban_guidance_in_worker_prompt(monkeypatch, tmp_path):
 
 
 def test_kanban_guidance_prompt_size_bounded(monkeypatch, tmp_path):
-    """Sanity: the guidance block is under 4 KB so it doesn't blow
-    up the cached prompt."""
+    """Sanity: the guidance block stays bounded so it doesn't blow up the
+    cached prompt. The bound is 5 KB rather than 4 KB because the block now
+    merges upstream's clearer rewrite with the A2 mailbox checkpoint protocol
+    (paragraph 3a) — both are load-bearing."""
     monkeypatch.setenv("HERMES_KANBAN_TASK", "t_fake")
     home = tmp_path / ".hermes"
     home.mkdir()
@@ -1157,9 +1210,31 @@ def test_kanban_guidance_prompt_size_bounded(monkeypatch, tmp_path):
     monkeypatch.setattr(_P, "home", lambda: tmp_path)
 
     from agent.prompt_builder import KANBAN_GUIDANCE
-    assert 1_500 < len(KANBAN_GUIDANCE) < 4_096, (
+    assert 1_500 < len(KANBAN_GUIDANCE) < 5_120, (
         f"KANBAN_GUIDANCE is {len(KANBAN_GUIDANCE)} chars — too short (missing?) or too long"
     )
+
+
+def test_kanban_guidance_keeps_mailbox_checkpoint_protocol():
+    """Prompt compression must retain every A1 mailbox obligation."""
+    from agent.prompt_builder import KANBAN_GUIDANCE
+
+    for required in (
+        "read_task_thread",
+        "since",
+        "last_comment_id",
+        "[question]",
+        "[answer]",
+        "kanban_comment",
+        "kanban_block",
+        "kanban_complete",
+        "long heartbeats",
+    ):
+        assert required in KANBAN_GUIDANCE
+
+    assert "Before `kanban_block` or" in KANBAN_GUIDANCE
+    assert "do not poll every iteration" in KANBAN_GUIDANCE
+    assert "unanswered question" in KANBAN_GUIDANCE
 
 
 # ---------------------------------------------------------------------------

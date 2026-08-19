@@ -246,6 +246,24 @@ TOOLSETS = {
         "includes": []
     },
 
+    "agent_manager": {
+        "description": (
+            "Manage a team of specialized agent profiles — create, "
+            "configure (per-profile model/provider/api key), assign kanban "
+            "tasks, and view live status. Each 'agent' is a persistent "
+            "Hermes profile that survives across tasks (unlike delegate_task "
+            "subagents). Opt into it via the `agent_manager` entry in the "
+            "active profile's `toolsets:` config."
+        ),
+        "tools": [
+            "list_agents", "create_agent", "set_agent_model",
+            "delete_agent", "agent_status", "assign_task",
+            "ask_agent",
+            "message_agent",
+        ],
+        "includes": [],
+    },
+
     # "honcho" toolset removed — Honcho is now a memory provider plugin.
     # Tools are injected via MemoryManager, not the toolset system.
 
@@ -270,6 +288,7 @@ TOOLSETS = {
             "kanban_heartbeat", "kanban_comment",
             "kanban_create", "kanban_link",
             "kanban_unblock",
+            "message_agent",
         ],
         "includes": [],
     },
@@ -548,6 +567,90 @@ TOOLSETS = {
         "tools": [],
         "includes": ["hermes-telegram", "hermes-discord", "hermes-whatsapp", "hermes-slack", "hermes-signal", "hermes-bluebubbles", "hermes-homeassistant", "hermes-email", "hermes-sms", "hermes-mattermost", "hermes-matrix", "hermes-dingtalk", "hermes-feishu", "hermes-wecom", "hermes-wecom-callback", "hermes-weixin", "hermes-qqbot", "hermes-webhook", "hermes-yuanbao"]
     }
+}
+
+
+# ---------------------------------------------------------------------------
+# Role-Based Agent Profiles
+#
+# Maps specialization roles to their optimal toolset presets. These are
+# orthogonal to the delegation-capability roles ('leaf'/'orchestrator') in
+# delegate_tool.py: a specialization role determines WHAT tools and system
+# prompt a child gets, while leaf/orchestrator determines WHETHER it can
+# spawn its own children.
+#
+# Specialized roles always default to leaf (cannot delegate). To get an
+# orchestrator, use role='orchestrator' explicitly.
+#
+# Inspired by CrewAI's role-based crews and AgentScope's specialization model.
+# Each role is curated — not just toolset subsets, but the minimal effective
+# toolset for that domain. This keeps child system prompts focused and
+# reduces token overhead.
+# ---------------------------------------------------------------------------
+
+ROLE_TOOLSET_MAP = {
+    "researcher": {
+        "description": (
+            "Research specialist — web search, content extraction, file "
+            "reading, session history. No writes, no terminal."
+        ),
+        "toolsets": ["web", "search", "file", "session_search", "browser"],
+        "prompt_hint": (
+            "You are a research specialist. Focus on finding, extracting, "
+            "and synthesizing information. Prioritize accuracy and cite "
+            "sources (URLs, file paths, line numbers). Do not modify files "
+            "or run commands unless explicitly asked."
+        ),
+    },
+    "coder": {
+        "description": (
+            "Code specialist — terminal, file ops, code execution. "
+            "Full development access."
+        ),
+        "toolsets": ["terminal", "file", "code_execution"],
+        "prompt_hint": (
+            "You are a code specialist. Write clean, working code. Always "
+            "test your changes (build, run tests) before reporting success. "
+            "If something fails, debug and fix it — don't just report the error."
+        ),
+    },
+    "reviewer": {
+        "description": (
+            "Code review specialist — read-only analysis, no writes. "
+            "Focused on quality, correctness, security."
+        ),
+        "toolsets": ["file", "search"],
+        "prompt_hint": (
+            "You are a code reviewer. Analyze code quality, correctness, "
+            "and security. You have READ-ONLY access — do not modify any "
+            "files. Report issues with file paths and line numbers, "
+            "categorized by severity (critical/major/minor/suggestion)."
+        ),
+    },
+    "analyst": {
+        "description": (
+            "Data analyst — terminal, file, code execution, web search. "
+            "Methodical data processing."
+        ),
+        "toolsets": ["terminal", "file", "code_execution", "web"],
+        "prompt_hint": (
+            "You are a data analyst. Process data methodically: inspect "
+            "inputs, write analysis scripts, verify outputs. Present "
+            "findings with concrete numbers and clear conclusions."
+        ),
+    },
+    "writer": {
+        "description": (
+            "Technical writer — file operations, web research. "
+            "Clear, well-structured documentation."
+        ),
+        "toolsets": ["file", "web", "search"],
+        "prompt_hint": (
+            "You are a technical writer. Create clear, well-structured "
+            "documentation. Research before writing. Match the tone and "
+            "format of existing docs in the project."
+        ),
+    },
 }
 
 
@@ -841,6 +944,10 @@ def get_toolset_info(name: str) -> Dict[str, Any]:
     }
 
 
+# Valid roles for delegate_task specialization. Derived from ROLE_TOOLSET_MAP
+# (defined above, near line 572). Built once at import time — after
+# _apply_profile_override() has set HERMES_HOME, so profile-safe.
+VALID_ROLES: Set[str] = set(ROLE_TOOLSET_MAP.keys())
 
 
 if __name__ == "__main__":

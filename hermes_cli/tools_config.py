@@ -1201,6 +1201,21 @@ def _get_platform_tools(
     # Normalise to str so downstream sorted() never mixes types.
     toolset_names = [str(ts) for ts in toolset_names]
 
+    # TD-2/TD-6: the top-level ``toolsets:`` list also activates toolsets.
+    # Merge it in so a toolset listed in EITHER key is enabled. Without this,
+    # ``toolsets: [kanban]`` was read by per-tool ``check_fn`` gates (e.g.
+    # agent_manager, kanban lifecycle) but ignored here for activation —
+    # leaving the toolset's tools filtered out even though check_fn passed.
+    # Merge is a stable union (order-preserving, deduped) so an explicit
+    # platform_toolsets entry keeps precedence and the top-level list only
+    # ever ADDS toolsets, never removes them.
+    top_level = config.get("toolsets") or []
+    if isinstance(top_level, str):
+        top_level = [top_level]
+    if top_level:
+        top_level = [str(ts) for ts in top_level]
+        toolset_names = list(dict.fromkeys(toolset_names + top_level))
+
     configurable_keys = {ts_key for ts_key, _, _ in CONFIGURABLE_TOOLSETS}
     plugin_ts_keys = _get_plugin_toolset_keys()
     platform_default_keys = {p["default_toolset"] for p in PLATFORMS.values()}

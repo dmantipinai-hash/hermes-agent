@@ -52,6 +52,27 @@ def list_providers() -> List[DashboardAuthProvider]:
         return list(_providers.values())
 
 
+def list_session_providers() -> List[DashboardAuthProvider]:
+    """Providers that participate in interactive cookie-session auth.
+
+    Filters :func:`list_providers` to those with ``supports_session = True``.
+    Token-only providers (``supports_session = False``, e.g. a service
+    credential) are excluded so the cookie-verify loop never consults them.
+    """
+    return [p for p in list_providers() if getattr(p, "supports_session", True)]
+
+
+def list_token_providers() -> List[DashboardAuthProvider]:
+    """Providers that participate in non-interactive bearer-token auth.
+
+    Filters :func:`list_providers` to those with ``supports_token = True``.
+    The token-auth middleware consults only these when verifying an
+    ``Authorization: Bearer`` header, so session-only providers are never
+    asked to recognize a token.
+    """
+    return [p for p in list_providers() if getattr(p, "supports_token", False)]
+
+
 def clear_providers() -> None:
     """Test-only: drop all registrations."""
     with _lock:

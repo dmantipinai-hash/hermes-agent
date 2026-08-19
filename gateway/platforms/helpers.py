@@ -276,3 +276,132 @@ def redact_phone(phone: str) -> str:
     if len(phone) <= 8:
         return phone[:2] + "****" + phone[-2:] if len(phone) > 4 else "****"
     return phone[:4] + "****" + phone[-4:]
+
+
+# ─── Markdown Table → Bullet Conversion ──────────────────────────────────────
+#
+# Platform-neutral GFM pipe-table → bullet-group rewriter. Telegram (and any
+# platform that renders pipe tables poorly) calls :func:`convert_table_to_bullets`
+# so a model-emitted table stays readable instead of collapsing into a pipe
+# salad. ``gateway/platforms/telegram.py`` keeps a private copy of the same
+# algorithm for its own rich-message path; the public version here is what
+# platform plugins import.
+
+TABLE_SEPARATOR_RE = re.compile(
+    # A delimiter row: cells of only dashes (with optional leading/trailing
+    # colons for alignment) separated by '|'. Requires at least one internal
+    # '|' so lone '---' horizontal rules are NOT matched.
+    r'^\s*\|?\s*:?-+:?\s*(?:\|\s*:?-+:?\s*){1,}\|?\s*$'
+)
+
+
+def split_markdown_table_row(line: str) -> list[str]:
+    """Split a simple GFM table row into stripped cell values."""
+    stripped = line.strip()
+    if stripped.startswith("|"):
+        stripped = stripped[1:]
+    if stripped.endswith("|"):
+        stripped = stripped[:-1]
+    return [cell.strip() for cell in stripped.split("|")]
+
+
+def is_table_row(line: str) -> bool:
+    """Return True if *line* could plausibly be a table data row."""
+    stripped = line.strip()
+    return bool(stripped) and "|" in stripped
+
+
+def _render_table_block(table_block: list[str]) -> str:
+    """Render a detected GFM table as per-row bullet groups."""
+    if len(table_block) < 3:
+        return "\n".join(table_block)
+
+    headers = split_markdown_table_row(table_block[0])
+    if len(headers) < 2:
+        return "\n".join(table_block)
+
+    # Detect row-label column: present when data rows have one more cell than
+    # the header row (the row-label column carries no header).
+    first_data_row = split_markdown_table_row(table_block[2]) if len(table_block) > 2 else []
+    has_row_label_col = len(first_data_row) == len(headers) + 1
+
+    rendered_groups: list[str] = []
+    for index, row in enumerate(table_block[2:], start=1):
+        cells = split_markdown_table_row(row)
+        if has_row_label_col:
+            heading = cells[0] if cells and cells[0] else f"Row {index}"
+            data_cells = cells[1:]
+        else:
+            heading = next((cell for cell in cells if cell), f"Row {index}")
+            data_cells = cells
+
+        # Pad or trim data_cells to match headers length.
+        if len(data_cells) < len(headers):
+            data_cells.extend([""] * (len(headers) - len(data_cells)))
+        elif len(data_cells) > len(headers):
+            data_cells = data_cells[: len(headers)]
+
+        # Skip any bullet whose value duplicates the heading text — when
+        # has_row_label_col is False the heading IS the first data cell.
+        bullets: list[str] = []
+        for header, value in zip(headers, data_cells):
+            if not has_row_label_col and value == heading:
+                continue
+            bullets.append(f"• {header}: {value}")
+
+        group_lines = [f"**{heading}**", *bullets]
+        rendered_groups.append("\n".join(group_lines))
+
+    # Blank line between row-groups so each reads as a distinct block.
+    return "\n\n".join(rendered_groups)
+
+
+def convert_table_to_bullets(text: str) -> str:
+    """Rewrite GFM-style pipe tables into per-row bullet groups.
+
+    Detected by a header row (contains ``|``) immediately followed by a
+    delimiter row matching :data:`TABLE_SEPARATOR_RE`. Subsequent
+    pipe-containing non-blank lines are consumed as the table body and
+    rewritten. Tables inside fenced code blocks are left alone.
+    """
+    if "|" not in text or "-" not in text:
+        return text
+
+    lines = text.split("\n")
+    out: list[str] = []
+    in_fence = False
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        stripped = line.lstrip()
+
+        # Track fenced code blocks — never touch content inside.
+        if stripped.startswith("```"):
+            in_fence = not in_fence
+            out.append(line)
+            i += 1
+            continue
+        if in_fence:
+            out.append(line)
+            i += 1
+            continue
+
+        # Header row (contains '|') immediately followed by a delimiter row.
+        if (
+            "|" in line
+            and i + 1 < len(lines)
+            and TABLE_SEPARATOR_RE.match(lines[i + 1])
+        ):
+            table_block = [line, lines[i + 1]]
+            j = i + 2
+            while j < len(lines) and is_table_row(lines[j]):
+                table_block.append(lines[j])
+                j += 1
+            out.append(_render_table_block(table_block))
+            i = j
+            continue
+
+        out.append(line)
+        i += 1
+
+    return "\n".join(out)

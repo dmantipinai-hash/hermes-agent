@@ -1,0 +1,7 @@
+name: drift-detection
+version: 0.1.0
+description: "Detect when the agent drifts from a skill's documented numbered steps during a turn and annotate the tool result so the existing background_review fork can patch the skill. Non-blocking — the skill is not modified by this hook; it only surfaces the drift for the review agent to act on with its full guardrails (protected skills, anti-patterns, whitelist)."
+author: "Dmitry Antipin (Architecture 2.0 fork)"
+hooks:
+  - post_tool_call
+  - transform_tool_result

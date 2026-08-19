@@ -969,6 +969,20 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
             try:
                 with open(media_path, "rb") as f:
                     media_kwargs = dict(thread_kwargs)
+                    # Probe duration for voice/audio so Telegram's player
+                    # shows the correct length (it drops container metadata
+                    # for long clips). Applies to both the voice (.ogg/.opus)
+                    # and audio (.mp3/.m4a) paths below.
+                    if (ext in _VOICE_EXTS and is_voice) or ext in _TELEGRAM_SEND_AUDIO_EXTS:
+                        try:
+                            from plugins.platforms.telegram.adapter import (
+                                _probe_voice_duration_seconds,
+                            )
+                            _duration = _probe_voice_duration_seconds(media_path)
+                            if _duration:
+                                media_kwargs["duration"] = _duration
+                        except Exception:
+                            pass
                     try:
                         if ext in _IMAGE_EXTS and not force_document:
                             last_msg = await bot.send_photo(

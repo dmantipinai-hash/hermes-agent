@@ -24,8 +24,13 @@ from fastapi.responses import JSONResponse, RedirectResponse, Response
 
 from hermes_cli.dashboard_auth import list_providers
 from hermes_cli.dashboard_auth.audit import AuditEvent, audit_log
-from hermes_cli.dashboard_auth.base import ProviderError
-from hermes_cli.dashboard_auth.cookies import read_session_cookies
+from hermes_cli.dashboard_auth.base import ProviderError, RefreshExpiredError
+from hermes_cli.dashboard_auth.cookies import (
+    detect_https,
+    read_session_cookies,
+    set_session_cookies,
+)
+from hermes_cli.dashboard_auth.prefix import prefix_from_request
 from hermes_cli.dashboard_auth.public_paths import PUBLIC_API_PATHS
 
 _log = logging.getLogger(__name__)
@@ -39,6 +44,7 @@ _GATE_PUBLIC_PREFIXES: tuple[str, ...] = (
     "/auth/login",
     "/auth/callback",
     "/auth/logout",
+    "/auth/password-login",
     "/login",
     "/api/auth/providers",
     "/assets/",
@@ -184,7 +190,7 @@ async def gated_auth_middleware(
     if _path_is_public(path):
         return await call_next(request)
 
-    at, _rt = read_session_cookies(request)
+    at, rt = read_session_cookies(request)
     if not at:
         return _unauth_response(request, reason="no_cookie")
 
@@ -193,6 +199,7 @@ async def gated_auth_middleware(
     # lets multiple providers stack — the first one that recognises a
     # token wins.
     session = None
+    matched_provider = None
     for provider in list_providers():
         try:
             session = provider.verify_session(access_token=at)
@@ -212,7 +219,38 @@ async def gated_auth_middleware(
                 status_code=503,
             )
         if session is not None:
+            matched_provider = provider
             break
+
+    # Transparent refresh: access token expired/unrecognised but a refresh
+    # token cookie is present. Try to mint a fresh session via the same
+    # provider before bouncing to /login. On success, reissue the session
+    # cookies on the downstream response so the browser rotates them.
+    refreshed_cookies = None
+    if session is None and rt:
+        for provider in list_providers():
+            try:
+                session = provider.refresh_session(refresh_token=rt)
+                matched_provider = provider
+                expires_in = max(
+                    1, int(session.expires_at - __import__("time").time())
+                )
+                refreshed_cookies = {
+                    "access_token": session.access_token,
+                    "refresh_token": session.refresh_token,
+                    "access_token_expires_in": expires_in,
+                    "use_https": detect_https(request),
+                    "prefix": prefix_from_request(request),
+                }
+                break
+            except RefreshExpiredError:
+                continue
+            except ProviderError as e:
+                _log.warning(
+                    "dashboard-auth: provider %r unreachable during refresh: %s",
+                    provider.name, e,
+                )
+                continue
 
     if session is None:
         audit_log(
@@ -222,15 +260,16 @@ async def gated_auth_middleware(
         )
         response = _unauth_response(request, reason="invalid_or_expired_session")
         # Clear the dead cookie so the browser doesn't keep sending it.
-        # Contract v1: no refresh token to retry with, so the only correct
-        # next step is full re-auth via /login. Importing locally avoids a
-        # cycle with cookies → middleware at module load. Pass the active
-        # prefix so the deletion's Path matches the set-Path (otherwise
-        # the browser ignores it).
+        # No refresh token rescued the session (either absent or also dead),
+        # so the only correct next step is full re-auth via /login.
         from hermes_cli.dashboard_auth.cookies import clear_session_cookies
-        from hermes_cli.dashboard_auth.prefix import prefix_from_request
         clear_session_cookies(response, prefix=prefix_from_request(request))
         return response
 
     request.state.session = session
-    return await call_next(request)
+    response = await call_next(request)
+    # If we refreshed, rotate the cookies on the way out so the browser
+    # stores the new access/refresh tokens for subsequent requests.
+    if refreshed_cookies is not None:
+        set_session_cookies(response, **refreshed_cookies)
+    return response

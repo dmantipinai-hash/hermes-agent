@@ -842,6 +842,17 @@ DEFAULT_CONFIG = {
         # only controls how inbound user images are presented.
         "image_input_mode": "auto",
         "disabled_toolsets": [],
+        # Phase 3 mid-turn crash recovery:
+        # auto_resume_last — on CLI startup, if a session with run_active=1
+        # AND ended_at IS NULL exists (i.e. the previous process died
+        # mid-turn), prompt to resume it. Disabled by default so existing
+        # users see no behavior change; opt in by setting true.
+        "auto_resume_last": False,
+        # mid_turn_persist — flush new messages to the session DB after each
+        # tool iteration (not just at turn end) so a crash mid-loop doesn't
+        # lose the tail. Idempotent flush, ~1ms overhead per iteration.
+        # Disable only if you measure DB contention on a slow disk.
+        "mid_turn_persist": True,
     },
     
     "terminal": {
@@ -1474,6 +1485,7 @@ DEFAULT_CONFIG = {
     "stt": {
         "enabled": True,
         "provider": "local",  # "local" (free, faster-whisper) | "groq" | "openai" (Whisper API) | "mistral" (Voxtral Transcribe) | "elevenlabs" (Scribe)
+        "echo_transcripts": True,  # echo 🎙️ "<transcript>" when a voice message arrives as an interrupt (agent busy)
         "local": {
             "model": "base",  # tiny, base, small, medium, large-v3
             "language": "",  # auto-detect by default; set to "en", "es", "fr", etc. to force
@@ -1523,11 +1535,50 @@ DEFAULT_CONFIG = {
         "user_profile_enabled": True,
         "memory_char_limit": 2200,   # ~800 tokens at 2.75 chars/token
         "user_char_limit": 1375,     # ~500 tokens at 2.75 chars/token
+        # Typed SQLite store (Phase 1 of the memory roadmap): entry types
+        # (fact/decision/constraint/pattern/preference), status lifecycle
+        # (active/deprecated/pinned/...), FTS5 recall via memory(action=read),
+        # contradiction-aware deprecate. MEMORY.md/USER.md stay as human-
+        # readable projections; SQLite (memories/memory.db) is canonical.
+        # Set false to roll back to the legacy flat-file store.
+        "store_v2": True,
         # External memory provider plugin (empty = built-in only).
         # Set to a provider name to activate: "openviking", "mem0",
         # "hindsight", "holographic", "retaindb", "byterover".
         # Only ONE external provider is allowed at a time.
         "provider": "",
+        # How often (in user turns) the background self-review fires to
+        # consider memory updates from the recent conversation. Default 5
+        # (down from upstream's 10) so short Q&A sessions of 4-6 turns still
+        # trigger a review instead of never reaching the threshold.
+        "nudge_interval": 5,
+        # Per-turn context pack over the typed store (Phase 2 of the memory
+        # roadmap): each turn the store is searched with the user's message
+        # (intent-routed, scored, token-budgeted) and records NOT already in
+        # the frozen system-prompt snapshot are injected into the API copy of
+        # that message as a separate context slot. While memory fits the
+        # snapshot the pack is empty — nothing is injected.
+        "orchestrator": {
+            "enabled": True,
+            "token_budget": 2500,   # roadmap §3 step 2.3 default
+            "max_entries": 20,      # hard cap on pack size regardless of budget
+            # Scoring weights (roadmap §3 step 2.2). The defaults sum to 1.0;
+            # overrides apply as-is — no normalization.
+            "weights": {
+                "relevance": 0.35,
+                "importance": 0.20,
+                "project_link": 0.15,
+                "decision_value": 0.15,
+                "recency": 0.10,
+                "confidence": 0.05,
+            },
+        },
+        # Cognitive Memory Bus (Phase 3): unified recall/remember facade for
+        # delegation and cron consumers. Read-only by construction for them;
+        # every bus write carries written_by provenance for scoped revert.
+        "bus": {
+            "enabled": True,
+        },
     },
 
     # Subagent delegation — override the provider:model used by delegate_task
@@ -1572,6 +1623,15 @@ DEFAULT_CONFIG = {
         # Flip to true only if you trust delegated work to run dangerous cmds
         # without human review (cron pipelines, batch automation, etc.).
         "subagent_auto_approve": False,
+        # Phase 3 memory bus: append a read-only memory briefing (recalled by
+        # the parent from the typed store) to each child's goal context. The
+        # child agent itself stays memoryless — skip_memory and the stripped
+        # memory toolset are unchanged.
+        "memory_briefing": True,
+        # Realm for subagent briefings: empty = global read; set to a project
+        # name to restrict children to that project's rows + global rows
+        # (Codex §8.4: no foreign-project memory by lexical accident).
+        "subagent_project": "",
     },
 
     # Ephemeral prefill messages file — JSON list of {role, content} dicts
@@ -1625,6 +1685,11 @@ DEFAULT_CONFIG = {
         # External hub installs (trusted/community sources) are always
         # scanned regardless of this setting.
         "guard_agent_created": False,
+        # How often (in tool iterations) the background self-review fires to
+        # consider skill patches/creation from the recent tool use. Default 5
+        # (down from upstream's 10) so short sessions still trigger a skill
+        # review instead of never reaching the threshold.
+        "creation_nudge_interval": 5,
     },
 
     # Curator — background skill maintenance.
@@ -1910,6 +1975,14 @@ DEFAULT_CONFIG = {
         # worker process (if still running host-locally) is terminated
         # before the reclaim.  0 disables stale detection entirely.
         "dispatch_stale_timeout_seconds": 14400,
+        "mailbox": {
+            "poll_interval_seconds": 0.5,
+            "lease_seconds": 30,
+            "max_body_bytes": 16 * 1024,
+            "max_batch_messages": 20,
+            "max_batch_bytes": 32 * 1024,
+            "worker_wake_profiles": [],
+        },
     },
 
     # execute_code settings — controls the tool used for programmatic tool calls.

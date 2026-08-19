@@ -33,6 +33,15 @@ _AUDIO_EXTS = frozenset({'.ogg', '.opus', '.mp3', '.wav', '.m4a', '.flac'})
 # delivered as a regular document.
 _TELEGRAM_AUDIO_ATTACHMENT_EXTS = frozenset({'.mp3', '.m4a'})
 _TELEGRAM_VOICE_EXTS = frozenset({'.ogg', '.opus'})
+# Document extensions whose text content may be inlined into the message
+# payload (subject to a byte cap each adapter applies locally). Surfaced here
+# so platform plugins (telegram/slack) share one canonical set instead of each
+# defining its own. Binary formats (pdf/zip/docx) are deliberately excluded —
+# they are surfaced as a cached path only.
+_TEXT_INJECT_EXTENSIONS = frozenset({
+    '.md', '.txt', '.csv', '.log', '.json',
+    '.xml', '.yaml', '.yml', '.toml', '.ini', '.cfg',
+})
 
 
 def _platform_name(platform) -> str:
@@ -1265,6 +1274,132 @@ def cleanup_document_cache(max_age_hours: int = 24) -> int:
     return removed
 
 
+# ─── Unified media cache (kind-dispatched) ───────────────────────────────────
+
+
+class CachedMedia:
+    """Result of :func:`cache_media_bytes` — a cached attachment with metadata.
+
+    Adapters that handle arbitrary attachments (observed group traffic,
+    replied-to media) need one entry point that routes to the right per-kind
+    cache and returns a uniform object: ``path`` (absolute filesystem path),
+    ``media_type`` (MIME), ``kind`` (one of image/video/audio/document),
+    ``display_name`` (original filename), and ``context_note()`` (a
+    transcript-annotation string). Returning ``None`` from
+    :func:`cache_media_bytes` signals "not cached" (e.g. an image that failed
+    validation) so callers can surface a distinct note instead of crashing.
+    """
+
+    __slots__ = ("path", "media_type", "kind", "display_name")
+
+    def __init__(
+        self,
+        *,
+        path: str,
+        media_type: str,
+        kind: str,
+        display_name: str = "",
+    ) -> None:
+        self.path = path
+        self.media_type = media_type
+        self.kind = kind
+        self.display_name = display_name or Path(path).name
+
+    def context_note(self) -> str:
+        """Annotation appended to the transcript for a cached attachment."""
+        label = self.display_name or Path(self.path).name
+        return f"[Observed {self.kind} '{label}' saved at: {self.path}]"
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging aid
+        return (
+            f"CachedMedia(kind={self.kind!r}, path={self.path!r}, "
+            f"media_type={self.media_type!r})"
+        )
+
+
+# MIME / extension → kind lookup tables. Image detection additionally relies
+# on the byte-signature check ``_looks_like_image``; everything else is
+# extension/MIME driven.
+_IMAGE_EXTS = frozenset({".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".tiff", ".tif"})
+_VIDEO_EXTS = frozenset({".mp4", ".mov", ".mkv", ".avi", ".webm", ".m4v", ".wmv", ".flv"})
+_AUDIO_EXTS = frozenset({".mp3", ".m4a", ".ogg", ".opus", ".wav", ".flac", ".aac"})
+
+
+def _ext_from_filename(filename: str) -> str:
+    """Lowercased extension (with dot) from a filename, or ``""``."""
+    return Path(filename or "").suffix.lower()
+
+
+def _kind_from_mime_ext(
+    mime_type: Optional[str], ext: str, default_kind: str
+) -> str:
+    """Resolve the attachment kind from MIME + extension, falling back to ``default_kind``."""
+    mime = (mime_type or "").split(";")[0].strip().lower()
+    if mime.startswith("image/") or ext in _IMAGE_EXTS:
+        return "image"
+    if mime.startswith("video/") or ext in _VIDEO_EXTS:
+        return "video"
+    if mime.startswith("audio/") or ext in _AUDIO_EXTS:
+        return "audio"
+    if mime.startswith("text/") or ext in _TEXT_INJECT_EXTENSIONS:
+        return "document"
+    return default_kind or "document"
+
+
+def cache_media_bytes(
+    data: bytes,
+    *,
+    filename: str = "",
+    mime_type: Optional[str] = None,
+    default_kind: str = "document",
+) -> Optional[CachedMedia]:
+    """Cache arbitrary attachment bytes, dispatching to the right per-kind store.
+
+    Determines ``kind`` from ``mime_type`` / the filename extension (with
+    ``default_kind`` as fallback), then routes to :func:`cache_image_from_bytes`,
+    :func:`cache_video_from_bytes`, :func:`cache_audio_from_bytes`, or
+    :func:`cache_document_from_bytes`. Returns a :class:`CachedMedia` carrying
+    the path, MIME, kind, and original display name.
+
+    Returns ``None`` only when an image payload fails the byte-signature
+    validation (a known path where callers surface a "could not be read"
+    note). Any other kind is always cached; failures from the per-kind helper
+    propagate as exceptions.
+    """
+    if not data:
+        return None
+
+    ext = _ext_from_filename(filename)
+    kind = _kind_from_mime_ext(mime_type, ext, default_kind)
+
+    if kind == "image":
+        # Re-validate via the byte-signature check; a non-image (e.g. an HTML
+        # error page) must NOT be cached as an image.
+        if not _looks_like_image(data):
+            return None
+        try:
+            path = cache_image_from_bytes(data, ext or ".jpg")
+        except ValueError:
+            return None
+        media_type = mime_type if mime_type and mime_type.startswith("image/") else f"image/{(ext or '.jpeg').lstrip('.').replace('jpg', 'jpeg')}"
+    elif kind == "video":
+        path = cache_video_from_bytes(data, ext or ".mp4")
+        media_type = mime_type if mime_type and mime_type.startswith("video/") else SUPPORTED_VIDEO_TYPES.get(ext, "video/mp4")
+    elif kind == "audio":
+        path = cache_audio_from_bytes(data, ext or ".ogg")
+        media_type = mime_type if mime_type and mime_type.startswith("audio/") else "audio/ogg"
+    else:
+        path = cache_document_from_bytes(data, filename or "document")
+        media_type = mime_type or "application/octet-stream"
+
+    return CachedMedia(
+        path=path,
+        media_type=media_type,
+        kind=kind,
+        display_name=filename or Path(path).name,
+    )
+
+
 class MessageType(Enum):
     """Types of incoming messages."""
     TEXT = "text"
@@ -1339,6 +1474,17 @@ class MessageEvent:
     # Internal flag — set for synthetic events (e.g. background process
     # completion notifications) that must bypass user authorization checks.
     internal: bool = False
+
+    # Cached STT transcripts for voice messages that arrived as interrupts.
+    # Populated once by GatewayRunner._transcribe_pending_audio_event_once
+    # and reused by every subsequent interrupt/drain path so STT never runs
+    # twice for the same voice event (interrupt → drain → follow-up turn).
+    # Empty list means "not transcribed yet"; a populated list is the cache.
+    stt_transcripts: list = field(default_factory=list)
+    # Echo latch: once the 🎙️ "<transcript>" confirmation has been sent for
+    # this event, never send it again — even if multiple interrupt paths
+    # (primary, busy, backup monitor) handle the same pending event.
+    stt_echo_sent: bool = False
 
     # Timestamps
     timestamp: datetime = field(default_factory=datetime.now)
@@ -1430,6 +1576,104 @@ class SendResult:
     # made up the full payload, in send order.  Empty tuple for the common
     # single-message case.
     continuation_message_ids: tuple = ()
+    # Server-requested backoff (seconds) for rate-limited sends. Telegram's
+    # flood control surfaces ``retry_after`` on a 429; the base retry layer
+    # honors it instead of its own short exponential schedule. ``None`` when
+    # the platform didn't request a specific delay.
+    retry_after: Optional[float] = None
+    # Typed classification of a send failure (see ``classify_send_error``).
+    # ``None`` for success or for legacy call sites that never classify —
+    # consumers that branch on it MUST treat ``None`` as "unclassified", not
+    # as a benign category. Added in lockstep with ``classify_send_error`` so
+    # platform adapters can surface a stable category instead of forcing every
+    # consumer to substring-match the raw provider message.
+    error_kind: Optional[str] = None
+
+
+# ─── Send-Error Classification ───────────────────────────────────────────────
+#
+# Platform-neutral vocabulary for send failures. Consumers (dead-target
+# detection, retry policy, user-facing error copy) branch on a typed category
+# instead of substring-matching each provider's localized error message.
+# Adapters call ``classify_send_error`` in their send() failure path and stash
+# the result on ``SendResult.error_kind``.
+
+SEND_ERROR_KINDS = frozenset({
+    "too_long",
+    "bad_format",
+    "forbidden",
+    "not_found",
+    "rate_limited",
+    "transient",
+    "unknown",
+})
+
+
+def _error_blob(exc: BaseException = None) -> str:
+    """Lowercased classification blob from an exception.
+
+    Combines ``str(exc)`` and the exception's class name so the class name
+    participates even when the message is empty (e.g. ``Forbidden()`` →
+    ``"forbidden"``). A stray leading space from an empty ``str(exc)`` is
+    trimmed so single-word class names match cleanly.
+    """
+    text = "" if exc is None else str(exc)
+    cls = "" if exc is None else type(exc).__name__
+    return f"{text} {cls}".strip().lower()
+
+
+def classify_send_error(exc: BaseException = None, text: str = None) -> str:
+    """Classify a platform send failure into a stable :data:`SEND_ERROR_KINDS`.
+
+    Accepts either an exception (``classify_send_error(e)``), an explicit text
+    blob (``classify_send_error(None, raw_msg)``), or both. When only ``exc``
+    is given, the blob is built from its message + class name; when ``text`` is
+    provided it is preferred as the primary signal and ``exc``'s class name is
+    still appended so ``Forbidden()`` classifies correctly even with empty
+    text.
+
+    Returns one of :data:`SEND_ERROR_KINDS`. Unrecognized failures classify as
+    ``"unknown"`` — never as a benign category a consumer might treat as soft
+    recovery.
+    """
+    primary = "" if text is None else str(text)
+    if exc is not None:
+        cls = type(exc).__name__
+        if primary:
+            blob = f"{primary} {cls}".lower()
+        else:
+            blob = _error_blob(exc)
+    else:
+        blob = primary.lower()
+
+    # Order matters: more specific phrases first. ``forbidden`` phrases like
+    # "not enough rights" must be checked before the generic ``not_found`` scan.
+    if "too long" in blob or "message_too_long" in blob:
+        return "too_long"
+    if "can't parse entities" in blob or "can't find end of the entity" in blob:
+        return "bad_format"
+    if (
+        "forbidden" in blob
+        or "bot was blocked by the user" in blob
+        or "user is deactivated" in blob
+        or "not enough rights to send text messages" in blob
+    ):
+        return "forbidden"
+    if "chat not found" in blob or "message to edit not found" in blob:
+        return "not_found"
+    if (
+        "too many requests" in blob
+        or "flood control exceeded" in blob
+        or "retry after" in blob
+    ):
+        return "rate_limited"
+    if (
+        "connecterror" in blob
+        or "connecttimeout" in blob
+        or "connection refused" in blob
+    ):
+        return "transient"
+    return "unknown"
 
 
 class EphemeralReply(str):

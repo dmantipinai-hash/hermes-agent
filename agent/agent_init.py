@@ -59,6 +59,11 @@ from utils import base_url_host_matches
 logger = logging.getLogger("run_agent")
 
 
+def initialize_mailbox_principal(agent) -> None:
+    """Default-deny mailbox authority for every newly-created agent."""
+    agent.mailbox_principal = None
+
+
 def _ra():
     """Lazy reference to ``run_agent`` so callers can patch
     ``run_agent.OpenAI`` / ``run_agent.cleanup_vm`` / ... and have those
@@ -250,6 +255,7 @@ def init_agent(
             remain skipped.
     """
     _install_safe_stdio()
+    initialize_mailbox_principal(agent)
 
     agent.model = model
     agent.max_iterations = max_iterations
@@ -424,6 +430,16 @@ def init_agent(
     # existing tool message rather than inserting a new user turn).
     agent._pending_steer: Optional[str] = None
     agent._pending_steer_lock = threading.Lock()
+    # A2 mailbox guidance is deliberately separate from manual /steer text,
+    # but both are serialized by the same lock.  Queue values are immutable
+    # trusted delivery envelopes keyed by (message_id, run_id); the runtime
+    # helpers lazily create the ordered mappings so object.__new__ test stubs
+    # remain supported.
+    agent._pending_mailbox_deliveries = None
+    agent._inflight_mailbox_deliveries = None
+    agent._active_mailbox_delivery_batch = None
+    agent._mailbox_delivery_included_callback = None
+    agent._mailbox_delivery_responded_callback = None
 
     # Concurrent-tool worker thread tracking.  `_execute_tool_calls_concurrent`
     # runs each tool on its own ThreadPoolExecutor worker — those worker
@@ -1062,9 +1078,11 @@ def init_agent(
 
     # Persistent memory (MEMORY.md + USER.md) -- loaded from disk
     agent._memory_store = None
+    agent._memory_orchestrator = None
+    agent._memory_bus = None
     agent._memory_enabled = False
     agent._user_profile_enabled = False
-    agent._memory_nudge_interval = 10
+    agent._memory_nudge_interval = 5
     agent._turns_since_memory = 0
     agent._iters_since_skill = 0
     if not skip_memory:
@@ -1072,14 +1090,36 @@ def init_agent(
             mem_config = _agent_cfg.get("memory", {})
             agent._memory_enabled = mem_config.get("memory_enabled", False)
             agent._user_profile_enabled = mem_config.get("user_profile_enabled", False)
-            agent._memory_nudge_interval = int(mem_config.get("nudge_interval", 10))
+            agent._memory_nudge_interval = int(mem_config.get("nudge_interval", 5))
             if agent._memory_enabled or agent._user_profile_enabled:
-                from tools.memory_tool import MemoryStore
-                agent._memory_store = MemoryStore(
-                    memory_char_limit=mem_config.get("memory_char_limit", 2200),
-                    user_char_limit=mem_config.get("user_char_limit", 1375),
-                )
+                if mem_config.get("store_v2", True):
+                    # Typed SQLite store (Phase 1 of the memory roadmap):
+                    # types/statuses/FTS5 recall, MEMORY.md kept as projection.
+                    from agent.memory_store_v2 import MemoryStoreV2
+                    agent._memory_store = MemoryStoreV2(
+                        memory_char_limit=mem_config.get("memory_char_limit", 2200),
+                        user_char_limit=mem_config.get("user_char_limit", 1375),
+                    )
+                else:
+                    from tools.memory_tool import MemoryStore
+                    agent._memory_store = MemoryStore(
+                        memory_char_limit=mem_config.get("memory_char_limit", 2200),
+                        user_char_limit=mem_config.get("user_char_limit", 1375),
+                    )
                 agent._memory_store.load_from_disk()
+                # Phase-2 orchestrator: per-turn context pack over the typed
+                # store (intent-routed retrieval + scoring + token budget).
+                # Legacy flat-file store → None (factory duck-types the v2 API).
+                try:
+                    from agent.memory_orchestrator import build_memory_orchestrator
+                    agent._memory_orchestrator = build_memory_orchestrator(
+                        agent._memory_store,
+                        mem_config,
+                        memory_enabled=agent._memory_enabled,
+                        user_profile_enabled=agent._user_profile_enabled,
+                    )
+                except Exception:
+                    agent._memory_orchestrator = None
         except Exception:
             pass  # Memory is optional -- don't break agent init
     
@@ -1150,6 +1190,24 @@ def init_agent(
             _ra().logger.warning("Memory provider plugin init failed: %s", _mpe)
             agent._memory_manager = None
 
+    # Cognitive Memory Bus (Phase 3): unified recall/remember facade over
+    # the typed store (+ external provider when present) for delegation and
+    # cron consumers. Cheap to build (no I/O beyond the store connection);
+    # disabled together with the store via memory.bus.enabled.
+    if agent._memory_store is not None:
+        try:
+            _bus_cfg = (mem_config.get("bus", {}) if isinstance(mem_config, dict) else {})
+            if _bus_cfg.get("enabled", True) and hasattr(agent._memory_store, "recall_candidates"):
+                from agent.memory_bus import MemoryBus
+                agent._memory_bus = MemoryBus(
+                    store=agent._memory_store,
+                    manager=agent._memory_manager,
+                    targets=("memory", "user"),
+                )
+        except Exception as _be:
+            _ra().logger.debug("Memory bus init failed (non-fatal): %s", _be)
+            agent._memory_bus = None
+
     # Inject memory provider tool schemas into the tool surface.
     # Skip tools whose names already exist (plugins may register the
     # same tools via ctx.register_tool(), which lands in agent.tools
@@ -1184,10 +1242,10 @@ def init_agent(
                 _existing_tool_names.add(_tname)
 
     # Skills config: nudge interval for skill creation reminders
-    agent._skill_nudge_interval = 10
+    agent._skill_nudge_interval = 5
     try:
         skills_config = _agent_cfg.get("skills", {})
-        agent._skill_nudge_interval = int(skills_config.get("creation_nudge_interval", 10))
+        agent._skill_nudge_interval = int(skills_config.get("creation_nudge_interval", 5))
     except Exception:
         pass
 
@@ -1197,6 +1255,8 @@ def init_agent(
     if not isinstance(_agent_section, dict):
         _agent_section = {}
     agent._tool_use_enforcement = _agent_section.get("tool_use_enforcement", "auto")
+    # Phase 3: mid-turn crash recovery gating flag.
+    agent._mid_turn_persist = bool(_agent_section.get("mid_turn_persist", True))
 
     # Universal task-completion guidance toggle.  Default True.  Surfaced
     # as a separate flag from tool_use_enforcement because the guidance

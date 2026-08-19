@@ -264,6 +264,7 @@ _LOGIN_HTML_TEMPLATE = """\
     <span class="sep"></span>Public bind &middot; Auth required<span class="sep"></span>
   </footer>
 </main>
+{password_script}
 </body>
 </html>
 """
@@ -359,6 +360,10 @@ def render_login_html(*, next_path: str = "") -> str:
     end-to-end. The caller (``routes.login_page``) is responsible for
     validating ``next_path`` against the same-origin rules before we
     emit it; we still HTML-escape it as defence in depth.
+
+    Password providers (``supports_password = True``) render a credential
+    form + a small submit script instead of an OAuth redirect button; a
+    page with both kinds renders both surfaces.
     """
     providers = list_providers()
     if not providers:
@@ -371,14 +376,82 @@ def render_login_html(*, next_path: str = "") -> str:
         # the button href is byte-identical.
         from urllib.parse import quote
         next_qs = f"&next={html.escape(quote(next_path, safe=''), quote=True)}"
+        next_val = html.escape(next_path, quote=True)
     else:
         next_qs = ""
+        next_val = ""
 
     buttons = []
+    has_password = False
     for p in providers:
-        buttons.append(
-            f'      <a class="provider-btn" '
-            f'href="/auth/login?provider={html.escape(p.name, quote=True)}{next_qs}">'
-            f'Sign in with {html.escape(p.display_name)}</a>'
-        )
-    return _LOGIN_HTML_TEMPLATE.format(provider_buttons="\n".join(buttons))
+        if getattr(p, "supports_password", False):
+            has_password = True
+            buttons.append(_password_provider_form(p, next_val))
+        else:
+            buttons.append(
+                f'      <a class="provider-btn" '
+                f'href="/auth/login?provider={html.escape(p.name, quote=True)}{next_qs}">'
+                f'Sign in with {html.escape(p.display_name)}</a>'
+            )
+
+    # The submit script is only needed when a credential form is present —
+    # an OAuth-only page must stay script-free.
+    script = _PASSWORD_SUBMIT_SCRIPT if has_password else ""
+    return _LOGIN_HTML_TEMPLATE.format(
+        provider_buttons="\n".join(buttons),
+        password_script=script,
+    )
+
+
+def _password_provider_form(provider, next_val: str) -> str:
+    """Render a username/password form for a ``supports_password`` provider."""
+    name = html.escape(provider.name, quote=True)
+    display = html.escape(provider.display_name, quote=True)
+    next_field = (
+        f'      <input type="hidden" name="next" value="{next_val}">\n'
+        if next_val
+        else ""
+    )
+    return (
+        f'      <form class="provider-form" data-provider="{name}" '
+        f'action="/auth/password-login" method="post">\n'
+        f'        <h3>Sign in with {display}</h3>\n'
+        f'        <label>Username<input name="username" autocomplete="username" required></label>\n'
+        f'        <label>Password<input name="password" type="password" autocomplete="current-password" required></label>\n'
+        f'{next_field}'
+        f'        <button type="submit">Sign in</button>\n'
+        f'      </form>'
+    )
+
+
+# Minimal submit handler: serialize the credential form as JSON and POST to
+# /auth/password-login. On success, redirect to the returned ``next``; on
+# 401, surface a generic error without revealing which field was wrong.
+_PASSWORD_SUBMIT_SCRIPT = """<script>
+document.querySelectorAll('form.provider-form').forEach(function(form) {
+  form.addEventListener('submit', function(ev) {
+    ev.preventDefault();
+    var data = {
+      provider: form.getAttribute('data-provider'),
+      username: form.querySelector('[name=username]').value,
+      password: form.querySelector('[name=password]').value,
+      next: (form.querySelector('[name=next]') || {}).value || ''
+    };
+    fetch('/auth/password-login', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(data)
+    }).then(function(r) {
+      if (r.ok) {
+        r.json().then(function(j) { window.location.href = j.next || '/'; });
+      } else if (r.status === 401) {
+        alert('Invalid credentials');
+      } else if (r.status === 429) {
+        alert('Too many attempts. Please try again later.');
+      } else {
+        alert('Login failed');
+      }
+    });
+  });
+});
+</script>"""

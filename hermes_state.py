@@ -264,6 +264,15 @@ CREATE TABLE IF NOT EXISTS sessions (
     handoff_platform TEXT,
     handoff_error TEXT,
     rewind_count INTEGER NOT NULL DEFAULT 0,
+    -- Phase 3 mid-turn crash recovery:
+    -- run_active = 1 while a run_conversation turn is in progress, 0 when it
+    -- ends cleanly. A session with run_active=1 AND ended_at IS NULL after a
+    -- process restart was interrupted mid-turn (the process never reached the
+    -- mark_run_idle call). find_interrupted_session() uses this to locate
+    -- crash-recovery candidates. last_activity_at is touched each iteration
+    -- for diagnostics (how long ago the crash happened).
+    run_active INTEGER NOT NULL DEFAULT 0,
+    last_activity_at REAL,
     FOREIGN KEY (parent_session_id) REFERENCES sessions(id)
 );
 
@@ -970,6 +979,87 @@ class SessionDB:
                 (session_id,),
             )
         self._execute_write(_do)
+
+    # ── Phase 3 mid-turn crash recovery ────────────────────────────────────
+    # A turn's lifecycle: mark_run_active() at the top of run_conversation,
+    # touch_activity() after each tool iteration, mark_run_idle() at any exit.
+    # If the process dies mid-turn, run_active stays 1 — that's the crash
+    # signal. find_interrupted_session() locates the most recent such session
+    # so /resume --last and auto_resume can pick it up.
+
+    def mark_run_active(self, session_id: str) -> None:
+        """Flag a session as mid-turn. Cleared by mark_run_idle()."""
+        if not session_id:
+            return
+
+        def _do(conn):
+            conn.execute(
+                "UPDATE sessions SET run_active = 1, last_activity_at = ? "
+                "WHERE id = ?",
+                (time.time(), session_id),
+            )
+        self._execute_write(_do)
+
+    def mark_run_idle(self, session_id: str) -> None:
+        """Clear the mid-turn flag — called on any run_conversation exit path."""
+        if not session_id:
+            return
+
+        def _do(conn):
+            conn.execute(
+                "UPDATE sessions SET run_active = 0 WHERE id = ?",
+                (session_id,),
+            )
+        self._execute_write(_do)
+
+    def touch_activity(self, session_id: str) -> None:
+        """Update last_activity_at — called after each tool iteration."""
+        if not session_id:
+            return
+
+        def _do(conn):
+            conn.execute(
+                "UPDATE sessions SET last_activity_at = ? WHERE id = ?",
+                (time.time(), session_id),
+            )
+        self._execute_write(_do)
+
+    def find_interrupted_session(self) -> Optional[str]:
+        """Locate the most recent session that was interrupted mid-turn.
+
+        A session qualifies if run_active = 1 AND ended_at IS NULL — meaning
+        the process never reached the mark_run_idle() call at the end of
+        run_conversation. Live-idle sessions (between user turns) have
+        run_active = 0, so this correctly distinguishes "crashed mid-turn"
+        from "open and waiting for input".
+
+        Returns None if no interrupted session exists.
+        """
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT id FROM sessions "
+                "WHERE run_active = 1 AND ended_at IS NULL "
+                "ORDER BY last_activity_at DESC, started_at DESC LIMIT 1"
+            ).fetchone()
+        if row is None:
+            return None
+        return row["id"] if isinstance(row, sqlite3.Row) else row[0]
+
+    def most_recent_session_id(self, exclude_ended: bool = False) -> Optional[str]:
+        """Return the most recently started session id, or None.
+
+        Fallback for /resume --last when no mid-turn-interrupted session is
+        found — just resume the last one the user was in.
+        """
+        with self._lock:
+            sql = "SELECT id FROM sessions"
+            if exclude_ended:
+                sql += " WHERE ended_at IS NULL"
+            sql += " ORDER BY started_at DESC LIMIT 1"
+            row = self._conn.execute(sql).fetchone()
+        if row is None:
+            return None
+        return row["id"] if isinstance(row, sqlite3.Row) else row[0]
 
     def update_session_cwd(self, session_id: str, cwd: str) -> None:
         """Persist the session working directory when a frontend knows it."""

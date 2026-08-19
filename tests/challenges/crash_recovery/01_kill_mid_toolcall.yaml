@@ -1,0 +1,23 @@
+name: "Kill mid toolcall — repair tail"
+category: crash_recovery
+difficulty: medium
+attempts: 2
+description: |
+  An interrupted turn leaves an orphan assistant(tool_calls) or partial
+  tool pair. _repair_interrupted_tail must trim it so the resumed turn
+  doesn't 400 on strict providers (Anthropic Sonnet/Opus 4.6+).
+
+steps:
+  - action: simulate_crash
+    params:
+      tail_kind: orphan_assistant  # assistant(tool_calls) with no tool results
+    expect:
+      repair_dropped: 1
+      tail_role_in: ["user", "assistant"]
+
+  - action: simulate_crash
+    params:
+      tail_kind: partial_pair  # 2 tool_calls, 1 tool result
+    expect:
+      repair_dropped: 2
+      tail_role_in: ["user", "assistant"]

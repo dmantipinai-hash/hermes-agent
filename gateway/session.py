@@ -91,6 +91,12 @@ class SessionSource:
     guild_id: Optional[str] = None  # Discord guild / Slack workspace / Matrix server scope
     parent_chat_id: Optional[str] = None  # Parent channel when chat_id refers to a thread
     message_id: Optional[str] = None  # ID of the triggering message (for pin/reply/react)
+    # Active profile name (multi-instance support). None for default profile.
+    # Platforms that route per-profile (telegram text batching) read this to
+    # build session keys scoped to the owning profile so two profiles sharing
+    # a bot token don't collide. Currently informational in build_session_key;
+    # reserved for future per-profile session isolation.
+    profile: Optional[str] = None
     
     @property
     def description(self) -> str:
@@ -601,10 +607,17 @@ def build_session_key(
     source: SessionSource,
     group_sessions_per_user: bool = True,
     thread_sessions_per_user: bool = False,
+    profile: Optional[str] = None,
 ) -> str:
     """Build a deterministic session key from a message source.
 
     This is the single source of truth for session key construction.
+
+    ``profile`` is accepted for forward compatibility with per-profile
+    session isolation (multi-instance support). It is currently informational
+    and does not alter the key — two profiles sharing a bot token use
+    distinct HERMES_HOME directories, so their session stores are already
+    isolated at the storage layer.
 
     DM rules:
       - DMs include chat_id when present, so each private conversation is isolated.

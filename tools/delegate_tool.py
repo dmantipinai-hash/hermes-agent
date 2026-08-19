@@ -30,7 +30,7 @@ from concurrent.futures import (
 )
 from typing import Any, Dict, List, Optional
 
-from toolsets import TOOLSETS
+from toolsets import TOOLSETS, ROLE_TOOLSET_MAP
 
 # Sentinel value used by the runtime provider system for providers that are
 # not natively known (named custom providers, third-party aggregators, etc.).
@@ -310,7 +310,13 @@ def _looks_like_error_output(content: str) -> bool:
 
 
 def _normalize_role(r: Optional[str]) -> str:
-    """Normalise a caller-provided role to 'leaf' or 'orchestrator'.
+    """Normalise a caller-provided role.
+
+    Returns one of:
+      - 'leaf' — default, no specialization
+      - 'orchestrator' — can delegate further
+      - Any key from ROLE_TOOLSET_MAP (e.g. 'researcher', 'coder') —
+        specialized leaf with curated toolset + prompt
 
     None/empty -> 'leaf'.  Unknown strings coerce to 'leaf' with a
     warning log (matches the silent-degrade pattern of
@@ -321,6 +327,8 @@ def _normalize_role(r: Optional[str]) -> str:
         return "leaf"
     r_norm = str(r).strip().lower()
     if r_norm in {"leaf", "orchestrator"}:
+        return r_norm
+    if r_norm in ROLE_TOOLSET_MAP:
         return r_norm
     logger.warning("Unknown delegate_task role=%r, coercing to 'leaf'", r)
     return "leaf"
@@ -362,6 +370,34 @@ def _get_max_concurrent_children() -> int:
         except (TypeError, ValueError):
             return _DEFAULT_MAX_CONCURRENT_CHILDREN
     return _DEFAULT_MAX_CONCURRENT_CHILDREN
+
+
+def _memory_briefing_enabled() -> bool:
+    """Read delegation.memory_briefing from config (default True).
+
+    Phase 3 memory bus: when enabled, each child's goal context gains a
+    read-only memory briefing recalled by the PARENT (the child agent itself
+    stays memoryless — skip_memory and the stripped toolset are unchanged).
+    """
+    try:
+        cfg = _load_config()
+        return bool(cfg.get("memory_briefing", True))
+    except Exception:
+        return True
+
+
+def _subagent_project_realm() -> Optional[str]:
+    """Read delegation.subagent_project — the realm every child is scoped to.
+
+    Empty (default) = global read. Set to a project name to enforce the
+    Codex §8.4 invariant: subagents see only that project's rows plus
+    global ones, never foreign-project memory.
+    """
+    try:
+        realm = _load_config().get("subagent_project", "")
+        return str(realm).strip() or None
+    except Exception:
+        return None
 
 
 def _get_child_timeout() -> float:
@@ -523,6 +559,10 @@ _HEARTBEAT_STALE_CYCLES_IDLE = 15  # 15 * 30s = 450s idle between turns → stal
 _HEARTBEAT_STALE_CYCLES_IN_TOOL = 40  # 40 * 30s = 1200s stuck on same tool → stale
 DEFAULT_TOOLSETS = ["terminal", "file", "web"]
 
+# All valid role values for delegate_task schema enums.
+# Built from leaf/orchestrator + specialization roles from ROLE_TOOLSET_MAP.
+_ALL_ROLE_NAMES = ["leaf", "orchestrator"] + sorted(ROLE_TOOLSET_MAP.keys())
+
 
 # ---------------------------------------------------------------------------
 # Delegation progress event types
@@ -572,6 +612,7 @@ def _build_child_system_prompt(
     *,
     workspace_path: Optional[str] = None,
     role: str = "leaf",
+    specialization: Optional[str] = None,
     max_spawn_depth: int = 2,
     child_depth: int = 1,
 ) -> str:
@@ -590,6 +631,15 @@ def _build_child_system_prompt(
     ]
     if context and context.strip():
         parts.append(f"\nCONTEXT:\n{context}")
+
+    # Specialization prompt: role-specific behavioral guidance.
+    # Inserted before the general instructions so it reads as identity,
+    # not as an afterthought.
+    if specialization and specialization in ROLE_TOOLSET_MAP:
+        hint = ROLE_TOOLSET_MAP[specialization].get("prompt_hint", "")
+        if hint:
+            parts.append(f"\nROLE SPECIALIZATION ({specialization}):\n{hint}")
+
     if workspace_path and str(workspace_path).strip():
         parts.append(
             "\nWORKSPACE PATH:\n"
@@ -912,6 +962,11 @@ def _build_child_agent(
     orchestrator_ok = _get_orchestrator_enabled() and child_depth < max_spawn
     effective_role = role if (role == "orchestrator" and orchestrator_ok) else "leaf"
 
+    # Preserve specialization role for toolset/prompt decisions.
+    # Specialized roles (researcher, coder, etc.) are always leaves for
+    # delegation purposes, but carry a curated toolset + system prompt.
+    specialization = role if role in ROLE_TOOLSET_MAP else None
+
     # ── Subagent identity (stable across events, 0-indexed for TUI) ─────
     # subagent_id is generated here so the progress callback, the
     # spawn_requested event, and the _active_subagents registry all share
@@ -941,6 +996,12 @@ def _build_child_agent(
         }
     else:
         parent_toolsets = set(DEFAULT_TOOLSETS)
+
+    # Role-based toolset preset: specialized roles (researcher, coder, etc.)
+    # provide curated toolsets when the caller didn't specify explicit ones.
+    # Explicit toolsets always win — role is a convenience, not a constraint.
+    if not toolsets and specialization:
+        toolsets = ROLE_TOOLSET_MAP[specialization]["toolsets"]
 
     if toolsets:
         # Intersect with parent — subagent must not gain tools the parent lacks.
@@ -973,6 +1034,7 @@ def _build_child_agent(
         context,
         workspace_path=workspace_hint,
         role=effective_role,
+        specialization=specialization,
         max_spawn_depth=max_spawn,
         child_depth=child_depth,
     )
@@ -1502,10 +1564,29 @@ def _run_single_child(
         # Python stack (see #14726 — 0-API-call hangs are opaque without it).
         _worker_thread_holder: Dict[str, Optional[threading.Thread]] = {"t": None}
 
+        # Phase 3 memory bus: read-only briefing recalled by the PARENT and
+        # appended to the child's goal. The child agent itself stays
+        # memoryless (skip_memory=True, memory toolset stripped — isolation
+        # unchanged); this is background context, not a memory channel.
+        child_user_message = goal
+        if _memory_briefing_enabled():
+            try:
+                from agent.memory_bus import build_delegation_briefing
+                _briefing = build_delegation_briefing(
+                    parent_agent,
+                    goal,
+                    subagent_id=child_task_id,
+                    project=_subagent_project_realm(),
+                )
+                if _briefing:
+                    child_user_message = goal + "\n\n" + _briefing
+            except Exception as _mb_exc:
+                logger.debug("memory briefing skipped (non-fatal): %s", _mb_exc)
+
         def _run_with_thread_capture():
             _worker_thread_holder["t"] = threading.current_thread()
             return child.run_conversation(
-                user_message=goal,
+                user_message=child_user_message,
                 task_id=child_task_id,
             )
 
@@ -2628,10 +2709,23 @@ def _build_role_param_description() -> str:
             "delegation.max_spawn_depth in config.yaml to enable."
         )
 
+    # Build specialization roles summary
+    spec_lines = []
+    for rname, rdef in ROLE_TOOLSET_MAP.items():
+        spec_lines.append(f"  - '{rname}': {rdef['description']}")
+    spec_block = "\n".join(spec_lines)
+
     return (
-        "Role of the child agent. 'leaf' (default) = focused "
-        "worker, cannot delegate further. 'orchestrator' = can "
-        f"use delegate_task to spawn its own workers. {nesting_note}"
+        "Role of the child agent. Options:\n"
+        "  - 'leaf' (default): focused worker, cannot delegate further.\n"
+        f"  - 'orchestrator': can use delegate_task to spawn its own workers. "
+        f"{nesting_note}\n"
+        "Specialization roles (auto-configures toolset + system prompt, "
+        "always leaf for delegation):\n"
+        f"{spec_block}\n"
+        "When using a specialization role, you can omit 'toolsets' — the "
+        "role's curated toolset is applied automatically. Explicit 'toolsets' "
+        "always overrides the role preset."
     )
 
 
@@ -2733,7 +2827,7 @@ DELEGATE_TASK_SCHEMA = {
                         },
                         "role": {
                             "type": "string",
-                            "enum": ["leaf", "orchestrator"],
+                            "enum": _ALL_ROLE_NAMES,
                             "description": "Per-task role override. See top-level 'role' for semantics.",
                         },
                     },
@@ -2746,7 +2840,7 @@ DELEGATE_TASK_SCHEMA = {
             },
             "role": {
                 "type": "string",
-                "enum": ["leaf", "orchestrator"],
+                "enum": _ALL_ROLE_NAMES,
                 "description": "(rebuilt at get_definitions() time)",
             },
             "acp_command": {

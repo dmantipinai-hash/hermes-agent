@@ -1536,9 +1536,82 @@ class AIAgent:
         except Exception as e:
             logger.warning("Session DB append_message failed: %s", e)
 
-    def _get_messages_up_to_last_assistant(self, messages: List[Dict]) -> List[Dict]:
+    def _repair_interrupted_tail(self, messages: List[Dict]) -> int:
+        """Repair a message list left dangling by a mid-turn crash.
+
+        Called on the resume path BEFORE handing history to the agent. A
+        process killed mid-tool-loop can leave the transcript in one of
+        three protocol-invalid states; this trims back to the last clean
+        boundary so the resumed turn doesn't get a 400 from providers that
+        strictly enforce tool_call / tool-result pairing (Anthropic Sonnet
+        4.6+, Opus 4.6+).
+
+        Cases handled (checked from the tail inward):
+          1. Trailing ``assistant(tool_calls=...)`` with no following
+             ``tool`` results — drop the orphan assistant.
+          2. Trailing ``tool`` results with no preceding
+             ``assistant(tool_calls)`` — drop the orphan tool(s).
+          3. ``assistant(tool_calls=[N calls])`` followed by fewer than N
+             ``tool`` results — drop the whole incomplete pair.
+
+        Returns the number of messages dropped (0 if the list was already
+        clean). Idempotent. Sibling of _drop_trailing_empty_response_scaffolding.
         """
-        Get messages up to (but not including) the last assistant turn.
+        dropped = 0
+        while messages:
+            tail = messages[-1]
+            if not isinstance(tail, dict):
+                break
+            tail_role = tail.get("role")
+
+            # Count trailing tool messages.
+            n_tool = 0
+            i = len(messages) - 1
+            while i >= 0 and isinstance(messages[i], dict) and messages[i].get("role") == "tool":
+                n_tool += 1
+                i -= 1
+
+            if n_tool == 0:
+                # Case 1: trailing assistant(tool_calls) with no tools at all.
+                if tail_role == "assistant" and tail.get("tool_calls"):
+                    messages.pop()
+                    dropped += 1
+                    continue
+                # Clean tail (assistant text or user) — done.
+                break
+
+            # There are n_tool trailing tool messages. The message before
+            # them must be an assistant(tool_calls=...).
+            if i < 0 or not isinstance(messages[i], dict) or messages[i].get("role") != "assistant":
+                # Case 2: orphan tool messages with no preceding assistant.
+                for _ in range(n_tool):
+                    messages.pop()
+                    dropped += 1
+                continue
+
+            assistant_msg = messages[i]
+            tcs = assistant_msg.get("tool_calls") or []
+            n_expected = len(tcs) if isinstance(tcs, list) else 0
+            if n_tool >= n_expected and n_expected > 0:
+                # Complete pair — clean tail, stop.
+                break
+            # Case 3: incomplete pair — drop the partial tools AND the
+            # assistant that initiated them.
+            for _ in range(n_tool):
+                messages.pop()
+                dropped += 1
+            messages.pop()  # the assistant at position i (now the tail)
+            dropped += 1
+
+        if dropped:
+            logger.info(
+                "mid-turn recovery: dropped %d trailing message(s) from "
+                "interrupted turn tail", dropped,
+            )
+        return dropped
+
+    def _get_messages_up_to_last_assistant(self, messages: List[Dict]) -> List[Dict]:
+        """Get messages up to (but not including) the last assistant turn.
         
         This is used when we need to "roll back" to the last successful point
         in the conversation, typically when the final assistant message is
@@ -2112,6 +2185,26 @@ class AIAgent:
             self._pending_steer = None
         return text
 
+    def _enqueue_mailbox_deliveries(self, deliveries) -> bool:
+        """Queue trusted A2 mailbox envelopes beside manual /steer text."""
+        from agent.agent_runtime_helpers import enqueue_mailbox_deliveries
+        return enqueue_mailbox_deliveries(self, deliveries)
+
+    def _drain_pending_mailbox_deliveries(self):
+        """Move the exact pending mailbox set into one immutable snapshot."""
+        from agent.agent_runtime_helpers import drain_pending_mailbox_deliveries
+        return drain_pending_mailbox_deliveries(self)
+
+    def _requeue_mailbox_delivery_batch(self, batch) -> None:
+        """Recover one failed snapshot without overwriting newer leases."""
+        from agent.agent_runtime_helpers import requeue_mailbox_delivery_batch
+        return requeue_mailbox_delivery_batch(self, batch)
+
+    def _recover_inflight_mailbox_deliveries(self) -> None:
+        """Return unresolved request ownership to the pending queue."""
+        from agent.agent_runtime_helpers import recover_inflight_mailbox_deliveries
+        return recover_inflight_mailbox_deliveries(self)
+
     def _record_file_mutation_result(
         self,
         tool_name: str,
@@ -2666,6 +2759,82 @@ class AIAgent:
                 self.client = None
         except Exception:
             pass
+
+        # 6. Shut down the Kanban mailbox listener (worker principals only).
+        #    Idempotent no-op for ordinary agents.  The listener thread is
+        #    daemon-flagged, but an explicit join prevents it from touching
+        #    SQLite after the agent object is gone.
+        #
+        #    Order: stop the listener FIRST, then join it, then run the
+        #    closing fence.  Stopping + joining before the fence guarantees
+        #    the fence observes a quiescent run: no in-flight claim can race
+        #    the `mailbox_accepting = 0` write.  (claim_mailbox_messages
+        #    already re-checks mailbox_accepting=1 inside its own txn, so the
+        #    race is closed at the DB level too — this is defense in depth.)
+        #
+        #    The fence returns closed=False when unresponded messages remain
+        #    (e.g. a non-blocking `info` whose delivery attempt never reached
+        #    model_response_received).  We log it but do NOT try to revive
+        #    the agent here: the real guard against shutting down with
+        #    unhandled *blocking* guidance is complete_task's barrier, which
+        #    runs earlier in the agent loop.  Late non-blocking messages are
+        #    left for a future replacement run / wake.
+        try:
+            from agent.kanban_mailbox import (
+                shutdown_kanban_mailbox_runtime,
+                join_kanban_mailbox_runtime,
+            )
+
+            shutdown_kanban_mailbox_runtime(self)
+            join_kanban_mailbox_runtime(self, timeout=5.0)
+
+            result = self._try_close_mailbox_intake()
+            if result is not None and not result.closed:
+                logger.warning(
+                    "Kanban mailbox intake could not close for task=%s run=%s: "
+                    "%d unresponded message(s) remain id(s)=%s; "
+                    "left for a future replacement run",
+                    getattr(getattr(self, "mailbox_principal", None), "task_id", None),
+                    getattr(getattr(self, "mailbox_principal", None), "run_id", None),
+                    len(result.pending_message_ids),
+                    result.pending_message_ids,
+                )
+        except Exception:
+            pass
+
+    def _try_close_mailbox_intake(self):
+        """Best-effort mailbox intake closing fence for worker principals.
+
+        Returns the ``MailboxIntakeCloseResult`` from the DB layer (or
+        ``None`` for non-worker principals / when the fence cannot run).
+        Callers (``close()``) inspect ``result.closed``: if ``False`` with
+        pending ids, the run still has unresponded mailbox messages and the
+        intake stays open — the dispatcher / a future replacement run will
+        pick them up.  The real guard against shutting down with unhandled
+        *blocking* guidance is ``complete_task``'s barrier, not this fence.
+        """
+        principal = getattr(self, "mailbox_principal", None)
+        if principal is None or principal.kind != "worker":
+            return None
+        if not getattr(principal, "task_id", None) or not getattr(principal, "run_id", None):
+            return None
+        try:
+            from hermes_cli import kanban_db as kb
+
+            conn = kb.connect()
+            try:
+                result = kb.try_close_mailbox_intake(
+                    conn,
+                    task_id=principal.task_id,
+                    run_id=principal.run_id,
+                    recipient_profile=principal.sender_profile,
+                )
+                conn.commit()
+                return result
+            finally:
+                conn.close()
+        except Exception:
+            return None
 
     def _hydrate_todo_store(self, history: List[Dict[str, Any]]) -> None:
         """
@@ -4583,7 +4752,14 @@ class AIAgent:
     ) -> Dict[str, Any]:
         """Forwarder — see ``agent.conversation_loop.run_conversation``."""
         from agent.conversation_loop import run_conversation
-        return run_conversation(self, user_message, system_message, conversation_history, task_id, stream_callback, persist_user_message)
+        # A previous failed turn may have exited after the include barrier but
+        # before response acknowledgement.  Recover that exact immutable
+        # snapshot before starting a new turn, and again on every exit path.
+        self._recover_inflight_mailbox_deliveries()
+        try:
+            return run_conversation(self, user_message, system_message, conversation_history, task_id, stream_callback, persist_user_message)
+        finally:
+            self._recover_inflight_mailbox_deliveries()
 
     def chat(self, message: str, stream_callback: Optional[callable] = None) -> str:
         """

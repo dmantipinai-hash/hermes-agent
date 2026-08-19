@@ -27,6 +27,7 @@ from typing import Any, Callable, Optional
 from gateway.platforms.base import BasePlatformAdapter as _BasePlatformAdapter
 from gateway.platforms.base import _custom_unit_to_cp
 from gateway.platforms.base import MEDIA_TAG_CLEANUP_RE
+from gateway.platforms.base import SendResult
 from gateway.config import (
     DEFAULT_STREAMING_EDIT_INTERVAL as _DEFAULT_STREAMING_EDIT_INTERVAL,
     DEFAULT_STREAMING_BUFFER_THRESHOLD as _DEFAULT_STREAMING_BUFFER_THRESHOLD,
@@ -150,6 +151,11 @@ class GatewayStreamConsumer:
         self._fallback_final_send = False
         self._fallback_prefix = ""
         self._flood_strikes = 0         # Consecutive flood-control edit failures
+        # All preview message ids created during this run (preamble + current
+        # segment preview). Used by fallback cleanup to ensure only the
+        # current segment's stale preview is removed — earlier preambles
+        # carry their own distinct content and must survive the recovery.
+        self._preview_message_ids: set[str] = set()
         self._current_edit_interval = self.cfg.edit_interval  # Adaptive backoff
         self._final_response_sent = False
         # Set when the final response content was sent to the user via
@@ -251,6 +257,18 @@ class GatewayStreamConsumer:
             cb()
         except Exception:
             logger.debug("on_new_message callback error", exc_info=True)
+
+    def _track_preview_id(self, message_id: Optional[str]) -> None:
+        """Record a preview message id so fallback cleanup can preserve it.
+
+        Every message id assigned to ``self._message_id`` during a run is a
+        preview that showed streamed content to the user. Fallback cleanup
+        must only remove the *current* stale preview — earlier preambles
+        carry distinct content and must survive. Tracking them here lets the
+        cleanup assert it isn't deleting already-shown segments.
+        """
+        if message_id and message_id != "__no_edit__":
+            self._preview_message_ids.add(str(message_id))
 
     def _reset_segment_state(self, *, preserve_no_edit: bool = False) -> None:
         if preserve_no_edit and self._message_id == "__no_edit__":
@@ -574,8 +592,12 @@ class GatewayStreamConsumer:
                             # Either the mid-stream edit didn't run (no
                             # visible update this tick) OR the adapter needs
                             # explicit finalize=True to close the stream.
+                            # is_turn_final=True tells _send_or_edit this is
+                            # the completed answer — opt-in adapters (telegram)
+                            # skip adaptive backoff and fall straight to the
+                            # durable fallback send on flood control.
                             self._final_response_sent = await self._send_or_edit(
-                                self._accumulated, finalize=True,
+                                self._accumulated, finalize=True, is_turn_final=True,
                             )
                             if self._final_response_sent:
                                 self._final_content_delivered = True
@@ -748,6 +770,17 @@ class GatewayStreamConsumer:
         final_text = self._clean_for_display(text)
         continuation = self._continuation_text(final_text)
         self._fallback_final_send = False
+        # Adapters whose edits failed on the turn-final edit (opt-in flood
+        # fallback) request a durable resend even when the preview already
+        # shows the content. We still owe the user a real message.
+        _resend_on_empty = getattr(
+            self.adapter, "RESEND_FINAL_ON_EMPTY_STREAM_FALLBACK", False,
+        ) is True
+        # Track whether this call resent the full content as a fresh message
+        # specifically because the continuation was empty (preview already
+        # showed everything). Only in that case is the preview a duplicate
+        # that should be cleaned up despite a non-empty fallback_prefix.
+        _empty_tail_resend = False
         if not continuation.strip():
             # Nothing new to send — the visible partial already matches final text.
             # BUT: if final_text itself has meaningful content (e.g. a timeout
@@ -757,6 +790,13 @@ class GatewayStreamConsumer:
             # boundary).  In that case, send the full final_text as-is (#10807).
             if final_text.strip() and final_text != self._visible_prefix():
                 continuation = final_text
+            elif _resend_on_empty and final_text.strip():
+                # Opt-in adapter (telegram) wants a durable fresh message even
+                # when the preview already shows the content — the preview's
+                # edit-based delivery is not durable and may disappear on
+                # client refresh. Send the full final_text as a fresh message.
+                continuation = final_text
+                _empty_tail_resend = True
             else:
                 # Defence-in-depth for #7183: the last edit may still show the
                 # cursor character because fallback mode was entered after an
@@ -799,24 +839,73 @@ class GatewayStreamConsumer:
         last_message_id: Optional[str] = None
         last_successful_chunk = ""
         sent_any_chunk = False
+        # _resend_on_empty was resolved near the top of this method.
         for chunk in chunks:
             # Try sending with one retry on flood-control errors.
             result = None
+            # Each fallback chunk is a fresh platform message — notify so any
+            # stale tool-progress bubble gets closed off. Merge into a copy so
+            # we don't mutate the caller's metadata dict.
+            send_metadata = dict(self.metadata) if self.metadata else {}
+            send_metadata.setdefault("notify", True)
             for attempt in range(2):
-                result = await self.adapter.send(
-                    chat_id=self.chat_id,
-                    content=chunk,
-                    metadata=self.metadata,
-                )
+                try:
+                    result = await self.adapter.send(
+                        chat_id=self.chat_id,
+                        content=chunk,
+                        metadata=send_metadata,
+                    )
+                except Exception as exc:
+                    # Ambiguous delivery (e.g. TimedOut): the request may have
+                    # reached the server. Treat content as delivered, suppress
+                    # the duplicate, and leave final_response_sent=False so the
+                    # gateway can still reconcile state. Confirmed exceptions
+                    # (network down, auth failure) fall through to the normal
+                    # failure path below.
+                    if self._send_failure_may_have_delivered(exc):
+                        logger.debug(
+                            "Fallback send raised %s — treating as possibly "
+                            "delivered, suppressing duplicate",
+                            type(exc).__name__,
+                        )
+                        self._already_sent = True
+                        self._final_response_sent = False
+                        self._final_content_delivered = True
+                        self._message_id = last_message_id
+                        self._last_sent_text = last_successful_chunk
+                        self._fallback_prefix = ""
+                        return
+                    # Re-raise style: synthesize a failed SendResult so the
+                    # existing failure-handling below applies uniformly.
+                    result = SendResult(
+                        success=False, error=str(exc) or type(exc).__name__,
+                    )
                 if result.success:
                     break
+                # Flood retry: honor the server's retry_after when present,
+                # but only if it's short enough that waiting is worth it. A
+                # 30s flood delay would stall the response past the point of
+                # usefulness — better to hand back to the gateway's
+                # final-send path. Threshold is conservative (10s).
                 if attempt == 0 and self._is_flood_error(result):
-                    logger.debug(
-                        "Flood control on fallback send, retrying in 3s"
+                    _retry_after = (
+                        getattr(result, "retry_after", None) or 0.0
                     )
-                    await asyncio.sleep(3.0)
-                else:
-                    break  # non-flood error or second attempt failed
+                    _FLOOD_RETRY_CEILING = 10.0
+                    if 0 < _retry_after <= _FLOOD_RETRY_CEILING:
+                        logger.debug(
+                            "Flood control on fallback send, retrying in %.1fs",
+                            _retry_after,
+                        )
+                        await asyncio.sleep(_retry_after)
+                        continue
+                    elif _retry_after > _FLOOD_RETRY_CEILING:
+                        logger.debug(
+                            "Flood control on fallback send (retry_after=%.1fs) "
+                            "exceeds ceiling — skipping retry",
+                            _retry_after,
+                        )
+                break  # non-flood error, long flood, or second attempt failed
 
             if not result or not result.success:
                 if sent_any_chunk:
@@ -831,12 +920,30 @@ class GatewayStreamConsumer:
                     self._last_sent_text = last_successful_chunk
                     self._fallback_prefix = ""
                     return
-                # No fallback chunk reached the user — allow the normal gateway
-                # final-send path to try one more time.
+                # No fallback chunk reached the user. Distinguish "possibly
+                # delivered" (ambiguous) from "definitely not delivered"
+                # (confirmed failure). Ambiguous → keep final_content_delivered
+                # True so the gateway doesn't duplicate; confirmed → allow the
+                # gateway's final-send path to retry.
+                _err_text = (getattr(result, "error", "") or "").lower()
+                _ambiguous = (
+                    "timed out" in _err_text
+                    or "timeout" in _err_text
+                )
                 self._already_sent = False
                 self._message_id = None
                 self._last_sent_text = ""
                 self._fallback_prefix = ""
+                if _ambiguous:
+                    # Content may have landed before the timeout — don't let
+                    # the gateway re-send and create a duplicate.
+                    self._final_response_sent = False
+                    self._final_content_delivered = True
+                else:
+                    # Confirmed non-delivery (network down, auth, long flood).
+                    # Reset content-delivered so the gateway retries.
+                    self._final_response_sent = False
+                    self._final_content_delivered = False
                 return
             sent_any_chunk = True
             last_successful_chunk = chunk
@@ -850,7 +957,30 @@ class GatewayStreamConsumer:
         # implement ``delete_message``, the delete fails (flood control still
         # active, bot lacks permission, message too old to delete), the
         # partial remains but at least the full answer was delivered.
-        if stale_message_id and stale_message_id != last_message_id:
+        #
+        # Skip cleanup when a prefix was already delivered to the user via a
+        # partial-overflow edit (``_fallback_prefix`` non-empty): the stale
+        # message carries visible content the user has seen, so deleting it
+        # would hide already-shown text. Only clean up the frozen cursor-only
+        # preview (empty prefix) that carries no user value.
+        #
+        # EXCEPTION: when the adapter opted into
+        # RESEND_FINAL_ON_EMPTY_STREAM_FALLBACK, the fallback send deliberately
+        # re-sent the full content as a durable message even though the
+        # preview already showed it. In that case the preview is a duplicate
+        # and must be cleaned up — but only the current segment's preview
+        # (``_message_id`` / ``stale_message_id``), never earlier preambles
+        # that carry their own distinct content (preserved in
+        # ``_preview_message_ids``).
+        _cleanup_preview = (
+            stale_message_id
+            and stale_message_id != last_message_id
+            and (
+                _empty_tail_resend
+                or not (self._fallback_prefix or "").strip()
+            )
+        )
+        if _cleanup_preview:
             delete_fn = getattr(self.adapter, "delete_message", None)
             if delete_fn is not None:
                 try:
@@ -873,6 +1003,25 @@ class GatewayStreamConsumer:
         err = getattr(result, "error", "") or ""
         err_lower = err.lower()
         return "flood" in err_lower or "retry after" in err_lower or "rate" in err_lower
+
+    @staticmethod
+    def _send_failure_may_have_delivered(exc: BaseException) -> bool:
+        """Classify whether a raised send exception may still have delivered.
+
+        Some platform failures are ambiguous: the request reached the server
+        but the client timed out waiting for the response. In that case the
+        message may already be visible to the user, so retrying would produce
+        a duplicate. This classifier lets ``_send_fallback_final`` suppress
+        the duplicate while still marking content as delivered.
+
+        Currently treats request timeouts (``TimedOut``) as ambiguous. Other
+        exceptions are treated as confirmed non-delivery so the gateway can
+        retry safely.
+        """
+        # Match by class name so we don't import platform-specific exception
+        # types (python-telegram-bot's TimedOut lives in telethon/ptb). This
+        # keeps the consumer free of per-platform dependencies.
+        return type(exc).__name__ == "TimedOut"
 
     def _resolve_draft_streaming(self) -> bool:
         """Decide whether this run should use native draft streaming.
@@ -1111,7 +1260,7 @@ class GatewayStreamConsumer:
         self._final_response_sent = True
         return True
 
-    async def _send_or_edit(self, text: str, *, finalize: bool = False) -> bool:
+    async def _send_or_edit(self, text: str, *, finalize: bool = False, is_turn_final: bool = False) -> bool:
         """Send or edit the streaming message.
 
         Returns True if the text was successfully delivered (sent or edited),
@@ -1120,6 +1269,13 @@ class GatewayStreamConsumer:
 
         ``finalize`` is True when this is the last edit in a streaming
         sequence.
+
+        ``is_turn_final`` is True only for the very last edit that carries the
+        completed answer (not for intermediate segment breaks). When the
+        adapter opts in via ``FALLBACK_ON_FINAL_EDIT_FLOOD``, a flood-control
+        failure on a turn-final edit skips the adaptive backoff and moves
+        directly to the fallback-final path — retrying a turn-final edit burns
+        the same flood budget while the completed answer stays undelivered.
         """
         # Strip MEDIA: directives so they don't appear as visible text.
         # Media files are delivered as native attachments after the stream
@@ -1248,6 +1404,63 @@ class GatewayStreamConsumer:
                         # and retry on the next cycle.  Only permanently disable
                         # edits after _MAX_FLOOD_STRIKES consecutive failures.
                         if self._is_flood_error(result):
+                            # Turn-final + opted-in adapter: don't wait out the
+                            # adaptive backoff. The completed answer is sitting
+                            # undelivered and every retried edit consumes the
+                            # same flood budget that the fallback send needs.
+                            # Move directly to the fallback-final path (strike
+                            # 1 of _MAX_FLOOD_STRIKES so the counter reflects
+                            # "we saw a flood" without exhausting the budget).
+                            if (
+                                is_turn_final
+                                and getattr(
+                                    self.adapter,
+                                    "FALLBACK_ON_FINAL_EDIT_FLOOD",
+                                    False,
+                                )
+                                is True
+                            ):
+                                self._flood_strikes = 1
+                                logger.debug(
+                                    "Flood control on turn-final edit "
+                                    "(opt-in adapter) → immediate fallback "
+                                    "(strike 1/%d)",
+                                    self._MAX_FLOOD_STRIKES,
+                                )
+                                # When the visible preview already shows the
+                                # full final text (continuation is empty), the
+                                # content has been delivered to the user even
+                                # though the edit didn't land durably. An
+                                # opt-in adapter that asked for
+                                # RESEND_FINAL_ON_EMPTY_STREAM_FALLBACK still
+                                # wants a fresh durable message, but we mark
+                                # content as delivered so the gateway doesn't
+                                # treat this as a total loss.
+                                _continuation = self._continuation_text(
+                                    self._clean_for_display(text),
+                                )
+                                if (
+                                    not _continuation.strip()
+                                    and getattr(
+                                        self.adapter,
+                                        "RESEND_FINAL_ON_EMPTY_STREAM_FALLBACK",
+                                        False,
+                                    )
+                                    is True
+                                ):
+                                    self._final_content_delivered = True
+                                self._fallback_prefix = self._visible_prefix()
+                                self._fallback_final_send = True
+                                self._edit_supported = False
+                                self._already_sent = True
+                                # Note: no _try_strip_cursor() here — the
+                                # fallback send will replace or delete the
+                                # preview, so a cursor-strip edit would just
+                                # burn another edit call against the same
+                                # flood budget (regression: edit count must
+                                # stay at 1 for the immediate-fallback path).
+                                return False
+
                             self._flood_strikes += 1
                             self._current_edit_interval = min(
                                 self._current_edit_interval * 2, 10.0,
@@ -1301,6 +1514,9 @@ class GatewayStreamConsumer:
                         # the user so fresh-final logic can detect stale
                         # preview timestamps on long-running responses.
                         self._message_created_ts = time.monotonic()
+                        # Record this preview so fallback cleanup knows which
+                        # segments have already delivered content to the user.
+                        self._track_preview_id(self._message_id)
                     else:
                         self._edit_supported = False
                     self._already_sent = True

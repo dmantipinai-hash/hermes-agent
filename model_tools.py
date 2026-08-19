@@ -810,6 +810,7 @@ def handle_function_call(
     skip_pre_tool_call_hook: bool = False,
     enabled_toolsets: Optional[List[str]] = None,
     disabled_toolsets: Optional[List[str]] = None,
+    mailbox_principal=None,
 ) -> str:
     """
     Main function call dispatcher that routes calls to the tool registry.
@@ -909,6 +910,7 @@ def handle_function_call(
                 skip_pre_tool_call_hook=skip_pre_tool_call_hook,
                 enabled_toolsets=enabled_toolsets,
                 disabled_toolsets=disabled_toolsets,
+                mailbox_principal=mailbox_principal,
             )
 
     try:
@@ -987,6 +989,7 @@ def handle_function_call(
                 function_name, function_args,
                 task_id=task_id,
                 user_task=user_task,
+                mailbox_principal=mailbox_principal,
             )
         duration_ms = int((time.monotonic() - _dispatch_start) * 1000)
 

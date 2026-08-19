@@ -1162,6 +1162,47 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
     return _scan_assembled_cron_prompt("\n".join(parts), job, has_skills=True)
 
 
+def _build_memory_briefing_for_job(job: dict, query: str) -> str:
+    """Read-only memory briefing for a cron run (Phase 3 bus, roadmap 3.3).
+
+    Builds a fresh bus over the profile's typed store (WAL: concurrent with
+    any running agents), subscribes a read-only consumer ``cron:<job_id>``,
+    renders a bounded briefing keyed on the assembled prompt, and always
+    closes the store — the scheduler process is long-lived.
+    """
+    bus = None
+    try:
+        from agent.memory_bus import ConsumerSpec, READ_MEMORY, build_cron_bus
+
+        bus = build_cron_bus()
+        if bus is None:
+            return ""
+        view = bus.scoped_view(
+            ConsumerSpec(
+                f"cron:{job.get('id', 'unknown')}",
+                needs=frozenset({READ_MEMORY}),
+            )
+        )
+        if view is None:
+            return ""
+        briefing = view.render_briefing(query)
+        if briefing:
+            # Live-E2E evidence: the briefing rides the per-run prompt only.
+            logger.info(
+                "cron job %s: memory briefing chars=%d", job.get("id", "?"), len(briefing)
+            )
+        return briefing
+    except Exception as exc:
+        logger.debug("cron memory briefing failed (non-fatal): %s", exc)
+        return ""
+    finally:
+        if bus is not None:
+            try:
+                bus.store.close()
+            except Exception:
+                pass
+
+
 def _scan_assembled_cron_prompt(assembled: str, job: dict, *, has_skills: bool = False) -> str:
     """Scan the fully-assembled cron prompt for injection patterns. Raises
     ``CronPromptInjectionBlocked`` when a match fires so ``run_job`` can
@@ -1388,6 +1429,31 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
     if prompt is None:
         logger.info("Job '%s': script produced no output, skipping AI call.", job_name)
         return True, "", SILENT_MARKER, None
+
+    # Phase 3 memory bus: jobs with memory="read" get a read-only briefing
+    # recalled per run. The agent keeps skip_memory=True (no system-prompt
+    # snapshot, no writes — the historic corruption concern was about the
+    # snapshot); only this run's prompt gains bounded background context.
+    # The briefing itself goes through the injection scanner: recalled
+    # memory is user data, not trusted system text.
+    #
+    # The recall query is the RAW job prompt, not the assembled one: the
+    # delivery preamble + script output would eat the stem-search token cap
+    # with boilerplate before the question's words ever get a turn (found
+    # live on hemdal — the briefing silently came back empty).
+    if job.get("memory") == "read":
+        briefing = _build_memory_briefing_for_job(job, job.get("prompt") or prompt)
+        if briefing:
+            try:
+                _scan_assembled_cron_prompt(briefing, job)
+                prompt = prompt + "\n\n" + briefing
+            except CronPromptInjectionBlocked as mem_block:
+                logger.warning(
+                    "Job '%s' (ID: %s): memory briefing tripped the injection "
+                    "scanner — skipped. %s",
+                    job_name, job_id, mem_block,
+                )
+
     origin = _resolve_origin(job)
     _cron_session_id = f"cron_{job_id}_{_hermes_now().strftime('%Y%m%d_%H%M%S')}"
 

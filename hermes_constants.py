@@ -5,9 +5,11 @@ without risk of circular imports.
 """
 
 import os
+import shutil
 import sysconfig
 from contextvars import ContextVar, Token
 from pathlib import Path
+from typing import Optional
 
 
 _profile_fallback_warned: bool = False
@@ -404,6 +406,34 @@ def get_skills_dir() -> Path:
 def get_env_path() -> Path:
     """Return the path to the ``.env`` file under HERMES_HOME."""
     return get_hermes_home() / ".env"
+
+
+# ─── Executable / Environment Helpers ─────────────────────────────────────────
+
+
+def find_node_executable(command: str) -> Optional[str]:
+    """Resolve a Node.js toolchain command (``"node"``, ``"npm"``) to a path.
+
+    Thin ``shutil.which`` wrapper so platform adapters (e.g. the WhatsApp
+    bridge spawner) can locate the Node binary without each reimplementing
+    PATH resolution. Returns the resolved path or ``None`` if not found.
+    """
+    return shutil.which(command)
+
+
+def with_hermes_node_path(env: Optional[dict] = None) -> dict:
+    """Return a process-environment dict suitable for spawning Node tooling.
+
+    When called with no argument, returns a copy of ``os.environ`` — callers
+    then layer their own overrides on top before passing to ``subprocess``.
+    When called with an explicit ``env`` mapping, returns a copy of that
+    mapping unchanged. The name documents intent (Node bridge processes
+    inherit the operator's environment, including the resolved Node path);
+    it does not mutate PATH itself.
+    """
+    if env is None:
+        return dict(os.environ)
+    return dict(env)
 
 
 # ─── Network Preferences ─────────────────────────────────────────────────────

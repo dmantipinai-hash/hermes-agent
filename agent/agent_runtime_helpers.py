@@ -26,7 +26,10 @@ import copy
 import json
 import logging
 import re
+import threading
 import time
+from collections import OrderedDict
+from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -39,6 +42,9 @@ from agent.error_classifier import FailoverReason
 from utils import base_url_host_matches, base_url_hostname, env_var_enabled, atomic_json_write
 
 logger = logging.getLogger(__name__)
+
+_MAILBOX_ACK_ATTEMPTS = 3
+_MAILBOX_ACK_RETRY_BASE_SECONDS = 0.05
 
 
 def _ra():
@@ -1657,6 +1663,11 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
             target=target,
             content=function_args.get("content"),
             old_text=function_args.get("old_text"),
+            entry_type=function_args.get("type"),
+            importance=function_args.get("importance"),
+            query=function_args.get("query"),
+            reason=function_args.get("reason"),
+            written_by=f"main:{agent.session_id}" if getattr(agent, "session_id", None) else None,
             store=agent._memory_store,
         )
         # Bridge: notify external memory provider of built-in memory writes
@@ -1694,6 +1705,7 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
             skip_pre_tool_call_hook=True,
             enabled_toolsets=getattr(agent, "enabled_toolsets", None),
             disabled_toolsets=getattr(agent, "disabled_toolsets", None),
+            mailbox_principal=getattr(agent, "mailbox_principal", None),
         )
 
 
@@ -2279,6 +2291,475 @@ def apply_pending_steer_to_tool_results(agent, messages: list, num_tool_msgs: in
     )
 
 
+@dataclass(frozen=True)
+class MailboxQueuedDelivery:
+    """Trusted immutable guidance and its exact delivery-attempt owner."""
+
+    message_id: int
+    run_id: int
+    claim_token: str
+    body: str
+    kind: str
+
+    @property
+    def key(self) -> tuple[int, int]:
+        return (self.message_id, self.run_id)
+
+
+@dataclass(frozen=True)
+class MailboxDeliveryBatch:
+    """One immutable model-boundary snapshot.
+
+    Claim tokens are intentionally available to the persistence coordinator
+    but never rendered into model-visible guidance.
+    """
+
+    deliveries: tuple[MailboxQueuedDelivery, ...]
+    included: bool = False
+
+    def render(self) -> str:
+        return self.render_deliveries(self.deliveries)
+
+    @staticmethod
+    def render_deliveries(deliveries) -> str:
+        lines = [
+            "<kanban_mailbox>",
+            "Durable guidance received for this running task:",
+        ]
+        for delivery in deliveries:
+            lines.extend(
+                (
+                    f"[message_id={delivery.message_id} kind={delivery.kind}]",
+                    delivery.body,
+                )
+            )
+        lines.append("</kanban_mailbox>")
+        return "\n".join(lines)
+
+
+@dataclass(frozen=True)
+class MailboxMessageMutation:
+    """Enough state to roll back one not-yet-acknowledged injection."""
+
+    target_index: Optional[int]
+    original_content: Any = None
+    appended: bool = False
+
+
+def _coerce_mailbox_delivery(value: Any) -> MailboxQueuedDelivery:
+    if isinstance(value, MailboxQueuedDelivery):
+        return value
+    try:
+        message_id = int(value.message_id)
+        run_id = int(value.run_id)
+        claim_token = str(value.claim_token)
+        body = str(value.body)
+        kind = str(value.kind)
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise ValueError("invalid mailbox delivery envelope") from exc
+    if message_id <= 0 or run_id <= 0 or not claim_token.strip() or not body.strip():
+        raise ValueError("invalid mailbox delivery envelope")
+    if kind not in {"guidance", "question", "info"}:
+        raise ValueError("invalid mailbox delivery kind")
+    return MailboxQueuedDelivery(
+        message_id=message_id,
+        run_id=run_id,
+        claim_token=claim_token,
+        body=body,
+        kind=kind,
+    )
+
+
+def _mailbox_state(agent) -> tuple[OrderedDict, OrderedDict]:
+    pending = getattr(agent, "_pending_mailbox_deliveries", None)
+    if pending is None:
+        pending = OrderedDict()
+        agent._pending_mailbox_deliveries = pending
+    inflight = getattr(agent, "_inflight_mailbox_deliveries", None)
+    if inflight is None:
+        inflight = OrderedDict()
+        agent._inflight_mailbox_deliveries = inflight
+    return pending, inflight
+
+
+def _same_mailbox_batch(
+    left: Optional[MailboxDeliveryBatch],
+    right: Optional[MailboxDeliveryBatch],
+) -> bool:
+    if left is None or right is None:
+        return False
+    return tuple(
+        (delivery.message_id, delivery.run_id, delivery.claim_token)
+        for delivery in left.deliveries
+    ) == tuple(
+        (delivery.message_id, delivery.run_id, delivery.claim_token)
+        for delivery in right.deliveries
+    )
+
+
+def current_mailbox_delivery_batch(
+    agent,
+    batch: MailboxDeliveryBatch,
+) -> MailboxDeliveryBatch:
+    """Return the stage-current immutable object for one exact snapshot."""
+    lock = getattr(agent, "_pending_steer_lock", None)
+
+    def _current() -> MailboxDeliveryBatch:
+        active = getattr(agent, "_active_mailbox_delivery_batch", None)
+        if _same_mailbox_batch(active, batch):
+            return active
+        return batch
+
+    if lock is None:
+        return _current()
+    with lock:
+        return _current()
+
+
+def enqueue_mailbox_deliveries(agent, deliveries) -> bool:
+    """Add trusted deliveries without flattening them into manual steer text.
+
+    A renewed token replaces a pending ref in place.  When the same logical
+    message is already in flight, the renewed attempt is kept pending for a
+    later boundary so the old immutable snapshot cannot acknowledge it.
+    """
+    normalized = tuple(_coerce_mailbox_delivery(item) for item in deliveries)
+    if not normalized:
+        return False
+    lock = getattr(agent, "_pending_steer_lock", None)
+    if lock is None:
+        lock = threading.Lock()
+        agent._pending_steer_lock = lock
+    with lock:
+        pending, inflight = _mailbox_state(agent)
+        for delivery in normalized:
+            in_flight = inflight.get(delivery.key)
+            if in_flight is not None and in_flight.claim_token == delivery.claim_token:
+                continue
+            pending[delivery.key] = delivery
+    return True
+
+
+def drain_pending_mailbox_deliveries(agent) -> Optional[MailboxDeliveryBatch]:
+    """Return the active batch or atomically start one from pending guidance.
+
+    An included batch remains active across compression restarts and turn-level
+    provider failures.  Later arrivals stay pending until that exact batch has
+    crossed the response barrier.
+    """
+    lock = getattr(agent, "_pending_steer_lock", None)
+
+    def _drain() -> Optional[MailboxDeliveryBatch]:
+        active = getattr(agent, "_active_mailbox_delivery_batch", None)
+        if active is not None:
+            return active
+        pending = getattr(agent, "_pending_mailbox_deliveries", None)
+        if not pending:
+            return None
+        pending, inflight = _mailbox_state(agent)
+        deliveries = tuple(pending.values())
+        pending.clear()
+        for delivery in deliveries:
+            inflight[delivery.key] = delivery
+        batch = MailboxDeliveryBatch(deliveries)
+        agent._active_mailbox_delivery_batch = batch
+        return batch
+
+    if lock is None:
+        return _drain()
+    with lock:
+        return _drain()
+
+
+def requeue_mailbox_delivery_batch(agent, batch: Optional[MailboxDeliveryBatch]) -> None:
+    """Put an old snapshot before later arrivals without clobbering renewals."""
+    if batch is None or not batch.deliveries:
+        return
+    lock = getattr(agent, "_pending_steer_lock", None)
+
+    def _requeue() -> None:
+        pending, inflight = _mailbox_state(agent)
+        recovered = OrderedDict((delivery.key, delivery) for delivery in batch.deliveries)
+        # Assigning later arrivals last makes their newer token authoritative
+        # while preserving the old message's original queue position.
+        recovered.update(pending)
+        pending.clear()
+        pending.update(recovered)
+        for delivery in batch.deliveries:
+            current = inflight.get(delivery.key)
+            if current is not None and current.claim_token == delivery.claim_token:
+                inflight.pop(delivery.key, None)
+        active = getattr(agent, "_active_mailbox_delivery_batch", None)
+        if _same_mailbox_batch(active, batch):
+            agent._active_mailbox_delivery_batch = None
+
+    if lock is None:
+        _requeue()
+    else:
+        with lock:
+            _requeue()
+
+
+def complete_mailbox_delivery_batch(agent, batch: Optional[MailboxDeliveryBatch]) -> None:
+    """Forget only the exact token refs whose model response was committed."""
+    if batch is None:
+        return
+    lock = getattr(agent, "_pending_steer_lock", None)
+
+    def _complete() -> None:
+        _, inflight = _mailbox_state(agent)
+        for delivery in batch.deliveries:
+            current = inflight.get(delivery.key)
+            if current is not None and current.claim_token == delivery.claim_token:
+                inflight.pop(delivery.key, None)
+        active = getattr(agent, "_active_mailbox_delivery_batch", None)
+        if _same_mailbox_batch(active, batch):
+            agent._active_mailbox_delivery_batch = None
+
+    if lock is None:
+        _complete()
+    else:
+        with lock:
+            _complete()
+
+
+def recover_inflight_mailbox_deliveries(agent) -> None:
+    """Recover unresolved ownership without repeating a committed include.
+
+    Before inclusion, recovery returns the exact batch to the pending queue.
+    After inclusion, the immutable active batch must retain its stage: the
+    backing state machine cannot repeat ``accepted -> included``.  It therefore
+    stays active for the next request and continues directly to the response
+    barrier.
+    """
+    if (
+        getattr(agent, "_pending_mailbox_deliveries", None) is None
+        and getattr(agent, "_inflight_mailbox_deliveries", None) is None
+        and getattr(agent, "_active_mailbox_delivery_batch", None) is None
+    ):
+        return
+    lock = getattr(agent, "_pending_steer_lock", None)
+
+    def _recover() -> None:
+        active = getattr(agent, "_active_mailbox_delivery_batch", None)
+        if active is not None and active.included:
+            return
+        pending, inflight = _mailbox_state(agent)
+        if not inflight:
+            if active is not None:
+                agent._active_mailbox_delivery_batch = None
+            return
+        recovered = OrderedDict(inflight)
+        recovered.update(pending)
+        pending.clear()
+        pending.update(recovered)
+        inflight.clear()
+        agent._active_mailbox_delivery_batch = None
+
+    if lock is None:
+        _recover()
+    else:
+        with lock:
+            _recover()
+
+
+def reconcile_mailbox_delivery_batch_after_response_failure(
+    agent,
+    batch: MailboxDeliveryBatch,
+) -> Optional[MailboxDeliveryBatch]:
+    """Drop obsolete included refs when a newer token owns the same message.
+
+    A permanent response-ack failure usually keeps the included batch active
+    for a later attempt.  If a lease renewal has already queued a different
+    token for the same logical message, however, the old token can never make
+    progress.  Remove only those superseded refs and leave any still-current
+    included subset active.
+    """
+    lock = getattr(agent, "_pending_steer_lock", None)
+
+    def _reconcile() -> Optional[MailboxDeliveryBatch]:
+        active = getattr(agent, "_active_mailbox_delivery_batch", None)
+        if not _same_mailbox_batch(active, batch):
+            return active
+        pending, inflight = _mailbox_state(agent)
+        retained = []
+        for delivery in active.deliveries:
+            replacement = pending.get(delivery.key)
+            if replacement is not None and replacement.claim_token != delivery.claim_token:
+                current = inflight.get(delivery.key)
+                if current is not None and current.claim_token == delivery.claim_token:
+                    inflight.pop(delivery.key, None)
+                continue
+            retained.append(delivery)
+        if len(retained) == len(active.deliveries):
+            return active
+        if retained:
+            active = MailboxDeliveryBatch(
+                deliveries=tuple(retained),
+                included=True,
+            )
+            agent._active_mailbox_delivery_batch = active
+            return active
+        agent._active_mailbox_delivery_batch = None
+        return None
+
+    if lock is None:
+        return _reconcile()
+    with lock:
+        return _reconcile()
+
+
+def _content_contains_envelope(content: Any, envelope: str) -> bool:
+    if isinstance(content, str):
+        return envelope in content
+    if isinstance(content, list):
+        return any(
+            isinstance(part, dict)
+            and part.get("type") == "text"
+            and envelope in str(part.get("text", ""))
+            for part in content
+        )
+    return False
+
+
+def _mailbox_delivery_block(delivery: MailboxQueuedDelivery) -> str:
+    return f"[message_id={delivery.message_id} kind={delivery.kind}]\n{delivery.body}"
+
+
+def inject_mailbox_delivery_batch(
+    agent,
+    messages: list,
+    batch: MailboxDeliveryBatch,
+    *,
+    current_turn_user_idx: int,
+) -> MailboxMessageMutation:
+    """Persist one exact envelope in the current user/tool message."""
+    missing_deliveries = tuple(
+        delivery
+        for delivery in batch.deliveries
+        if not any(
+            isinstance(message, dict)
+            and _content_contains_envelope(
+                message.get("content"),
+                _mailbox_delivery_block(delivery),
+            )
+            for message in messages
+        )
+    )
+    if not missing_deliveries:
+        return MailboxMessageMutation(target_index=None, appended=False)
+    envelope = MailboxDeliveryBatch.render_deliveries(missing_deliveries)
+
+    target_idx = None
+    for idx in range(len(messages) - 1, current_turn_user_idx, -1):
+        message = messages[idx]
+        if isinstance(message, dict) and message.get("role") == "tool":
+            target_idx = idx
+            break
+    if target_idx is None:
+        if (
+            0 <= current_turn_user_idx < len(messages)
+            and messages[current_turn_user_idx].get("role") == "user"
+        ):
+            target_idx = current_turn_user_idx
+        else:
+            target_idx = next(
+                (
+                    idx
+                    for idx in range(len(messages) - 1, -1, -1)
+                    if isinstance(messages[idx], dict)
+                    and messages[idx].get("role") == "user"
+                ),
+                None,
+            )
+            if target_idx is None:
+                raise ValueError("current mailbox user message is missing")
+
+    original = messages[target_idx].get("content", "")
+    if isinstance(original, str):
+        separator = "\n\n" if original else ""
+        messages[target_idx]["content"] = original + separator + envelope
+    elif isinstance(original, list):
+        blocks = list(original)
+        blocks.append({"type": "text", "text": envelope})
+        messages[target_idx]["content"] = blocks
+    else:
+        messages[target_idx]["content"] = f"{original}\n\n{envelope}"
+    return MailboxMessageMutation(
+        target_index=target_idx,
+        original_content=original,
+        appended=True,
+    )
+
+
+def restore_mailbox_message_mutation(messages: list, mutation: Optional[MailboxMessageMutation]) -> None:
+    if mutation is None or not mutation.appended or mutation.target_index is None:
+        return
+    if 0 <= mutation.target_index < len(messages):
+        messages[mutation.target_index]["content"] = mutation.original_content
+
+
+def acknowledge_mailbox_delivery_batch(
+    agent,
+    batch: Optional[MailboxDeliveryBatch],
+    *,
+    stage: str,
+) -> bool:
+    """Synchronously cross one persistence barrier with bounded retries."""
+    if batch is None:
+        return True
+    if stage == "included" and batch.included:
+        return True
+    callback_name = {
+        "included": "_mailbox_delivery_included_callback",
+        "responded": "_mailbox_delivery_responded_callback",
+    }.get(stage)
+    if callback_name is None:
+        raise ValueError(f"unknown mailbox acknowledgement stage: {stage}")
+    callback = getattr(agent, callback_name, None)
+    if callback is None:
+        logger.error("Mailbox %s acknowledgement callback is unavailable", stage)
+        return False
+    for attempt in range(1, _MAILBOX_ACK_ATTEMPTS + 1):
+        try:
+            if callback(batch) is True:
+                if stage == "included":
+                    lock = getattr(agent, "_pending_steer_lock", None)
+
+                    def _mark_included() -> None:
+                        active = getattr(agent, "_active_mailbox_delivery_batch", None)
+                        if _same_mailbox_batch(active, batch):
+                            agent._active_mailbox_delivery_batch = replace(
+                                active,
+                                included=True,
+                            )
+
+                    if lock is None:
+                        _mark_included()
+                    else:
+                        with lock:
+                            _mark_included()
+                else:
+                    complete_mailbox_delivery_batch(agent, batch)
+                return True
+        except Exception as exc:
+            logger.warning(
+                "Mailbox %s acknowledgement attempt %d/%d failed: %s",
+                stage,
+                attempt,
+                _MAILBOX_ACK_ATTEMPTS,
+                exc,
+            )
+        if attempt < _MAILBOX_ACK_ATTEMPTS:
+            time.sleep(_MAILBOX_ACK_RETRY_BASE_SECONDS * attempt)
+    logger.error(
+        "Mailbox %s acknowledgement failed after %d attempts",
+        stage,
+        _MAILBOX_ACK_ATTEMPTS,
+    )
+    return False
+
+
 
 def force_close_tcp_sockets(client: Any) -> int:
     """Abort in-flight TCP I/O by shutting down sockets WITHOUT closing FDs.
@@ -2356,6 +2837,19 @@ __all__ = [
     "cleanup_dead_connections",
     "extract_api_error_context",
     "apply_pending_steer_to_tool_results",
+    "MailboxQueuedDelivery",
+    "MailboxDeliveryBatch",
+    "MailboxMessageMutation",
+    "enqueue_mailbox_deliveries",
+    "drain_pending_mailbox_deliveries",
+    "requeue_mailbox_delivery_batch",
+    "complete_mailbox_delivery_batch",
+    "recover_inflight_mailbox_deliveries",
+    "current_mailbox_delivery_batch",
+    "reconcile_mailbox_delivery_batch_after_response_failure",
+    "inject_mailbox_delivery_batch",
+    "restore_mailbox_message_mutation",
+    "acknowledge_mailbox_delivery_batch",
     "_iter_pool_sockets",
     "force_close_tcp_sockets",
 ]

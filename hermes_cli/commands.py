@@ -115,7 +115,8 @@ COMMAND_REGISTRY: list[CommandDef] = [
     CommandDef("sethome", "Set this chat as the home channel", "Session",
                gateway_only=True, aliases=("set-home",)),
     CommandDef("resume", "Resume a previously-named session", "Session",
-               args_hint="[name]"),
+               args_hint="[name | --last | <id>]",
+               aliases=("continue",)),
 
     # Configuration
     CommandDef("sessions", "Browse and resume previous sessions", "Session"),
@@ -184,6 +185,9 @@ COMMAND_REGISTRY: list[CommandDef] = [
                             "archive", "tail", "dispatch", "stats", "notify-subscribe",
                             "notify-list", "notify-unsubscribe", "log", "runs",
                             "heartbeat", "assignees", "context", "specify", "gc")),
+    CommandDef("team", "Manage a team of specialized agent profiles (create, models, status, assign)",
+               "Tools & Skills", args_hint="<subcommand> [args]",
+               subcommands=("list", "create", "delete", "status", "assign", "models")),
     CommandDef("reload", "Reload .env variables into the running session", "Tools & Skills",
                cli_only=True),
     CommandDef("reload-mcp", "Reload MCP servers from config", "Tools & Skills",
@@ -770,6 +774,40 @@ def _collect_gateway_skill_entries(
 # ---------------------------------------------------------------------------
 # Platform-specific wrappers
 # ---------------------------------------------------------------------------
+
+
+def telegram_menu_max_commands(default: int = 60, maximum: int = 100) -> int:
+    """Return the cap on Telegram client menu commands.
+
+    Telegram's Bot API accepts up to 100 commands but has an undocumented
+    payload-size limit (~4KB total). Hermes defaults to 60 so built-in
+    commands plus common skill commands stay visible while remaining under
+    the threshold. Operators can tune the cap via
+    ``platforms.telegram.extra.command_menu`` in ``config.yaml``.
+
+    The returned value is clamped to ``[0, maximum]`` so a misconfigured
+    value can neither disable the menu entirely by accident nor exceed the
+    Bot API hard limit.
+    """
+    try:
+        from hermes_cli.config import read_raw_config
+        cfg = read_raw_config()
+    except Exception:
+        return default
+    platforms = cfg.get("platforms", {}) if isinstance(cfg, dict) else {}
+    telegram_cfg = platforms.get("telegram", {}) if isinstance(platforms, dict) else {}
+    extra = telegram_cfg.get("extra", {}) if isinstance(telegram_cfg, dict) else {}
+    raw = extra.get("command_menu", default) if isinstance(extra, dict) else default
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return default
+    if value < 0:
+        return 0
+    if value > maximum:
+        return maximum
+    return value
+
 
 def telegram_menu_commands(max_commands: int = 100) -> tuple[list[tuple[str, str]], int]:
     """Return Telegram menu commands capped to the Bot API limit.

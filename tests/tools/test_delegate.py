@@ -2163,13 +2163,26 @@ class TestOrchestratorRoleSchema(unittest.TestCase):
         self.assertTrue(any("coercing" in m.lower() for m in cm.output))
 
     def test_schema_has_role_top_level_and_per_task(self):
-        from tools.delegate_tool import DELEGATE_TASK_SCHEMA
+        # Invariant, not snapshot: the role enum must always carry the
+        # capability roles (leaf/orchestrator) plus every specialization
+        # role from ROLE_TOOLSET_MAP, on both the top-level and per-task
+        # params. Hardcoding the exact list would break every time a role
+        # is added — that's a change-detector, not a contract.
+        from toolsets import ROLE_TOOLSET_MAP
+        from tools.delegate_tool import DELEGATE_TASK_SCHEMA, _ALL_ROLE_NAMES
         props = DELEGATE_TASK_SCHEMA["parameters"]["properties"]
         self.assertIn("role", props)
-        self.assertEqual(props["role"]["enum"], ["leaf", "orchestrator"])
+        # top-level and per-task enums must both equal the runtime-derived list
+        self.assertEqual(props["role"]["enum"], _ALL_ROLE_NAMES)
         task_props = props["tasks"]["items"]["properties"]
         self.assertIn("role", task_props)
-        self.assertEqual(task_props["role"]["enum"], ["leaf", "orchestrator"])
+        self.assertEqual(task_props["role"]["enum"], _ALL_ROLE_NAMES)
+        # capability roles always present
+        self.assertIn("leaf", _ALL_ROLE_NAMES)
+        self.assertIn("orchestrator", _ALL_ROLE_NAMES)
+        # every specialization role is reachable from the schema
+        for role_name in ROLE_TOOLSET_MAP:
+            self.assertIn(role_name, _ALL_ROLE_NAMES)
 
     def test_acp_command_description_has_do_not_set_guidance(self):
         # acp_command/acp_args descriptions must NOT bias the model toward

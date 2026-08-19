@@ -79,6 +79,11 @@ OPENROUTER_MODELS: list[tuple[str, str]] = [
 
 _openrouter_catalog_cache: list[tuple[str, str]] | None = None
 
+# DeepInfra catalog cache keyed by tag (e.g. {"video-gen": [...]}). Empty dict
+# = cold cache (forces a fetch); populated entry short-circuits the network call
+# for subsequent list_models() invocations within the process lifetime.
+_deepinfra_catalog_cache: dict[str, list[dict]] = {}
+
 
 
 
@@ -1255,6 +1260,83 @@ def fetch_openrouter_models(
     curated[0] = (first_id, "recommended")
     _openrouter_catalog_cache = curated
     return list(curated)
+
+
+def _fetch_deepinfra_models_by_tag(
+    tag: str,
+    *,
+    timeout: float = 8.0,
+    force_refresh: bool = False,
+) -> list[dict]:
+    """Return DeepInfra catalog entries whose tag matches ``tag``.
+
+    Hits the public OpenAI-compatible ``/v1/openai/models`` endpoint with the
+    configured ``DEEPINFRA_API_KEY`` (required for catalog access). Each entry
+    in the returned list has the shape ``{"id": str, "metadata": {...}}`` so
+    the video-gen provider's ``list_models()`` can read ``metadata.description``
+    without a second lookup.
+
+    Caching: keyed by ``tag`` in the module-level ``_deepinfra_catalog_cache``
+    dict — the first call per tag per process fetches; subsequent calls
+    short-circuit. ``force_refresh`` bypasses the cache. An empty dict cache
+    (the initial state) is treated as a cold miss.
+
+    Returns an empty list when the API key is missing, the endpoint is
+    unreachable, or the response is malformed — callers (the video-gen picker)
+    treat an empty list as "no options" rather than routing to a possibly-
+    retired model id.
+    """
+    if not force_refresh and _deepinfra_catalog_cache.get(tag):
+        return list(_deepinfra_catalog_cache[tag])
+
+    import os
+
+    api_key = os.environ.get("DEEPINFRA_API_KEY", "").strip()
+    if not api_key:
+        return []
+
+    try:
+        req = urllib.request.Request(
+            "https://api.deepinfra.com/v1/openai/models",
+            headers={
+                "Accept": "application/json",
+                "Authorization": f"Bearer {api_key}",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            payload = json.loads(resp.read().decode())
+    except Exception:
+        # Network/HTTP/parse failure — leave the cache untouched and return
+        # empty so the picker shows nothing rather than crashing.
+        return []
+
+    data = payload.get("data") if isinstance(payload, dict) else None
+    if not isinstance(data, list):
+        return []
+
+    matched: list[dict] = []
+    for entry in data:
+        if not isinstance(entry, dict):
+            continue
+        mid = entry.get("id")
+        if not mid:
+            continue
+        # Tag matching: DeepInfra entries may carry a list of tags under
+        # ``metadata.tags`` or a flat ``tags`` field. Match case-insensitively
+        # and also accept the tag appearing anywhere in the id (some vendors
+        # encode the modality in the model slug, e.g. ``vendor/wan-t2v``).
+        meta = entry.get("metadata") or {}
+        if not isinstance(meta, dict):
+            meta = {}
+        tags_field = meta.get("tags") or entry.get("tags") or []
+        if isinstance(tags_field, str):
+            tags_field = [tags_field]
+        normalized_tags = {str(t).lower() for t in tags_field if t}
+        if tag.lower() in normalized_tags or tag.lower() in str(mid).lower():
+            matched.append({"id": mid, "metadata": meta})
+
+    _deepinfra_catalog_cache[tag] = matched
+    return list(matched)
 
 
 def model_ids(*, force_refresh: bool = False) -> list[str]:

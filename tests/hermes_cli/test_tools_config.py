@@ -139,6 +139,53 @@ def test_get_platform_tools_homeassistant_platform_keeps_homeassistant_toolset()
     assert "homeassistant" in enabled
 
 
+# --- TD-2/TD-6: top-level `toolsets:` activates toolsets (merge semantics) ---
+#
+# Historically only `platform_toolsets[platform]` activated toolsets, while
+# the top-level `toolsets:` list was read by per-tool check_fn gates
+# (agent_manager, kanban). That split left toolsets like `kanban` listed in
+# config but invisible to the agent — the dual-key trap. The fix merges
+# top-level `toolsets:` into the activation set as a union.
+
+
+def test_top_level_toolsets_activates_toolset_absent_from_platform_config():
+    """A toolset listed ONLY in top-level `toolsets:` still activates.
+
+    Regression for the dual-key trap: kanban in `toolsets:` but missing from
+    `platform_toolsets.cli` used to leave kanban tools invisible to the agent.
+    """
+    config = {
+        "toolsets": ["hermes-cli", "kanban"],
+        "platform_toolsets": {"cli": ["hermes-cli"]},
+    }
+    enabled = _get_platform_tools(config, "cli", include_default_mcp_servers=False)
+    assert "kanban" in enabled
+    assert "terminal" in enabled  # hermes-cli composite still resolves
+
+
+def test_top_level_toolsets_merges_without_dropping_platform_config():
+    """Merge is a union — explicit platform_toolsets entries are preserved."""
+    config = {
+        "toolsets": ["kanban"],
+        "platform_toolsets": {"cli": ["web", "terminal", "memory"]},
+    }
+    enabled = _get_platform_tools(config, "cli", include_default_mcp_servers=False)
+    assert "kanban" in enabled
+    assert "web" in enabled
+    assert "memory" in enabled
+
+
+def test_top_level_toolsets_empty_or_missing_is_noop():
+    """No top-level `toolsets:` (or empty) must not change behaviour."""
+    config_explicit = {"platform_toolsets": {"cli": ["web", "terminal"]}}
+    enabled_explicit = _get_platform_tools(config_explicit, "cli")
+
+    config_with_empty = {"toolsets": [], "platform_toolsets": {"cli": ["web", "terminal"]}}
+    enabled_empty = _get_platform_tools(config_with_empty, "cli")
+
+    assert enabled_explicit == enabled_empty
+
+
 def test_get_platform_tools_homeassistant_toolset_enabled_for_cron_when_hass_token_set(monkeypatch):
     """HA toolset is runtime-gated by check_fn (requires HASS_TOKEN).
 

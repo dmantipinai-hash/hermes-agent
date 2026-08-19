@@ -41,9 +41,28 @@ def test_memory_schema_is_well_formed():
     assert params["type"] == "object"
     assert params["required"] == ["action", "target"]
     # Nested ``enum`` on property values is fine — only top-level is forbidden.
-    assert params["properties"]["action"]["enum"] == ["add", "replace", "remove"]
+    # v2 store adds deprecate/read actions plus typed-entry parameters.
+    assert params["properties"]["action"]["enum"] == [
+        "add", "replace", "remove", "deprecate", "read",
+    ]
     assert params["properties"]["target"]["enum"] == ["memory", "user"]
+    assert params["properties"]["type"]["enum"] == [
+        "fact", "decision", "constraint", "pattern", "preference",
+    ]
 
 
 def test_memory_schema_is_json_serializable():
     json.dumps(MEMORY_SCHEMA)
+
+
+def test_memory_schema_describes_both_memory_tiers():
+    """The agent's self-model contract: the schema must tell the model that
+    memory is two-tier (hot prompt snapshot + cold full store), that `read`
+    searches the cold store beyond the visible prompt, and that evicted
+    records resurface per turn. Without this the agent describes its memory
+    as "just the 2200-char budget" (live-observed on hemdal, 2026-08-17)."""
+    desc = MEMORY_SCHEMA["description"]
+    assert "ARCHITECTURE (two tiers)" in desc
+    assert "hot tier" in desc and "cold tier" in desc
+    assert "ENTIRE cold store" in desc
+    assert "re-injected automatically" in desc

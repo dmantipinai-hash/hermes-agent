@@ -731,6 +731,11 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 target=target,
                 content=function_args.get("content"),
                 old_text=function_args.get("old_text"),
+                entry_type=function_args.get("type"),
+                importance=function_args.get("importance"),
+                query=function_args.get("query"),
+                reason=function_args.get("reason"),
+                written_by=f"main:{agent.session_id}" if getattr(agent, "session_id", None) else None,
                 store=agent._memory_store,
             )
             # Bridge: notify external memory provider of built-in memory writes
@@ -854,6 +859,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     skip_pre_tool_call_hook=True,
                     enabled_toolsets=getattr(agent, "enabled_toolsets", None),
                     disabled_toolsets=getattr(agent, "disabled_toolsets", None),
+                    mailbox_principal=getattr(agent, "mailbox_principal", None),
                 )
                 _spinner_result = function_result
             except Exception as tool_error:
@@ -876,6 +882,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     skip_pre_tool_call_hook=True,
                     enabled_toolsets=getattr(agent, "enabled_toolsets", None),
                     disabled_toolsets=getattr(agent, "disabled_toolsets", None),
+                    mailbox_principal=getattr(agent, "mailbox_principal", None),
                 )
             except Exception as tool_error:
                 function_result = f"Error executing tool '{function_name}': {tool_error}"

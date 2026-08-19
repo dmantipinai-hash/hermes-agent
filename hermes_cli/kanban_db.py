@@ -110,6 +110,16 @@ _IS_WINDOWS = sys.platform == "win32"
 # long single-call MCP workflows.
 DEFAULT_CLAIM_TTL_SECONDS = 15 * 60
 
+# Active-agent mailbox bounds. Durable message bodies are limited after
+# forced secret redaction; listener claims are additionally bounded by both
+# row count and cumulative UTF-8 bytes so a legal message burst cannot create
+# an unbounded model-context append.
+DEFAULT_MAILBOX_BODY_MAX_BYTES = 16 * 1024
+DEFAULT_MAILBOX_BATCH_MESSAGES = 20
+DEFAULT_MAILBOX_BATCH_BYTES = 32 * 1024
+DEFAULT_MAILBOX_LEASE_SECONDS = 30
+MAX_MAILBOX_LEASE_SECONDS = 5 * 60
+
 # If a worker's PID is still alive but its ``last_heartbeat_at`` is
 # older than this when ``release_stale_claims`` runs, treat the worker
 # as wedged and reclaim regardless of PID liveness (#29747 gap 3).
@@ -885,6 +895,60 @@ class Comment:
     created_at: int
 
 
+@dataclass(frozen=True)
+class MailboxSendResult:
+    """Result of an idempotent durable mailbox send."""
+
+    message_id: int
+    created: bool
+    redacted: bool
+    task_status: str
+    wake_effect: str
+    delivery_state: str
+
+
+@dataclass(frozen=True)
+class MailboxDelivery:
+    """One message leased to the current task run."""
+
+    message_id: int
+    run_id: int
+    claim_token: str
+    body: str
+    kind: str
+
+
+@dataclass(frozen=True)
+class MailboxIntakeCloseResult:
+    """Result of trying to close one exact run's mailbox intake."""
+
+    closed: bool
+    pending_message_ids: list[int]
+
+
+class MailboxCompletionBlockedError(ValueError):
+    """Completion was rejected until the current run responds to mail."""
+
+    def __init__(
+        self,
+        message_ids: Iterable[int],
+        current_run_id: Optional[int],
+    ) -> None:
+        self.message_ids = [int(message_id) for message_id in message_ids]
+        self.current_run_id = (
+            int(current_run_id) if current_run_id is not None else None
+        )
+        run_label = (
+            str(self.current_run_id)
+            if self.current_run_id is not None
+            else "none"
+        )
+        super().__init__(
+            "completion blocked by unresolved mailbox messages "
+            f"{self.message_ids} for current run {run_label}"
+        )
+
+
 @dataclass
 class Attachment:
     """In-memory view of a row from the ``task_attachments`` table."""
@@ -1032,8 +1096,124 @@ CREATE TABLE IF NOT EXISTS task_runs (
     --          gave_up | reclaimed | (null while still running)
     summary             TEXT,
     metadata            TEXT,
-    error               TEXT
+    error               TEXT,
+    -- Legacy/live runs migrate closed. Only a newly-created dispatcher claim
+    -- explicitly opens this fence.
+    mailbox_accepting   INTEGER NOT NULL DEFAULT 0 CHECK (mailbox_accepting IN (0, 1)),
+    mailbox_wake_pending INTEGER NOT NULL DEFAULT 0 CHECK (mailbox_wake_pending IN (0, 1))
 );
+
+-- Immutable durable mailbox content and trusted attribution. These are
+-- ordinary rowid tables: INTEGER PRIMARY KEY, never WITHOUT ROWID.
+CREATE TABLE IF NOT EXISTS task_mailbox_messages (
+    id                INTEGER PRIMARY KEY,
+    task_id           TEXT NOT NULL CHECK (length(trim(task_id)) > 0),
+    actor_identity    TEXT NOT NULL CHECK (length(trim(actor_identity)) > 0),
+    actor_kind        TEXT NOT NULL CHECK (length(trim(actor_kind)) > 0),
+    sender_profile    TEXT NOT NULL CHECK (length(trim(sender_profile)) > 0),
+    recipient_profile TEXT NOT NULL CHECK (length(trim(recipient_profile)) > 0),
+    kind              TEXT NOT NULL CHECK (kind IN ('guidance', 'question', 'info')),
+    body              TEXT NOT NULL CHECK (length(trim(body)) > 0),
+    wake_requested    INTEGER NOT NULL DEFAULT 0 CHECK (wake_requested IN (0, 1)),
+    comment_id        INTEGER NOT NULL UNIQUE,
+    idempotency_key   TEXT NOT NULL CHECK (length(trim(idempotency_key)) > 0),
+    created_at        INTEGER NOT NULL,
+    UNIQUE (task_id, sender_profile, idempotency_key)
+);
+
+-- Immutable, exact historical wake outcome for one mailbox message.  This
+-- keyed record keeps idempotent retries O(1); task_events remains the
+-- human/audit stream rather than a receipt lookup index.
+CREATE TABLE IF NOT EXISTS task_mailbox_wake_evaluations (
+    message_id INTEGER PRIMARY KEY,
+    effect     TEXT NOT NULL CHECK (effect IN (
+                   'not_requested',
+                   'dependency_blocked',
+                   'none_running',
+                   'status_ineligible',
+                   'promoted',
+                   'wake_pending'
+               )),
+    created_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS task_mailbox_delivery_attempts (
+    id             INTEGER PRIMARY KEY,
+    message_id     INTEGER NOT NULL,
+    run_id         INTEGER NOT NULL,
+    state          TEXT NOT NULL CHECK (state IN (
+                       'claimed_for_run',
+                       'accepted_by_steer',
+                       'included_in_request',
+                       'model_response_received'
+                   )),
+    claim_token    TEXT NOT NULL CHECK (length(trim(claim_token)) > 0),
+    lease_expires  INTEGER NOT NULL,
+    attempt_count  INTEGER NOT NULL DEFAULT 1 CHECK (attempt_count >= 1),
+    claimed_at     INTEGER NOT NULL,
+    accepted_at    INTEGER,
+    included_at    INTEGER,
+    responded_at   INTEGER,
+    updated_at     INTEGER NOT NULL,
+    UNIQUE (message_id, run_id)
+);
+
+-- Authorization work records allow/deny here later. Deliberately no body
+-- column: rejected targets and secret-bearing inputs must remain body-free.
+CREATE TABLE IF NOT EXISTS task_mailbox_audit (
+    id                INTEGER PRIMARY KEY,
+    task_id           TEXT,
+    run_id            INTEGER,
+    message_id        INTEGER,
+    actor_identity    TEXT NOT NULL CHECK (length(trim(actor_identity)) > 0),
+    actor_kind        TEXT NOT NULL CHECK (length(trim(actor_kind)) > 0),
+    recipient_profile TEXT,
+    action            TEXT NOT NULL CHECK (length(trim(action)) > 0),
+    allowed           INTEGER NOT NULL CHECK (allowed IN (0, 1)),
+    reason            TEXT NOT NULL,
+    created_at        INTEGER NOT NULL
+);
+
+CREATE TRIGGER IF NOT EXISTS trg_mailbox_messages_immutable
+BEFORE UPDATE ON task_mailbox_messages
+BEGIN
+    SELECT RAISE(ABORT, 'mailbox messages are immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_mailbox_messages_no_delete
+BEFORE DELETE ON task_mailbox_messages
+WHEN EXISTS (SELECT 1 FROM tasks WHERE id = OLD.task_id)
+BEGIN
+    SELECT RAISE(ABORT, 'mailbox messages are immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_mailbox_wake_evaluations_immutable
+BEFORE UPDATE ON task_mailbox_wake_evaluations
+BEGIN
+    SELECT RAISE(ABORT, 'mailbox wake evaluations are immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_mailbox_wake_evaluations_no_insert
+BEFORE INSERT ON task_mailbox_wake_evaluations
+WHEN EXISTS (
+    SELECT 1 FROM task_mailbox_wake_evaluations
+     WHERE message_id = NEW.message_id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'mailbox wake evaluations are immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_mailbox_wake_evaluations_no_delete
+BEFORE DELETE ON task_mailbox_wake_evaluations
+WHEN EXISTS (
+    SELECT 1
+      FROM task_mailbox_messages m
+      JOIN tasks t ON t.id = m.task_id
+     WHERE m.id = OLD.message_id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'mailbox wake evaluations are immutable');
+END;
 
 -- Files attached to a task (PDFs, images, source documents). The blob
 -- lives on disk under ``attachments_root(board)/<task_id>/<stored_name>``;
@@ -1073,9 +1253,28 @@ CREATE INDEX IF NOT EXISTS idx_tasks_status          ON tasks(status);
 CREATE INDEX IF NOT EXISTS idx_links_child           ON task_links(child_id);
 CREATE INDEX IF NOT EXISTS idx_links_parent          ON task_links(parent_id);
 CREATE INDEX IF NOT EXISTS idx_comments_task         ON task_comments(task_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_comments_task_id      ON task_comments(task_id, id);
 CREATE INDEX IF NOT EXISTS idx_events_task           ON task_events(task_id, created_at);
+-- Guard JSON extraction so a malformed historical payload cannot make schema
+-- initialization or index maintenance fail.  Legacy receipt lookup uses this
+-- exact CASE expression and LIMIT 1; new messages use the keyed table above.
+CREATE INDEX IF NOT EXISTS idx_mailbox_wake_events_message
+    ON task_events(
+        CASE WHEN json_valid(payload)
+             THEN CAST(json_extract(payload, '$.message_id') AS INTEGER)
+        END,
+        kind,
+        id DESC
+    )
+    WHERE kind IN ('mailbox_wake_evaluated', 'mailbox_wake_requested');
 CREATE INDEX IF NOT EXISTS idx_runs_task             ON task_runs(task_id, started_at);
 CREATE INDEX IF NOT EXISTS idx_runs_status           ON task_runs(status);
+CREATE INDEX IF NOT EXISTS idx_mailbox_messages_recipient
+    ON task_mailbox_messages(task_id, recipient_profile, id);
+CREATE INDEX IF NOT EXISTS idx_mailbox_attempts_run_state
+    ON task_mailbox_delivery_attempts(run_id, state, message_id);
+CREATE INDEX IF NOT EXISTS idx_mailbox_attempts_lease
+    ON task_mailbox_delivery_attempts(run_id, lease_expires, message_id);
 CREATE INDEX IF NOT EXISTS idx_attachments_task      ON task_attachments(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_id);
 """
@@ -1665,6 +1864,33 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         "ON task_events(run_id, id)"
     )
 
+    # Active-mailbox ownership is deliberately closed for every legacy row,
+    # including runs that happen to be live during migration. Only creation of
+    # a brand-new claim opens ``mailbox_accepting``.
+    runs_exist = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'task_runs'"
+    ).fetchone() is not None
+    if runs_exist:
+        run_cols = {
+            row["name"] for row in conn.execute("PRAGMA table_info(task_runs)")
+        }
+        if "mailbox_accepting" not in run_cols:
+            _add_column_if_missing(
+                conn,
+                "task_runs",
+                "mailbox_accepting",
+                "mailbox_accepting INTEGER NOT NULL DEFAULT 0 "
+                "CHECK (mailbox_accepting IN (0, 1))",
+            )
+        if "mailbox_wake_pending" not in run_cols:
+            _add_column_if_missing(
+                conn,
+                "task_runs",
+                "mailbox_wake_pending",
+                "mailbox_wake_pending INTEGER NOT NULL DEFAULT 0 "
+                "CHECK (mailbox_wake_pending IN (0, 1))",
+            )
+
     notify_table_exists = conn.execute(
         "SELECT name FROM sqlite_master WHERE type='table' AND name='kanban_notify_subs'"
     ).fetchone() is not None
@@ -1748,6 +1974,108 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         )
 
     _rebuild_drifted_tables(conn)
+    # Rebuilds drop table-owned triggers, so install the terminal fence only
+    # after all drift repair has completed.
+    if runs_exist:
+        conn.execute(
+            """
+            CREATE TRIGGER IF NOT EXISTS trg_task_runs_close_mailbox
+            AFTER UPDATE OF status, ended_at ON task_runs
+            WHEN NEW.status != 'running' OR NEW.ended_at IS NOT NULL
+            BEGIN
+                UPDATE task_runs
+                   SET mailbox_accepting = 0,
+                       mailbox_wake_pending = 0
+                 WHERE id = NEW.id
+                   AND (mailbox_accepting != 0 OR mailbox_wake_pending != 0);
+            END
+            """
+        )
+    mailbox_messages_exist = conn.execute(
+        "SELECT 1 FROM sqlite_master "
+        "WHERE type = 'table' AND name = 'task_mailbox_messages'"
+    ).fetchone() is not None
+    if mailbox_messages_exist:
+        # Replace (rather than merely IF-NOT-EXISTS) so boards created by the
+        # first mailbox release upgrade from unconditional DELETE denial to
+        # denial only while the owning task still exists. Hard-delete removes
+        # the parent task first inside the same transaction, then cascades.
+        conn.execute("DROP TRIGGER IF EXISTS trg_mailbox_messages_immutable")
+        conn.execute("DROP TRIGGER IF EXISTS trg_mailbox_messages_no_delete")
+        conn.execute(
+            """
+            CREATE TRIGGER IF NOT EXISTS trg_mailbox_messages_immutable
+            BEFORE UPDATE ON task_mailbox_messages
+            BEGIN
+                SELECT RAISE(ABORT, 'mailbox messages are immutable');
+            END
+            """
+        )
+        conn.execute(
+            """
+            CREATE TRIGGER IF NOT EXISTS trg_mailbox_messages_no_delete
+            BEFORE DELETE ON task_mailbox_messages
+            WHEN EXISTS (SELECT 1 FROM tasks WHERE id = OLD.task_id)
+            BEGIN
+                SELECT RAISE(ABORT, 'mailbox messages are immutable');
+            END
+            """
+        )
+
+    mailbox_evaluations_exist = conn.execute(
+        "SELECT 1 FROM sqlite_master "
+        "WHERE type = 'table' AND name = 'task_mailbox_wake_evaluations'"
+    ).fetchone() is not None
+    if mailbox_evaluations_exist:
+        # Keep this absolute.  A fill-once UPDATE exception would let any DB
+        # caller rewrite historical receipts; new messages insert the final
+        # effect exactly once instead.
+        conn.execute(
+            "DROP TRIGGER IF EXISTS trg_mailbox_wake_evaluations_immutable"
+        )
+        conn.execute(
+            "DROP TRIGGER IF EXISTS trg_mailbox_wake_evaluations_no_insert"
+        )
+        conn.execute(
+            "DROP TRIGGER IF EXISTS trg_mailbox_wake_evaluations_no_delete"
+        )
+        conn.execute(
+            """
+            CREATE TRIGGER IF NOT EXISTS trg_mailbox_wake_evaluations_immutable
+            BEFORE UPDATE ON task_mailbox_wake_evaluations
+            BEGIN
+                SELECT RAISE(ABORT, 'mailbox wake evaluations are immutable');
+            END
+            """
+        )
+        conn.execute(
+            """
+            CREATE TRIGGER IF NOT EXISTS trg_mailbox_wake_evaluations_no_insert
+            BEFORE INSERT ON task_mailbox_wake_evaluations
+            WHEN EXISTS (
+                SELECT 1 FROM task_mailbox_wake_evaluations
+                 WHERE message_id = NEW.message_id
+            )
+            BEGIN
+                SELECT RAISE(ABORT, 'mailbox wake evaluations are immutable');
+            END
+            """
+        )
+        conn.execute(
+            """
+            CREATE TRIGGER IF NOT EXISTS trg_mailbox_wake_evaluations_no_delete
+            BEFORE DELETE ON task_mailbox_wake_evaluations
+            WHEN EXISTS (
+                SELECT 1
+                  FROM task_mailbox_messages m
+                  JOIN tasks t ON t.id = m.task_id
+                 WHERE m.id = OLD.message_id
+            )
+            BEGIN
+                SELECT RAISE(ABORT, 'mailbox wake evaluations are immutable');
+            END
+            """
+        )
 
 
 # Legacy DBs defined these tables with a ``TEXT PRIMARY KEY`` id (or, for
@@ -1772,6 +2100,11 @@ _REBUILD_SPECS = {
         (
             "CREATE INDEX idx_events_task ON task_events(task_id, created_at)",
             "CREATE INDEX idx_events_run ON task_events(run_id, id)",
+            "CREATE INDEX idx_mailbox_wake_events_message ON task_events("
+            " CASE WHEN json_valid(payload)"
+            " THEN CAST(json_extract(payload, '$.message_id') AS INTEGER) END,"
+            " kind, id DESC) WHERE kind IN "
+            "('mailbox_wake_evaluated', 'mailbox_wake_requested')",
         ),
     ),
     "task_comments": (
@@ -1779,7 +2112,10 @@ _REBUILD_SPECS = {
         " id INTEGER PRIMARY KEY AUTOINCREMENT,"
         " task_id TEXT NOT NULL, author TEXT NOT NULL, body TEXT NOT NULL,"
         " created_at INTEGER NOT NULL)",
-        ("CREATE INDEX idx_comments_task ON task_comments(task_id, created_at)",),
+        (
+            "CREATE INDEX idx_comments_task ON task_comments(task_id, created_at)",
+            "CREATE INDEX idx_comments_task_id ON task_comments(task_id, id)",
+        ),
     ),
     "task_runs": (
         "CREATE TABLE task_runs ("
@@ -1789,7 +2125,10 @@ _REBUILD_SPECS = {
         " worker_pid INTEGER, max_runtime_seconds INTEGER,"
         " last_heartbeat_at INTEGER, started_at INTEGER NOT NULL,"
         " ended_at INTEGER, outcome TEXT, summary TEXT, metadata TEXT,"
-        " error TEXT)",
+        " error TEXT, mailbox_accepting INTEGER NOT NULL DEFAULT 0"
+        " CHECK (mailbox_accepting IN (0, 1)),"
+        " mailbox_wake_pending INTEGER NOT NULL DEFAULT 0"
+        " CHECK (mailbox_wake_pending IN (0, 1)))",
         (
             "CREATE INDEX idx_runs_task ON task_runs(task_id, started_at)",
             "CREATE INDEX idx_runs_status ON task_runs(status)",
@@ -2501,6 +2840,941 @@ def list_comments(conn: sqlite3.Connection, task_id: str) -> list[Comment]:
     ]
 
 
+def list_comments_since(
+    conn: sqlite3.Connection, task_id: str, since_id: int = 0
+) -> list[Comment]:
+    """Comments on ``task_id`` with id strictly greater than ``since_id``.
+
+    The cursor-read half of the A1 mailbox (ARCHITECTURE-2.0.md §8.1):
+    ``build_worker_context`` injects the thread only at spawn time, so a
+    RUNNING worker needs this to see messages that arrived mid-run.
+    Ordered by id (== insertion order; ``id`` is the AUTOINCREMENT PK,
+    strictly monotonic even when two comments share a created_at second).
+    """
+    rows = conn.execute(
+        "SELECT * FROM task_comments WHERE task_id = ? AND id > ? "
+        "ORDER BY id ASC",
+        (task_id, int(since_id)),
+    ).fetchall()
+    return [
+        Comment(
+            id=r["id"],
+            task_id=r["task_id"],
+            author=r["author"],
+            body=r["body"],
+            created_at=r["created_at"],
+        )
+        for r in rows
+    ]
+
+
+def list_worker_comments_since(
+    conn: sqlite3.Connection,
+    task_id: str,
+    since_id: int = 0,
+    *,
+    limit: int = 100,
+) -> tuple[list[Comment], int]:
+    """Return a bounded worker-visible comment page and its raw cursor.
+
+    Mailbox-linked comments stay visible through the existing human APIs but
+    are hidden here so the active listener is the only agent-facing delivery
+    path. The returned cursor advances across every inspected comment id,
+    including a page containing only hidden mailbox comments.
+    """
+    page_limit = max(1, min(int(limit), 1_000))
+    rows = conn.execute(
+        "SELECT c.*, m.id AS mailbox_message_id "
+        "FROM task_comments c "
+        "LEFT JOIN task_mailbox_messages m ON m.comment_id = c.id "
+        "WHERE c.task_id = ? AND c.id > ? "
+        "ORDER BY c.id ASC LIMIT ?",
+        (task_id, int(since_id), page_limit),
+    ).fetchall()
+    cursor = int(rows[-1]["id"]) if rows else int(since_id)
+    comments = [
+        Comment(
+            id=int(row["id"]),
+            task_id=row["task_id"],
+            author=row["author"],
+            body=row["body"],
+            created_at=int(row["created_at"]),
+        )
+        for row in rows
+        if row["mailbox_message_id"] is None
+    ]
+    return comments, cursor
+
+
+def _mailbox_delivery_state_in_txn(
+    conn: sqlite3.Connection, message_id: int
+) -> str:
+    row = conn.execute(
+        "SELECT state FROM task_mailbox_delivery_attempts "
+        "WHERE message_id = ? ORDER BY id DESC LIMIT 1",
+        (int(message_id),),
+    ).fetchone()
+    return str(row["state"]) if row is not None else "stored"
+
+
+def _mailbox_wake_effect_in_txn(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    message_id: int,
+    wake_requested: bool,
+    task_status: str,
+) -> str:
+    """Return the durable effect of a message's wake request."""
+    durable_effects = {
+        "not_requested",
+        "dependency_blocked",
+        "none_running",
+        "status_ineligible",
+        "promoted",
+        "wake_pending",
+    }
+    evaluation = conn.execute(
+        "SELECT effect FROM task_mailbox_wake_evaluations WHERE message_id = ?",
+        (int(message_id),),
+    ).fetchone()
+    if evaluation is not None:
+        return str(evaluation["effect"])
+
+    # Legacy rows predate the keyed receipt table.  Correlate directly by the
+    # message id through the matching expression index and inspect at most one
+    # event; never scan or JSON-parse the task's event history in Python.
+    legacy = conn.execute(
+        "SELECT payload FROM task_events "
+        "WHERE task_id = ? "
+        "AND kind IN ('mailbox_wake_evaluated', 'mailbox_wake_requested') "
+        "AND CASE WHEN json_valid(payload) "
+        "         THEN CAST(json_extract(payload, '$.message_id') AS INTEGER) "
+        "    END = ? "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id, int(message_id)),
+    ).fetchone()
+    if legacy is not None:
+        try:
+            payload = json.loads(legacy["payload"] or "{}")
+        except (TypeError, ValueError):
+            payload = {}
+        action = str(payload.get("action") or "")
+        if action in durable_effects:
+            return action
+
+    # Truly old messages without an exact event retain a bounded best-effort
+    # reconstruction.  These queries are indexed/current-state probes, not
+    # event-history scans.
+    if not wake_requested:
+        return "not_requested"
+    if task_status == "running":
+        row = conn.execute(
+            "SELECT mailbox_wake_pending FROM task_runs r "
+            "JOIN tasks t ON t.current_run_id = r.id "
+            "WHERE t.id = ? AND r.status = 'running' AND r.ended_at IS NULL",
+            (task_id,),
+        ).fetchone()
+        return "wake_pending" if row and row["mailbox_wake_pending"] else "none_running"
+    if task_status == "todo":
+        unresolved = conn.execute(
+            "SELECT 1 FROM task_links l JOIN tasks p ON p.id = l.parent_id "
+            "WHERE l.child_id = ? AND p.status NOT IN ('done', 'archived') LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        if unresolved is not None:
+            return "dependency_blocked"
+    return "status_ineligible"
+
+
+def _send_mailbox_message_in_txn(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    actor_identity: str,
+    actor_kind: str,
+    sender_profile: str,
+    recipient_profile: str,
+    kind: str,
+    body: str,
+    wake_requested: bool,
+    idempotency_key: str,
+    now: Optional[int] = None,
+    max_body_bytes: int = DEFAULT_MAILBOX_BODY_MAX_BYTES,
+) -> MailboxSendResult:
+    """Persist one trusted mailbox message inside the caller's write txn.
+
+    Authorization belongs to the caller.  It never claims or spawns work. Secret
+    redaction is forced before validation or durable writes, regardless of
+    the operator's display-redaction setting.
+    """
+    values = {
+        "task_id": task_id,
+        "actor_identity": actor_identity,
+        "actor_kind": actor_kind,
+        "sender_profile": sender_profile,
+        "recipient_profile": recipient_profile,
+        "idempotency_key": idempotency_key,
+    }
+    normalized: dict[str, str] = {}
+    for field_name, value in values.items():
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"{field_name} is required")
+        normalized[field_name] = value.strip()
+    if kind not in {"guidance", "question", "info"}:
+        raise ValueError("mailbox kind must be guidance, question, or info")
+    if not isinstance(body, str):
+        raise ValueError("mailbox body must be text")
+    if not isinstance(wake_requested, bool):
+        raise ValueError("wake_requested must be a bool")
+    requested_body_limit = int(max_body_bytes)
+    if requested_body_limit <= 0:
+        raise ValueError("max_body_bytes must be positive")
+    body_limit = min(requested_body_limit, DEFAULT_MAILBOX_BODY_MAX_BYTES)
+
+    from agent.redact import redact_sensitive_text
+
+    canonical_body = redact_sensitive_text(body, force=True)
+    redacted = canonical_body != body
+    if not canonical_body or not canonical_body.strip():
+        raise ValueError("mailbox body is required")
+    body_bytes = len(canonical_body.encode("utf-8"))
+    if body_bytes > body_limit:
+        raise ValueError(
+            f"mailbox body exceeds {body_limit} UTF-8 bytes after redaction"
+        )
+
+    created_at = int(time.time()) if now is None else int(now)
+    with contextlib.nullcontext():
+        task_row = conn.execute(
+            "SELECT status, current_run_id FROM tasks WHERE id = ?",
+            (normalized["task_id"],),
+        ).fetchone()
+        if task_row is None:
+            raise ValueError(f"unknown task {normalized['task_id']}")
+        if task_row["status"] in {"done", "archived"}:
+            raise ValueError(
+                f"cannot send mailbox message to terminal task "
+                f"{normalized['task_id']} ({task_row['status']})"
+            )
+        existing = conn.execute(
+            "SELECT id, recipient_profile, kind, body, wake_requested "
+            "FROM task_mailbox_messages "
+            "WHERE task_id = ? AND sender_profile = ? AND idempotency_key = ?",
+            (
+                normalized["task_id"],
+                normalized["sender_profile"],
+                normalized["idempotency_key"],
+            ),
+        ).fetchone()
+        if existing is not None:
+            expected_payload = {
+                "recipient_profile": normalized["recipient_profile"],
+                "kind": kind,
+                "body": canonical_body,
+                "wake_requested": int(wake_requested),
+            }
+            conflicting_fields = [
+                field_name
+                for field_name, expected_value in expected_payload.items()
+                if existing[field_name] != expected_value
+            ]
+            if conflicting_fields:
+                raise ValueError(
+                    "mailbox idempotency conflict: existing message "
+                    f"{int(existing['id'])} differs in "
+                    f"{', '.join(conflicting_fields)}"
+                )
+            current_status = str(
+                conn.execute(
+                    "SELECT status FROM tasks WHERE id = ?",
+                    (normalized["task_id"],),
+                ).fetchone()["status"]
+            )
+            message_id = int(existing["id"])
+            return MailboxSendResult(
+                message_id=message_id,
+                created=False,
+                redacted=redacted,
+                task_status=current_status,
+                wake_effect=_mailbox_wake_effect_in_txn(
+                    conn,
+                    task_id=normalized["task_id"],
+                    message_id=message_id,
+                    wake_requested=wake_requested,
+                    task_status=current_status,
+                ),
+                delivery_state=_mailbox_delivery_state_in_txn(conn, message_id),
+            )
+
+        comment_cur = conn.execute(
+            "INSERT INTO task_comments (task_id, author, body, created_at) "
+            "VALUES (?, ?, ?, ?)",
+            (
+                normalized["task_id"],
+                normalized["sender_profile"],
+                canonical_body,
+                created_at,
+            ),
+        )
+        comment_id = int(comment_cur.lastrowid or 0)
+        message_cur = conn.execute(
+            """
+            INSERT INTO task_mailbox_messages (
+                task_id, actor_identity, actor_kind, sender_profile,
+                recipient_profile, kind, body, wake_requested, comment_id,
+                idempotency_key, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                normalized["task_id"],
+                normalized["actor_identity"],
+                normalized["actor_kind"],
+                normalized["sender_profile"],
+                normalized["recipient_profile"],
+                kind,
+                canonical_body,
+                int(wake_requested),
+                comment_id,
+                normalized["idempotency_key"],
+                created_at,
+            ),
+        )
+        message_id = int(message_cur.lastrowid or 0)
+        payload = json.dumps(
+            {
+                "message_id": message_id,
+                "comment_id": comment_id,
+                "sender_profile": normalized["sender_profile"],
+                "recipient_profile": normalized["recipient_profile"],
+                "kind": kind,
+                "wake_requested": wake_requested,
+                "redacted": redacted,
+            },
+            ensure_ascii=False,
+        )
+        conn.execute(
+            "INSERT INTO task_events (task_id, run_id, kind, payload, created_at) "
+            "VALUES (?, NULL, 'mailbox_message_sent', ?, ?)",
+            (normalized["task_id"], payload, created_at),
+        )
+        wake_effect = "not_requested" if not wake_requested else "status_ineligible"
+        if wake_requested and task_row["status"] == "todo":
+            unresolved_parent = conn.execute(
+                "SELECT 1 FROM task_links l "
+                "JOIN tasks p ON p.id = l.parent_id "
+                "WHERE l.child_id = ? "
+                "AND p.status NOT IN ('done', 'archived') LIMIT 1",
+                (normalized["task_id"],),
+            ).fetchone()
+            if unresolved_parent is None:
+                promoted = conn.execute(
+                    "UPDATE tasks SET status = 'ready' "
+                    "WHERE id = ? AND status = 'todo'",
+                    (normalized["task_id"],),
+                )
+                if promoted.rowcount == 1:
+                    wake_effect = "promoted"
+                    _append_event(
+                        conn,
+                        normalized["task_id"],
+                        "mailbox_wake_requested",
+                        {"message_id": message_id, "action": "promoted"},
+                    )
+            else:
+                wake_effect = "dependency_blocked"
+        elif (
+            wake_requested
+            and task_row["status"] == "running"
+            and task_row["current_run_id"] is not None
+        ):
+            run_id = int(task_row["current_run_id"])
+            marked = conn.execute(
+                "UPDATE task_runs SET mailbox_wake_pending = 1 "
+                "WHERE id = ? AND task_id = ? AND status = 'running' "
+                "AND ended_at IS NULL AND mailbox_accepting = 0 "
+                "AND mailbox_wake_pending = 0",
+                (run_id, normalized["task_id"]),
+            )
+            if marked.rowcount == 1:
+                wake_effect = "wake_pending"
+                _append_event(
+                    conn,
+                    normalized["task_id"],
+                    "mailbox_wake_requested",
+                    {"message_id": message_id, "action": "wake_pending"},
+                    run_id=run_id,
+                )
+            else:
+                run_row = conn.execute(
+                    "SELECT mailbox_wake_pending FROM task_runs WHERE id = ?",
+                    (run_id,),
+                ).fetchone()
+                wake_effect = (
+                    "wake_pending"
+                    if run_row and run_row["mailbox_wake_pending"]
+                    else "none_running"
+                )
+        evaluation_run_id = (
+            int(task_row["current_run_id"])
+            if task_row["status"] == "running"
+            and task_row["current_run_id"] is not None
+            else None
+        )
+        conn.execute(
+            "INSERT INTO task_mailbox_wake_evaluations "
+            "(message_id, effect, created_at) VALUES (?, ?, ?)",
+            (message_id, wake_effect, created_at),
+        )
+        _append_event(
+            conn,
+            normalized["task_id"],
+            "mailbox_wake_evaluated",
+            {"message_id": message_id, "action": wake_effect},
+            run_id=evaluation_run_id,
+        )
+        current_status = str(
+            conn.execute(
+                "SELECT status FROM tasks WHERE id = ?",
+                (normalized["task_id"],),
+            ).fetchone()["status"]
+        )
+        return MailboxSendResult(
+            message_id=message_id,
+            created=True,
+            redacted=redacted,
+            task_status=current_status,
+            wake_effect=wake_effect,
+            delivery_state="stored",
+        )
+
+
+def send_mailbox_message(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    actor_identity: str,
+    actor_kind: str,
+    sender_profile: str,
+    recipient_profile: str,
+    kind: str,
+    body: str,
+    wake_requested: bool,
+    idempotency_key: str,
+    now: Optional[int] = None,
+    max_body_bytes: int = DEFAULT_MAILBOX_BODY_MAX_BYTES,
+) -> MailboxSendResult:
+    """Atomically persist one already-authorized mailbox message."""
+    with write_txn(conn):
+        return _send_mailbox_message_in_txn(
+            conn,
+            task_id=task_id,
+            actor_identity=actor_identity,
+            actor_kind=actor_kind,
+            sender_profile=sender_profile,
+            recipient_profile=recipient_profile,
+            kind=kind,
+            body=body,
+            wake_requested=wake_requested,
+            idempotency_key=idempotency_key,
+            now=now,
+            max_body_bytes=max_body_bytes,
+        )
+
+
+def _append_mailbox_audit_in_txn(
+    conn: sqlite3.Connection,
+    *,
+    task_id: Optional[str],
+    run_id: Optional[int],
+    message_id: Optional[int],
+    actor_identity: str,
+    actor_kind: str,
+    recipient_profile: Optional[str],
+    action: str,
+    allowed: bool,
+    reason: str,
+    now: Optional[int] = None,
+) -> int:
+    """Append a body-free mailbox authorization record in the caller's txn."""
+    created_at = int(time.time()) if now is None else int(now)
+    cur = conn.execute(
+        """
+        INSERT INTO task_mailbox_audit (
+            task_id, run_id, message_id, actor_identity, actor_kind,
+            recipient_profile, action, allowed, reason, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            task_id,
+            run_id,
+            message_id,
+            actor_identity.strip(),
+            actor_kind.strip(),
+            recipient_profile.strip() if recipient_profile else None,
+            action.strip(),
+            int(bool(allowed)),
+            reason.strip(),
+            created_at,
+        ),
+    )
+    return int(cur.lastrowid or 0)
+
+
+def _mailbox_run_is_current(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    run_id: int,
+    recipient_profile: str,
+) -> bool:
+    """Validate the exact live task/run/profile ownership fence in-txn."""
+    return conn.execute(
+        """
+        SELECT 1
+          FROM tasks t
+          JOIN task_runs r ON r.id = t.current_run_id
+         WHERE t.id = ?
+           AND t.status = 'running'
+           AND t.current_run_id = ?
+           AND r.id = ?
+           AND r.task_id = t.id
+           AND r.status = 'running'
+           AND r.ended_at IS NULL
+           AND r.profile = ?
+           AND r.mailbox_accepting = 1
+        """,
+        (task_id, int(run_id), int(run_id), recipient_profile),
+    ).fetchone() is not None
+
+
+def _bounded_mailbox_lease_seconds(lease_seconds: int) -> int:
+    return max(1, min(int(lease_seconds), MAX_MAILBOX_LEASE_SECONDS))
+
+
+def claim_mailbox_messages(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    run_id: int,
+    recipient_profile: str,
+    now: Optional[int] = None,
+    lease_seconds: int = DEFAULT_MAILBOX_LEASE_SECONDS,
+    max_messages: int = DEFAULT_MAILBOX_BATCH_MESSAGES,
+    max_batch_bytes: int = DEFAULT_MAILBOX_BATCH_BYTES,
+) -> list[MailboxDelivery]:
+    """Lease a bounded ordered message batch to the exact current run.
+
+    An expired attempt for the same run is reclaimed with a fresh opaque
+    token and an incremented attempt count. A replacement run intentionally
+    receives a separate attempt row for every durable message.
+    """
+    claimed_at = int(time.time()) if now is None else int(now)
+    row_limit = max(1, min(int(max_messages), DEFAULT_MAILBOX_BATCH_MESSAGES))
+    byte_limit = max(1, min(int(max_batch_bytes), DEFAULT_MAILBOX_BATCH_BYTES))
+    lease_expires = claimed_at + _bounded_mailbox_lease_seconds(lease_seconds)
+    with write_txn(conn):
+        if not _mailbox_run_is_current(
+            conn,
+            task_id=task_id,
+            run_id=int(run_id),
+            recipient_profile=recipient_profile,
+        ):
+            return []
+        rows = conn.execute(
+            """
+            SELECT m.id, m.body, m.kind, a.id AS attempt_id
+              FROM task_mailbox_messages m
+              LEFT JOIN task_mailbox_delivery_attempts a
+                ON a.message_id = m.id AND a.run_id = ?
+             WHERE m.task_id = ?
+               AND m.recipient_profile = ?
+               AND (
+                    a.id IS NULL
+                    OR (
+                        a.state != 'model_response_received'
+                        AND a.lease_expires <= ?
+                    )
+               )
+             ORDER BY m.id ASC
+             LIMIT ?
+            """,
+            (int(run_id), task_id, recipient_profile, claimed_at, row_limit),
+        ).fetchall()
+        selected: list[sqlite3.Row] = []
+        selected_bytes = 0
+        for row in rows:
+            row_bytes = len(row["body"].encode("utf-8"))
+            if selected and selected_bytes + row_bytes > byte_limit:
+                break
+            selected.append(row)
+            selected_bytes += row_bytes
+        if not selected:
+            return []
+
+        claim_token = secrets.token_urlsafe(24)
+        deliveries: list[MailboxDelivery] = []
+        for row in selected:
+            if row["attempt_id"] is None:
+                conn.execute(
+                    """
+                    INSERT INTO task_mailbox_delivery_attempts (
+                        message_id, run_id, state, claim_token, lease_expires,
+                        attempt_count, claimed_at, updated_at
+                    ) VALUES (?, ?, 'claimed_for_run', ?, ?, 1, ?, ?)
+                    """,
+                    (
+                        int(row["id"]),
+                        int(run_id),
+                        claim_token,
+                        lease_expires,
+                        claimed_at,
+                        claimed_at,
+                    ),
+                )
+            else:
+                conn.execute(
+                    """
+                    UPDATE task_mailbox_delivery_attempts
+                       SET state = 'claimed_for_run',
+                           claim_token = ?,
+                           lease_expires = ?,
+                           attempt_count = attempt_count + 1,
+                           claimed_at = ?,
+                           accepted_at = NULL,
+                           included_at = NULL,
+                           responded_at = NULL,
+                           updated_at = ?
+                     WHERE id = ?
+                    """,
+                    (
+                        claim_token,
+                        lease_expires,
+                        claimed_at,
+                        claimed_at,
+                        int(row["attempt_id"]),
+                    ),
+                )
+            deliveries.append(
+                MailboxDelivery(
+                    message_id=int(row["id"]),
+                    run_id=int(run_id),
+                    claim_token=claim_token,
+                    body=row["body"],
+                    kind=row["kind"],
+                )
+            )
+        return deliveries
+
+
+def _normalize_mailbox_message_ids(message_ids: Iterable[int]) -> list[int]:
+    try:
+        normalized = [int(message_id) for message_id in message_ids]
+    except (TypeError, ValueError):
+        return []
+    if not normalized or any(message_id <= 0 for message_id in normalized):
+        return []
+    if len(set(normalized)) != len(normalized):
+        return []
+    return normalized
+
+
+def _mailbox_attempt_batch_matches(
+    conn: sqlite3.Connection,
+    *,
+    message_ids: list[int],
+    run_id: int,
+    recipient_profile: str,
+    claim_token: str,
+    expected_states: tuple[str, ...],
+    now: int,
+) -> bool:
+    """Check exact batch ownership and current-run fencing in-txn."""
+    placeholders = ",".join("?" for _ in message_ids)
+    rows = conn.execute(
+        f"""
+        SELECT m.id, m.task_id
+          FROM task_mailbox_messages m
+          JOIN task_mailbox_delivery_attempts a
+            ON a.message_id = m.id
+         WHERE m.id IN ({placeholders})
+           AND m.recipient_profile = ?
+           AND a.run_id = ?
+           AND a.claim_token = ?
+           AND a.state IN ({','.join('?' for _ in expected_states)})
+           AND a.lease_expires > ?
+        """,
+        (
+            *message_ids,
+            recipient_profile,
+            int(run_id),
+            claim_token,
+            *expected_states,
+            int(now),
+        ),
+    ).fetchall()
+    if len(rows) != len(message_ids):
+        return False
+    if {int(row["id"]) for row in rows} != set(message_ids):
+        return False
+    task_ids = {row["task_id"] for row in rows}
+    if len(task_ids) != 1:
+        return False
+    return _mailbox_run_is_current(
+        conn,
+        task_id=next(iter(task_ids)),
+        run_id=int(run_id),
+        recipient_profile=recipient_profile,
+    )
+
+
+def _transition_mailbox_messages(
+    conn: sqlite3.Connection,
+    *,
+    message_ids: Iterable[int],
+    run_id: int,
+    recipient_profile: str,
+    claim_token: str,
+    expected_state: str,
+    new_state: str,
+    timestamp_column: str,
+    now: Optional[int],
+) -> bool:
+    ids = _normalize_mailbox_message_ids(message_ids)
+    if not ids or not claim_token:
+        return False
+    transition_at = int(time.time()) if now is None else int(now)
+    with write_txn(conn):
+        if not _mailbox_attempt_batch_matches(
+            conn,
+            message_ids=ids,
+            run_id=int(run_id),
+            recipient_profile=recipient_profile,
+            claim_token=claim_token,
+            expected_states=(expected_state,),
+            now=transition_at,
+        ):
+            return False
+        placeholders = ",".join("?" for _ in ids)
+        cur = conn.execute(
+            f"UPDATE task_mailbox_delivery_attempts "
+            f"SET state = ?, {timestamp_column} = ?, updated_at = ? "
+            f"WHERE message_id IN ({placeholders}) AND run_id = ? "
+            f"AND claim_token = ? AND state = ?",
+            (
+                new_state,
+                transition_at,
+                transition_at,
+                *ids,
+                int(run_id),
+                claim_token,
+                expected_state,
+            ),
+        )
+        return cur.rowcount == len(ids)
+
+
+def accept_mailbox_messages(
+    conn: sqlite3.Connection,
+    *,
+    message_ids: Iterable[int],
+    run_id: int,
+    recipient_profile: str,
+    claim_token: str,
+    now: Optional[int] = None,
+) -> bool:
+    return _transition_mailbox_messages(
+        conn,
+        message_ids=message_ids,
+        run_id=run_id,
+        recipient_profile=recipient_profile,
+        claim_token=claim_token,
+        expected_state="claimed_for_run",
+        new_state="accepted_by_steer",
+        timestamp_column="accepted_at",
+        now=now,
+    )
+
+
+def mark_mailbox_messages_included(
+    conn: sqlite3.Connection,
+    *,
+    message_ids: Iterable[int],
+    run_id: int,
+    recipient_profile: str,
+    claim_token: str,
+    now: Optional[int] = None,
+) -> bool:
+    return _transition_mailbox_messages(
+        conn,
+        message_ids=message_ids,
+        run_id=run_id,
+        recipient_profile=recipient_profile,
+        claim_token=claim_token,
+        expected_state="accepted_by_steer",
+        new_state="included_in_request",
+        timestamp_column="included_at",
+        now=now,
+    )
+
+
+def mark_mailbox_messages_responded(
+    conn: sqlite3.Connection,
+    *,
+    message_ids: Iterable[int],
+    run_id: int,
+    recipient_profile: str,
+    claim_token: str,
+    now: Optional[int] = None,
+) -> bool:
+    return _transition_mailbox_messages(
+        conn,
+        message_ids=message_ids,
+        run_id=run_id,
+        recipient_profile=recipient_profile,
+        claim_token=claim_token,
+        expected_state="included_in_request",
+        new_state="model_response_received",
+        timestamp_column="responded_at",
+        now=now,
+    )
+
+
+def _unresponded_mailbox_message_ids(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    run_id: Optional[int],
+    recipient_profile: Optional[str] = None,
+    blocking_only: bool = False,
+) -> list[int]:
+    """Return mailbox ids lacking a response attempt for ``run_id``."""
+    filters = ["m.task_id = ?"]
+    params: list[Any] = [task_id]
+    if recipient_profile is not None:
+        filters.append("m.recipient_profile = ?")
+        params.append(recipient_profile)
+    if blocking_only:
+        filters.append("m.kind IN ('guidance', 'question')")
+    if run_id is not None:
+        filters.append(
+            "NOT EXISTS ("
+            "SELECT 1 FROM task_mailbox_delivery_attempts a "
+            "WHERE a.message_id = m.id AND a.run_id = ? "
+            "AND a.state = 'model_response_received'"
+            ")"
+        )
+        params.append(int(run_id))
+    rows = conn.execute(
+        "SELECT m.id FROM task_mailbox_messages m WHERE "
+        + " AND ".join(filters)
+        + " ORDER BY m.id ASC",
+        params,
+    ).fetchall()
+    return [int(row["id"]) for row in rows]
+
+
+def try_close_mailbox_intake(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    run_id: int,
+    recipient_profile: str,
+) -> MailboxIntakeCloseResult:
+    """Close intake for an exact quiescent live run, or report pending ids."""
+    with write_txn(conn):
+        current = conn.execute(
+            "SELECT 1 FROM tasks t "
+            "JOIN task_runs r ON r.id = t.current_run_id "
+            "WHERE t.id = ? AND t.status = 'running' "
+            "AND t.current_run_id = ? AND r.id = ? AND r.task_id = t.id "
+            "AND r.profile = ? AND r.status = 'running' "
+            "AND r.ended_at IS NULL AND r.mailbox_accepting = 1",
+            (task_id, int(run_id), int(run_id), recipient_profile),
+        ).fetchone()
+        if current is None:
+            return MailboxIntakeCloseResult(
+                closed=False,
+                pending_message_ids=[],
+            )
+        pending_ids = _unresponded_mailbox_message_ids(
+            conn,
+            task_id=task_id,
+            run_id=int(run_id),
+            recipient_profile=recipient_profile,
+        )
+        if pending_ids:
+            return MailboxIntakeCloseResult(
+                closed=False,
+                pending_message_ids=pending_ids,
+            )
+        closed = conn.execute(
+            "UPDATE task_runs SET mailbox_accepting = 0 "
+            "WHERE id = ? AND task_id = ? AND profile = ? "
+            "AND status = 'running' AND ended_at IS NULL "
+            "AND mailbox_accepting = 1 "
+            "AND EXISTS (SELECT 1 FROM tasks t WHERE t.id = ? "
+            "AND t.status = 'running' AND t.current_run_id = task_runs.id)",
+            (
+                int(run_id),
+                task_id,
+                recipient_profile,
+                task_id,
+            ),
+        )
+        return MailboxIntakeCloseResult(
+            closed=closed.rowcount == 1,
+            pending_message_ids=[],
+        )
+
+
+def renew_mailbox_message_leases(
+    conn: sqlite3.Connection,
+    *,
+    message_ids: Iterable[int],
+    run_id: int,
+    recipient_profile: str,
+    claim_token: str,
+    lease_seconds: int = DEFAULT_MAILBOX_LEASE_SECONDS,
+    now: Optional[int] = None,
+) -> bool:
+    ids = _normalize_mailbox_message_ids(message_ids)
+    if not ids or not claim_token:
+        return False
+    renewed_at = int(time.time()) if now is None else int(now)
+    lease_expires = renewed_at + _bounded_mailbox_lease_seconds(lease_seconds)
+    with write_txn(conn):
+        if not _mailbox_attempt_batch_matches(
+            conn,
+            message_ids=ids,
+            run_id=int(run_id),
+            recipient_profile=recipient_profile,
+            claim_token=claim_token,
+            expected_states=(
+                "claimed_for_run",
+                "accepted_by_steer",
+                "included_in_request",
+            ),
+            now=renewed_at,
+        ):
+            return False
+        placeholders = ",".join("?" for _ in ids)
+        cur = conn.execute(
+            f"UPDATE task_mailbox_delivery_attempts "
+            f"SET lease_expires = ?, updated_at = ? "
+            f"WHERE message_id IN ({placeholders}) AND run_id = ? "
+            f"AND claim_token = ? AND state != 'model_response_received'",
+            (
+                lease_expires,
+                renewed_at,
+                *ids,
+                int(run_id),
+                claim_token,
+            ),
+        )
+        return cur.rowcount == len(ids)
+
+
 # ---------------------------------------------------------------------------
 # Attachments
 # ---------------------------------------------------------------------------
@@ -3000,8 +4274,8 @@ def claim_task(
             INSERT INTO task_runs (
                 task_id, profile, step_key, status,
                 claim_lock, claim_expires, max_runtime_seconds,
-                started_at
-            ) VALUES (?, ?, ?, 'running', ?, ?, ?, ?)
+                started_at, mailbox_accepting
+            ) VALUES (?, ?, ?, 'running', ?, ?, ?, ?, 1)
             """,
             (
                 task_id,
@@ -3074,8 +4348,8 @@ def claim_review_task(
             INSERT INTO task_runs (
                 task_id, profile, step_key, status,
                 claim_lock, claim_expires, max_runtime_seconds,
-                started_at
-            ) VALUES (?, ?, ?, 'running', ?, ?, ?, ?)
+                started_at, mailbox_accepting
+            ) VALUES (?, ?, ?, 'running', ?, ?, ?, ?, 1)
             """,
             (
                 task_id,
@@ -3502,7 +4776,7 @@ class HallucinatedCardsError(ValueError):
         )
 
 
-def complete_task(
+def _complete_task(
     conn: sqlite3.Connection,
     task_id: str,
     *,
@@ -3511,7 +4785,7 @@ def complete_task(
     metadata: Optional[dict] = None,
     created_cards: Optional[Iterable[str]] = None,
     expected_run_id: Optional[int] = None,
-) -> bool:
+) -> bool | MailboxCompletionBlockedError:
     """Transition ``running|ready -> done`` and record ``result``.
 
     Accepts a task that is merely ``ready`` too, so a manual CLI
@@ -3570,6 +4844,45 @@ def complete_task(
         verified_cards = []
 
     with write_txn(conn):
+        task_row = conn.execute(
+            "SELECT status, current_run_id FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if task_row is None or task_row["status"] not in {
+            "running", "ready", "blocked"
+        }:
+            return False
+        current_run_id = (
+            int(task_row["current_run_id"])
+            if task_row["current_run_id"] is not None
+            else None
+        )
+        if (
+            expected_run_id is not None
+            and current_run_id != int(expected_run_id)
+        ):
+            return False
+        pending_message_ids = _unresponded_mailbox_message_ids(
+            conn,
+            task_id=task_id,
+            run_id=current_run_id,
+            blocking_only=True,
+        )
+        if pending_message_ids:
+            _append_event(
+                conn,
+                task_id,
+                "completion_blocked_mailbox",
+                {
+                    "message_ids": pending_message_ids,
+                    "current_run_id": current_run_id,
+                },
+                run_id=current_run_id,
+            )
+            return MailboxCompletionBlockedError(
+                pending_message_ids,
+                current_run_id,
+            )
         if expected_run_id is None:
             cur = conn.execute(
                 """
@@ -3682,6 +4995,31 @@ def complete_task(
     # Clean up the scratch workspace and any stale tmux session for the worker.
     _cleanup_workspace(conn, task_id)
     return True
+
+
+def complete_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    result: Optional[str] = None,
+    summary: Optional[str] = None,
+    metadata: Optional[dict] = None,
+    created_cards: Optional[Iterable[str]] = None,
+    expected_run_id: Optional[int] = None,
+) -> bool:
+    """Complete a task, raising mailbox rejection only after audit commit."""
+    outcome = _complete_task(
+        conn,
+        task_id,
+        result=result,
+        summary=summary,
+        metadata=metadata,
+        created_cards=created_cards,
+        expected_run_id=expected_run_id,
+    )
+    if isinstance(outcome, MailboxCompletionBlockedError):
+        raise outcome
+    return outcome
 
 
 # ---------------------------------------------------------------------------
@@ -4487,6 +5825,53 @@ def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
     return True
 
 
+def _delete_task_related_rows_after_parent(
+    conn: sqlite3.Connection, task_id: str
+) -> None:
+    """Delete every DB row owned by an already-deleted task, in-txn.
+
+    The parent ``tasks`` row must be removed first. That is the capability
+    checked by the mailbox message DELETE trigger: standalone message deletion
+    remains forbidden, while an atomic task hard-delete may remove the full
+    mailbox graph without leaving attempts, audit references, or linked
+    comments behind.
+    """
+    conn.execute(
+        "DELETE FROM task_mailbox_audit "
+        "WHERE task_id = ? "
+        "OR message_id IN ("
+        "    SELECT id FROM task_mailbox_messages WHERE task_id = ?"
+        ") "
+        "OR run_id IN (SELECT id FROM task_runs WHERE task_id = ?)",
+        (task_id, task_id, task_id),
+    )
+    conn.execute(
+        "DELETE FROM task_mailbox_delivery_attempts "
+        "WHERE message_id IN ("
+        "    SELECT id FROM task_mailbox_messages WHERE task_id = ?"
+        ")",
+        (task_id,),
+    )
+    conn.execute(
+        "DELETE FROM task_mailbox_wake_evaluations "
+        "WHERE message_id IN ("
+        "    SELECT id FROM task_mailbox_messages WHERE task_id = ?"
+        ")",
+        (task_id,),
+    )
+    conn.execute(
+        "DELETE FROM task_mailbox_messages WHERE task_id = ?", (task_id,)
+    )
+    conn.execute(
+        "DELETE FROM task_links WHERE parent_id = ? OR child_id = ?",
+        (task_id, task_id),
+    )
+    conn.execute("DELETE FROM task_comments WHERE task_id = ?", (task_id,))
+    conn.execute("DELETE FROM task_events WHERE task_id = ?", (task_id,))
+    conn.execute("DELETE FROM task_runs WHERE task_id = ?", (task_id,))
+    conn.execute("DELETE FROM kanban_notify_subs WHERE task_id = ?", (task_id,))
+
+
 def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
     """Permanently remove an already-archived task and its related rows.
 
@@ -4501,37 +5886,37 @@ def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
         ).fetchone()
         if not row or row["status"] != "archived":
             return False
-        conn.execute(
-            "DELETE FROM task_links WHERE parent_id = ? OR child_id = ?",
-            (task_id, task_id),
+        cur = conn.execute(
+            "DELETE FROM tasks WHERE id = ? AND status = 'archived'", (task_id,)
         )
-        conn.execute("DELETE FROM task_comments WHERE task_id = ?", (task_id,))
-        conn.execute("DELETE FROM task_events WHERE task_id = ?", (task_id,))
-        conn.execute("DELETE FROM task_runs WHERE task_id = ?", (task_id,))
-        conn.execute("DELETE FROM kanban_notify_subs WHERE task_id = ?", (task_id,))
-        cur = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
-        return cur.rowcount == 1
+        if cur.rowcount != 1:
+            return False
+        _delete_task_related_rows_after_parent(conn, task_id)
+        return True
 
 
 def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
     """Hard-delete a task and cascade to all related rows.
 
     Because the schema does not use ``ON DELETE CASCADE`` foreign keys,
-    we explicitly delete from child tables first, then the task row.
-    This keeps the operation atomic (single ``write_txn``).
+    we delete the guarded task row first, then explicitly remove its mailbox
+    graph and existing related rows. The parent-first order lets the conditional
+    mailbox immutability trigger distinguish a complete task hard-delete from
+    forbidden standalone message deletion. One ``write_txn`` keeps the whole
+    operation atomic.
 
     Returns ``True`` if the task existed and was deleted, ``False``
     if the task was not found.
     """
     with write_txn(conn):
+        if not conn.execute(
+            "SELECT 1 FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone():
+            return False
         cur = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
         if cur.rowcount != 1:
             return False
-        conn.execute("DELETE FROM task_links WHERE parent_id = ? OR child_id = ?", (task_id, task_id))
-        conn.execute("DELETE FROM task_comments WHERE task_id = ?", (task_id,))
-        conn.execute("DELETE FROM task_events WHERE task_id = ?", (task_id,))
-        conn.execute("DELETE FROM task_runs WHERE task_id = ?", (task_id,))
-        conn.execute("DELETE FROM kanban_notify_subs WHERE task_id = ?", (task_id,))
+        _delete_task_related_rows_after_parent(conn, task_id)
     recompute_ready(conn)
     return True
 

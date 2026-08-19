@@ -970,6 +970,21 @@ def _run_cleanup():
                 _active_agent_ref.shutdown_memory_provider()
     except Exception:
         pass
+    # Phase 3 mid-turn crash recovery: clear the run_active flag for the
+    # active session so the next startup doesn't mistake this clean exit
+    # for a mid-turn crash. Without this, closing the terminal leaves
+    # run_active=1 (run_conversation never returns) and
+    # find_interrupted_session() would later find it — but the ended_at
+    # column is also set here, so the AND-clause in that query guards it.
+    # We clear run_active unconditionally on the atexit/signal path to be
+    # robust even if end_session() was missed.
+    try:
+        if _active_agent_ref is not None and getattr(_active_agent_ref, "_session_db", None):
+            _sid = getattr(_active_agent_ref, "session_id", None)
+            if _sid:
+                _active_agent_ref._session_db.mark_run_idle(_sid)
+    except Exception:
+        pass
 
 
 # =============================================================================
@@ -3223,6 +3238,18 @@ class HermesCLI:
             timestamp_str = self.session_start.strftime("%Y%m%d_%H%M%S")
             short_uuid = uuid.uuid4().hex[:6]
             self.session_id = f"{timestamp_str}_{short_uuid}"
+
+            # Phase 3 auto-resume: if a previous session was interrupted
+            # mid-turn (run_active=1, ended_at IS NULL) and the user opted
+            # into agent.auto_resume_last, prompt to continue it instead of
+            # starting fresh. Only fires in interactive CLI startup (not
+            # gateway, not single-query mode, not when already resuming).
+            try:
+                _auto_resume = bool(self._config.get("agent", {}).get("auto_resume_last", False))
+            except Exception:
+                _auto_resume = False
+            if _auto_resume and getattr(self, "interactive", True) and not getattr(self, "_single_query", False):
+                self._maybe_offer_auto_resume()
         
         # History file for persistent input recall across sessions
         self._history_file = _hermes_home / ".hermes_history"
@@ -4952,6 +4979,13 @@ class HermesCLI:
             restored = self._session_db.get_messages_as_conversation(self.session_id)
             if restored:
                 restored = [m for m in restored if m.get("role") != "session_meta"]
+                # Phase 3: repair any dangling tail left by a mid-turn crash
+                # before adopting the history. Idempotent no-op on clean tails.
+                if self.agent and hasattr(self.agent, "_repair_interrupted_tail"):
+                    try:
+                        self.agent._repair_interrupted_tail(restored)
+                    except Exception:
+                        pass
                 self.conversation_history = restored
                 msg_count = len([m for m in restored if m.get("role") == "user"])
                 title_part = ""
@@ -5049,6 +5083,25 @@ class HermesCLI:
                 stream_delta_callback=self._stream_delta if self.streaming_enabled else None,
                 tool_gen_callback=self._on_tool_gen_start if self.streaming_enabled else None,
             )
+            # Only this root CLI construction site grants mailbox authority.
+            # Delegates, background agents, auxiliary clients, and MCP paths
+            # construct AIAgent elsewhere and retain the default None.
+            from agent.mailbox_principal import grant_top_level_mailbox_principal
+            from hermes_cli.profiles import get_active_profile_name
+
+            _mailbox_profile = get_active_profile_name() or "default"
+            grant_top_level_mailbox_principal(
+                self.agent,
+                platform="cli",
+                sender_profile=_mailbox_profile,
+                actor_identity=f"cli:{_mailbox_profile}:{self.session_id}",
+            )
+            # Start the Kanban mailbox listener for worker principals only.
+            # No-op (returns False) for manager principals and ordinary chat;
+            # the initializer checks mailbox_principal.kind == "worker".
+            from agent.kanban_mailbox import initialize_kanban_mailbox_runtime
+
+            initialize_kanban_mailbox_runtime(self.agent)
             # Store reference for atexit memory provider shutdown
             global _active_agent_ref
             _active_agent_ref = self.agent
@@ -5234,6 +5287,11 @@ class HermesCLI:
         restored = self._session_db.get_messages_as_conversation(self.session_id)
         if restored:
             restored = [m for m in restored if m.get("role") != "session_meta"]
+            if self.agent and hasattr(self.agent, "_repair_interrupted_tail"):
+                try:
+                    self.agent._repair_interrupted_tail(restored)
+                except Exception:
+                    pass
             self.conversation_history = restored
             msg_count = len([m for m in restored if m.get("role") == "user"])
             title_part = ""
@@ -6690,6 +6748,47 @@ class HermesCLI:
         _cprint("  Your CLI session is intact.")
         return True
 
+    def _maybe_offer_auto_resume(self) -> None:
+        """Phase 3: on interactive startup, detect an interrupted session and
+        offer to resume it. Called only when ``agent.auto_resume_last`` is true
+        and no explicit --resume was passed. Mutates session_id/_resumed in
+        place when the user accepts, mirroring what /resume --last does."""
+        if not self._session_db:
+            return
+        try:
+            interrupted = self._session_db.find_interrupted_session()
+        except Exception:
+            return
+        if not interrupted:
+            return
+        # Best-effort timestamp display for the prompt.
+        try:
+            meta = self._session_db.get_session(interrupted)
+            ts = ""
+            if meta and meta.get("last_activity_at"):
+                import time as _t
+                _ago = max(0, int(_t.time() - (meta["last_activity_at"] or 0)))
+                if _ago < 60:
+                    ts = f" (последняя активность {_ago}s назад)"
+                else:
+                    ts = f" (последняя активность {_ago // 60}m назад)"
+        except Exception:
+            ts = ""
+        try:
+            _cprint(
+                f"\n  ⚠️  Обнаружена прерванная сессия {interrupted}{ts}.\n"
+                f"      Продолжить с того места? [Y/n] "
+            )
+            answer = input().strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            answer = "n"
+        if answer in ("", "y", "yes", "д", "да"):
+            self.session_id = interrupted
+            self._resumed = True
+            _cprint(f"  ↩️  Resuming {interrupted}\n")
+        else:
+            _cprint(f"  (стартую новую сессию; прерванная {interrupted} останется доступна через /resume --last)\n")
+
     def _handle_resume_command(self, cmd_original: str) -> None:
         """Handle /resume <session_id_or_title> — switch to a previous session mid-conversation."""
         parts = cmd_original.split(None, 1)
@@ -6707,6 +6806,22 @@ class HermesCLI:
             or (target[0] == "'" and target[-1] == "'")
         ):
             target = target[1:-1].strip()
+
+        # Phase 3: /resume --last — resume the most recent interrupted session
+        # (run_active=1, ended_at IS NULL), falling back to the most recent
+        # session of any kind. Lets the user recover from a crash without
+        # having to find the session id.
+        if target in ("--last", "-l", "last"):
+            if not self._session_db:
+                from hermes_state import format_session_db_unavailable
+                _cprint(f"  {format_session_db_unavailable()}")
+                return
+            target = self._session_db.find_interrupted_session() or \
+                     self._session_db.most_recent_session_id()
+            if not target:
+                _cprint("  (._.) No sessions found to resume.")
+                return
+            _cprint(f"  ↩️  Resuming {target}")
 
         if not target:
             _cprint("  Usage: /resume <number|session_id_or_title>")
@@ -6788,6 +6903,12 @@ class HermesCLI:
         # Load conversation history (strip transcript-only metadata entries)
         restored = self._session_db.get_messages_as_conversation(target_id)
         restored = [m for m in (restored or []) if m.get("role") != "session_meta"]
+        # Phase 3: repair a dangling tail from a mid-turn crash.
+        if self.agent and hasattr(self.agent, "_repair_interrupted_tail"):
+            try:
+                self.agent._repair_interrupted_tail(restored)
+            except Exception:
+                pass
         self.conversation_history = restored
 
         # Re-open the target session so it's not marked as ended
@@ -8437,6 +8558,21 @@ class HermesCLI:
         if output:
             print(output)
 
+    def _handle_team_command(self, cmd: str):
+        """Handle /team — manage the team of specialized agent profiles.
+
+        Thin wrapper over tools.agent_manager.run_team_slash, which holds
+        all the parsing + formatting logic so CLI and gateway stay in sync.
+        """
+        from tools.agent_manager import run_team_slash
+
+        try:
+            output = run_team_slash(cmd)
+        except Exception as exc:  # pragma: no cover - defensive
+            output = f"(._.) /team error: {exc}"
+        if output:
+            print(output)
+
     def _handle_skills_command(self, cmd: str):
         """Handle /skills slash command — delegates to hermes_cli.skills_hub."""
         from hermes_cli.skills_hub import handle_skills_slash
@@ -8751,6 +8887,8 @@ class HermesCLI:
             self._handle_curator_command(cmd_original)
         elif canonical == "kanban":
             self._handle_kanban_command(cmd_original)
+        elif canonical == "team":
+            self._handle_team_command(cmd_original)
         elif canonical == "skills":
             with self._busy_command(self._slow_command_status(cmd_original)):
                 self._handle_skills_command(cmd_original)

@@ -28,6 +28,13 @@ import uuid
 from typing import Any, Dict, List, Optional
 
 from agent.codex_responses_adapter import _summarize_user_message_for_log
+from agent.agent_runtime_helpers import (
+    acknowledge_mailbox_delivery_batch,
+    current_mailbox_delivery_batch,
+    inject_mailbox_delivery_batch,
+    reconcile_mailbox_delivery_batch_after_response_failure,
+    restore_mailbox_message_mutation,
+)
 from agent.display import KawaiiSpinner
 from agent.error_classifier import FailoverReason, classify_api_error
 from agent.iteration_budget import IterationBudget
@@ -115,6 +122,31 @@ def _ra():
     """
     import run_agent
     return run_agent
+
+
+def _mailbox_barrier_failure_result(
+    *,
+    messages: list,
+    api_call_count: int,
+    stage: str,
+) -> Dict[str, Any]:
+    if stage == "included":
+        detail = "before the provider request"
+        visible_calls = max(0, api_call_count - 1)
+    else:
+        detail = "after the model response and before response processing"
+        visible_calls = api_call_count
+    error = f"Mailbox {stage} acknowledgement failed {detail}."
+    logger.error(error)
+    return {
+        "final_response": f"❌ {error} The delivery remains queued for recovery.",
+        "messages": messages,
+        "api_calls": visible_calls,
+        "completed": False,
+        "failed": True,
+        "error": error,
+        "turn_exit_reason": f"mailbox_{stage}_ack_failed",
+    }
 
 
 def _nous_entitlement_message(capability: str) -> str:
@@ -381,6 +413,16 @@ def run_conversation(
     _install_safe_stdio()
 
     agent._ensure_db_session()
+
+    # Phase 3 mid-turn crash recovery: flag this session as mid-turn so that
+    # if the process dies before run_conversation returns, the next startup
+    # can detect it via find_interrupted_session() and offer to resume.
+    # mark_run_idle() at the function's tail clears the flag on every exit.
+    if agent._session_db and agent.session_id:
+        try:
+            agent._session_db.mark_run_active(agent.session_id)
+        except Exception:
+            pass
 
     # Tell auxiliary_client what the live main provider/model are for
     # this turn. Used by tools whose behaviour depends on the active
@@ -725,6 +767,9 @@ def run_conversation(
     final_response = None
     interrupted = False
     failed = False
+    _mailbox_failure_error = None
+    _mailbox_failure_metadata = {}
+    _mailbox_exit_requested = False
     codex_ack_continuations = 0
     length_continue_retries = 0
     truncated_tool_call_retries = 0
@@ -771,11 +816,22 @@ def run_conversation(
     # prefetch_all() on each tool call (10 tool calls = 10x latency + cost).
     # Use original_user_message (clean input) — user_message may contain
     # injected skill content that bloats / breaks provider queries.
+    _query = original_user_message if isinstance(original_user_message, str) else ""
     _ext_prefetch_cache = ""
     if agent._memory_manager:
         try:
-            _query = original_user_message if isinstance(original_user_message, str) else ""
             _ext_prefetch_cache = agent._memory_manager.prefetch_all(_query) or ""
+        except Exception:
+            pass
+
+    # Built-in typed store: per-turn context pack (Phase 2 orchestrator).
+    # Query-aware supplement to the frozen snapshot — rendered as its own
+    # plain-markdown slot, never through the <memory-context> fence (that
+    # channel is reserved for external providers). Empty pack → no injection.
+    _memory_pack_cache = ""
+    if getattr(agent, "_memory_orchestrator", None):
+        try:
+            _memory_pack_cache = agent._memory_orchestrator.build_pack(_query) or ""
         except Exception:
             pass
 
@@ -904,6 +960,66 @@ def run_conversation(
                     existing = getattr(agent, "_pending_steer", None)
                     agent._pending_steer = (existing + "\n" + _pre_api_steer) if existing else _pre_api_steer
 
+        # ── KanbanMailboxRuntime listener drain ─────────────────────
+        # If a background listener runtime is attached (worker principal only),
+        # drain its in-memory queue into the canonical mailbox delivery path
+        # so the existing exact-batch boundary below can inject and acknowledge
+        # it atomically.  No-op for ordinary agents (no runtime attached).
+        _listener_runtime = getattr(agent, "_kanban_mailbox_runtime", None)
+        if _listener_runtime is not None:
+            try:
+                # Synchronous poll FIRST (design line 142): claim any message
+                # that landed between runtime start / the previous iteration
+                # and now, on the agent thread.  This closes the first-model-
+                # request window where the async listener (polling every
+                # poll_interval_seconds) has not yet ticked.  DB uniqueness +
+                # in-memory dedup make this safe alongside the listener loop.
+                _listener_runtime.poll_once()
+
+                from agent.kanban_mailbox import extract_mailbox_deliveries
+
+                _listener_batch = extract_mailbox_deliveries(agent)
+                if _listener_batch is not None and _listener_batch.deliveries:
+                    agent._enqueue_mailbox_deliveries(_listener_batch.deliveries)
+            except Exception:
+                logger.debug("KanbanMailboxRuntime drain failed", exc_info=True)
+
+        # ── Exact A2 mailbox boundary ────────────────────────────────
+        # Manual /steer text stays in its legacy slot.  Durable mailbox
+        # deliveries drain as one immutable ownership snapshot under the
+        # same lock, then become part of the canonical messages list before
+        # api_messages is built.  Only this exact snapshot may be
+        # acknowledged for the request below; arrivals after the drain stay
+        # pending for the next model boundary.
+        _mailbox_batch = agent._drain_pending_mailbox_deliveries()
+        _mailbox_mutation = None
+        if _mailbox_batch is not None:
+            try:
+                _mailbox_mutation = inject_mailbox_delivery_batch(
+                    agent,
+                    messages,
+                    _mailbox_batch,
+                    current_turn_user_idx=current_turn_user_idx,
+                )
+            except Exception:
+                logger.exception("Could not inject exact mailbox delivery batch")
+                _mailbox_failure = _mailbox_barrier_failure_result(
+                    messages=messages,
+                    api_call_count=api_call_count,
+                    stage="included",
+                )
+                final_response = _mailbox_failure["final_response"]
+                _mailbox_failure_error = _mailbox_failure["error"]
+                _turn_exit_reason = _mailbox_failure["turn_exit_reason"]
+                failed = True
+                api_call_count = _mailbox_failure["api_calls"]
+                agent._api_call_count = api_call_count
+                try:
+                    agent.iteration_budget.refund()
+                except Exception:
+                    pass
+                break
+
         # Prepare messages for API call
         # If we have an ephemeral system prompt, prepend it to the messages
         # Note: Reasoning is embedded in content via <think> tags for trajectory storage.
@@ -948,6 +1064,10 @@ def run_conversation(
             # never mutated, so nothing leaks into session persistence.
             if idx == current_turn_user_idx and msg.get("role") == "user":
                 _injections = []
+                # Built-in context pack first (core memory), then external
+                # provider prefetch, then plugin context.
+                if _memory_pack_cache:
+                    _injections.append(_memory_pack_cache)
                 if _ext_prefetch_cache:
                     _fenced = build_memory_context_block(_ext_prefetch_cache)
                     if _fenced:
@@ -1089,6 +1209,7 @@ def run_conversation(
             agent, approx_request_tokens
         )
         if _runtime_context_error:
+            restore_mailbox_message_mutation(messages, _mailbox_mutation)
             final_response = _runtime_context_error
             failed = True
             _turn_exit_reason = "ollama_runtime_context_too_small"
@@ -1101,6 +1222,34 @@ def run_conversation(
             except Exception:
                 pass
             break
+
+        # The canonical messages and the final provider-facing request now
+        # contain the same exact envelope.  Commit inclusion synchronously
+        # before any plugin can observe or any network call can send it.
+        if _mailbox_batch is not None and not acknowledge_mailbox_delivery_batch(
+            agent,
+            _mailbox_batch,
+            stage="included",
+        ):
+            restore_mailbox_message_mutation(messages, _mailbox_mutation)
+            _mailbox_failure = _mailbox_barrier_failure_result(
+                messages=messages,
+                api_call_count=api_call_count,
+                stage="included",
+            )
+            final_response = _mailbox_failure["final_response"]
+            _mailbox_failure_error = _mailbox_failure["error"]
+            _turn_exit_reason = _mailbox_failure["turn_exit_reason"]
+            failed = True
+            api_call_count = _mailbox_failure["api_calls"]
+            agent._api_call_count = api_call_count
+            try:
+                agent.iteration_budget.refund()
+            except Exception:
+                pass
+            break
+        if _mailbox_batch is not None:
+            _mailbox_batch = current_mailbox_delivery_batch(agent, _mailbox_batch)
         
         # Thinking spinner for quiet mode (animated during API call)
         thinking_spinner = None
@@ -1153,6 +1302,7 @@ def run_conversation(
         finish_reason = "stop"
         response = None  # Guard against UnboundLocalError if all retries fail
         api_kwargs = None  # Guard against UnboundLocalError in except handler
+        _mailbox_normalized_response = None
 
         while retry_count < max_retries:
             # ── Nous Portal rate limit guard ──────────────────────
@@ -1185,13 +1335,20 @@ def run_conversation(
                         # so user sees the rate-limit message that led here.
                         agent._flush_status_buffer()
                         agent._persist_session(messages, conversation_history)
+                        _nous_response = (
+                            f"⏳ {_nous_msg}\n\n"
+                            "No fallback provider available. "
+                            "Try again after the reset, or add a "
+                            "fallback provider in config.yaml."
+                        )
+                        if _mailbox_batch is not None:
+                            final_response = _nous_response
+                            _mailbox_failure_error = _nous_msg
+                            _turn_exit_reason = "mailbox_nous_rate_guard"
+                            failed = True
+                            break
                         return {
-                            "final_response": (
-                                f"⏳ {_nous_msg}\n\n"
-                                "No fallback provider available. "
-                                "Try again after the reset, or add a "
-                                "fallback provider in config.yaml."
-                            ),
+                            "final_response": _nous_response,
                             "messages": messages,
                             "api_calls": api_call_count,
                             "completed": False,
@@ -1504,11 +1661,20 @@ def run_conversation(
                         agent._emit_status(f"❌ Max retries ({max_retries}) exceeded for invalid responses. Giving up.")
                         logger.error(f"{agent.log_prefix}Invalid API response after {max_retries} retries.")
                         agent._persist_session(messages, conversation_history)
+                        _invalid_response_error = (
+                            f"Invalid API response after {max_retries} retries: {_failure_hint}"
+                        )
+                        if _mailbox_batch is not None:
+                            final_response = _invalid_response_error
+                            _mailbox_failure_error = _invalid_response_error
+                            _turn_exit_reason = "mailbox_invalid_provider_response"
+                            failed = True
+                            break
                         return {
                             "messages": messages,
                             "completed": False,
                             "api_calls": api_call_count,
-                            "error": f"Invalid API response after {max_retries} retries: {_failure_hint}",
+                            "error": _invalid_response_error,
                             "failed": True  # Mark as failure for filtering
                         }
                     
@@ -1525,8 +1691,18 @@ def run_conversation(
                             agent._vprint(f"{agent.log_prefix}⚡ Interrupt detected during retry wait, aborting.", force=True)
                             agent._persist_session(messages, conversation_history)
                             agent.clear_interrupt()
+                            _interrupt_response = (
+                                f"Operation interrupted during retry ({_failure_hint}, "
+                                f"attempt {retry_count}/{max_retries})."
+                            )
+                            if _mailbox_batch is not None:
+                                final_response = _interrupt_response
+                                interrupted = True
+                                _mailbox_exit_requested = True
+                                _turn_exit_reason = "mailbox_invalid_response_retry_interrupted"
+                                break
                             return {
-                                "final_response": f"Operation interrupted during retry ({_failure_hint}, attempt {retry_count}/{max_retries}).",
+                                "final_response": _interrupt_response,
                                 "messages": messages,
                                 "api_calls": api_call_count,
                                 "completed": False,
@@ -1541,7 +1717,43 @@ def run_conversation(
                                 f"retry backoff ({retry_count}/{max_retries}), "
                                 f"{int(sleep_end - time.time())}s remaining"
                             )
+                    if _mailbox_exit_requested:
+                        break
                     continue  # Retry the API call
+
+                # A valid provider response is not enough: normalize it once
+                # here, then synchronously commit response receipt before
+                # finish-reason handling, plugins, tool-name repair,
+                # validation, guardrails, or dispatch can have side effects.
+                if _mailbox_batch is not None:
+                    _mailbox_transport = agent._get_transport()
+                    _mailbox_normalize_kwargs = {}
+                    if agent.api_mode == "anthropic_messages":
+                        _mailbox_normalize_kwargs["strip_tool_prefix"] = agent._is_anthropic_oauth
+                    _mailbox_normalized_response = _mailbox_transport.normalize_response(
+                        response,
+                        **_mailbox_normalize_kwargs,
+                    )
+                    if not acknowledge_mailbox_delivery_batch(
+                        agent,
+                        _mailbox_batch,
+                        stage="responded",
+                    ):
+                        reconcile_mailbox_delivery_batch_after_response_failure(
+                            agent,
+                            _mailbox_batch,
+                        )
+                        _mailbox_failure = _mailbox_barrier_failure_result(
+                            messages=messages,
+                            api_call_count=api_call_count,
+                            stage="responded",
+                        )
+                        final_response = _mailbox_failure["final_response"]
+                        _mailbox_failure_error = _mailbox_failure["error"]
+                        _turn_exit_reason = _mailbox_failure["turn_exit_reason"]
+                        failed = True
+                        break
+                    _mailbox_batch = None
 
                 # Check finish_reason before proceeding
                 if agent.api_mode == "codex_responses":
@@ -1562,11 +1774,19 @@ def run_conversation(
                 elif agent.api_mode == "bedrock_converse":
                     # Bedrock response already normalized at dispatch — use transport
                     _bt_fr = agent._get_transport()
-                    _bedrock_result = _bt_fr.normalize_response(response)
+                    _bedrock_result = (
+                        _mailbox_normalized_response
+                        if _mailbox_normalized_response is not None
+                        else _bt_fr.normalize_response(response)
+                    )
                     finish_reason = _bedrock_result.finish_reason
                 else:
                     _cc_fr = agent._get_transport()
-                    _finish_result = _cc_fr.normalize_response(response)
+                    _finish_result = (
+                        _mailbox_normalized_response
+                        if _mailbox_normalized_response is not None
+                        else _cc_fr.normalize_response(response)
+                    )
                     finish_reason = _finish_result.finish_reason
                     assistant_message = _finish_result
                     if agent._should_treat_stop_as_truncated(
@@ -1603,7 +1823,9 @@ def run_conversation(
                     # would have been appended in the non-truncated path.
                     _trunc_msg = None
                     _trunc_transport = agent._get_transport()
-                    if agent.api_mode == "anthropic_messages":
+                    if _mailbox_normalized_response is not None:
+                        _trunc_result = _mailbox_normalized_response
+                    elif agent.api_mode == "anthropic_messages":
                         _trunc_result = _trunc_transport.normalize_response(
                             response, strip_tool_prefix=agent._is_anthropic_oauth
                         )
@@ -2647,8 +2869,18 @@ def run_conversation(
                     agent._vprint(f"{agent.log_prefix}⚡ Interrupt detected during error handling, aborting retries.", force=True)
                     agent._persist_session(messages, conversation_history)
                     agent.clear_interrupt()
+                    _interrupt_response = (
+                        f"Operation interrupted: handling API error "
+                        f"({error_type}: {agent._clean_error_message(str(api_error))})."
+                    )
+                    if _mailbox_batch is not None:
+                        final_response = _interrupt_response
+                        interrupted = True
+                        _mailbox_exit_requested = True
+                        _turn_exit_reason = "mailbox_provider_error_interrupted"
+                        break
                     return {
-                        "final_response": f"Operation interrupted: handling API error ({error_type}: {agent._clean_error_message(str(api_error))}).",
+                        "final_response": _interrupt_response,
                         "messages": messages,
                         "api_calls": api_call_count,
                         "completed": False,
@@ -2860,11 +3092,25 @@ def run_conversation(
                         agent._vprint(f"{agent.log_prefix}   💡 Try /new to start a fresh conversation, or /compress to retry compression.", force=True)
                         logger.error(f"{agent.log_prefix}413 compression failed after {max_compression_attempts} attempts.")
                         agent._persist_session(messages, conversation_history)
+                        _payload_error = (
+                            "Request payload too large: max compression attempts "
+                            f"({max_compression_attempts}) reached."
+                        )
+                        if _mailbox_batch is not None:
+                            final_response = _payload_error
+                            _mailbox_failure_error = _payload_error
+                            _mailbox_failure_metadata = {
+                                "partial": True,
+                                "compression_exhausted": True,
+                            }
+                            _turn_exit_reason = "mailbox_payload_compression_exhausted"
+                            failed = True
+                            break
                         return {
                             "messages": messages,
                             "completed": False,
                             "api_calls": api_call_count,
-                            "error": f"Request payload too large: max compression attempts ({max_compression_attempts}) reached.",
+                            "error": _payload_error,
                             "partial": True,
                             "failed": True,
                             "compression_exhausted": True,
@@ -2894,11 +3140,22 @@ def run_conversation(
                         agent._vprint(f"{agent.log_prefix}   💡 Try /new to start a fresh conversation, or /compress to retry compression.", force=True)
                         logger.error(f"{agent.log_prefix}413 payload too large. Cannot compress further.")
                         agent._persist_session(messages, conversation_history)
+                        _payload_error = "Request payload too large (413). Cannot compress further."
+                        if _mailbox_batch is not None:
+                            final_response = _payload_error
+                            _mailbox_failure_error = _payload_error
+                            _mailbox_failure_metadata = {
+                                "partial": True,
+                                "compression_exhausted": True,
+                            }
+                            _turn_exit_reason = "mailbox_payload_compression_failed"
+                            failed = True
+                            break
                         return {
                             "messages": messages,
                             "completed": False,
                             "api_calls": api_call_count,
-                            "error": "Request payload too large (413). Cannot compress further.",
+                            "error": _payload_error,
                             "partial": True,
                             "failed": True,
                             "compression_exhausted": True,
@@ -2947,11 +3204,25 @@ def run_conversation(
                             agent._vprint(f"{agent.log_prefix}   💡 Try /new to start a fresh conversation, or /compress to retry compression.", force=True)
                             logger.error(f"{agent.log_prefix}Context compression failed after {max_compression_attempts} attempts.")
                             agent._persist_session(messages, conversation_history)
+                            _context_error = (
+                                "Context length exceeded: max compression attempts "
+                                f"({max_compression_attempts}) reached."
+                            )
+                            if _mailbox_batch is not None:
+                                final_response = _context_error
+                                _mailbox_failure_error = _context_error
+                                _mailbox_failure_metadata = {
+                                    "partial": True,
+                                    "compression_exhausted": True,
+                                }
+                                _turn_exit_reason = "mailbox_output_cap_compression_exhausted"
+                                failed = True
+                                break
                             return {
                                 "messages": messages,
                                 "completed": False,
                                 "api_calls": api_call_count,
-                                "error": f"Context length exceeded: max compression attempts ({max_compression_attempts}) reached.",
+                                "error": _context_error,
                                 "partial": True,
                                 "failed": True,
                                 "compression_exhausted": True,
@@ -3016,11 +3287,25 @@ def run_conversation(
                         agent._vprint(f"{agent.log_prefix}   💡 Try /new to start a fresh conversation, or /compress to retry compression.", force=True)
                         logger.error(f"{agent.log_prefix}Context compression failed after {max_compression_attempts} attempts.")
                         agent._persist_session(messages, conversation_history)
+                        _context_error = (
+                            "Context length exceeded: max compression attempts "
+                            f"({max_compression_attempts}) reached."
+                        )
+                        if _mailbox_batch is not None:
+                            final_response = _context_error
+                            _mailbox_failure_error = _context_error
+                            _mailbox_failure_metadata = {
+                                "partial": True,
+                                "compression_exhausted": True,
+                            }
+                            _turn_exit_reason = "mailbox_context_compression_exhausted"
+                            failed = True
+                            break
                         return {
                             "messages": messages,
                             "completed": False,
                             "api_calls": api_call_count,
-                            "error": f"Context length exceeded: max compression attempts ({max_compression_attempts}) reached.",
+                            "error": _context_error,
                             "partial": True,
                             "failed": True,
                             "compression_exhausted": True,
@@ -3050,11 +3335,25 @@ def run_conversation(
                         agent._vprint(f"{agent.log_prefix}   💡 The conversation has accumulated too much content. Try /new to start fresh, or /compress to manually trigger compression.", force=True)
                         logger.error(f"{agent.log_prefix}Context length exceeded: {approx_tokens:,} tokens. Cannot compress further.")
                         agent._persist_session(messages, conversation_history)
+                        _context_error = (
+                            f"Context length exceeded ({approx_tokens:,} tokens). "
+                            "Cannot compress further."
+                        )
+                        if _mailbox_batch is not None:
+                            final_response = _context_error
+                            _mailbox_failure_error = _context_error
+                            _mailbox_failure_metadata = {
+                                "partial": True,
+                                "compression_exhausted": True,
+                            }
+                            _turn_exit_reason = "mailbox_context_compression_failed"
+                            failed = True
+                            break
                         return {
                             "messages": messages,
                             "completed": False,
                             "api_calls": api_call_count,
-                            "error": f"Context length exceeded ({approx_tokens:,} tokens). Cannot compress further.",
+                            "error": _context_error,
                             "partial": True,
                             "failed": True,
                             "compression_exhausted": True,
@@ -3256,14 +3555,27 @@ def run_conversation(
                             f"Try rephrasing the request, narrowing the context, or "
                             f"adding a fallback provider with `hermes fallback add`."
                         )
+                        _policy_error = f"content_policy_blocked: {_summary}"
+                        if _mailbox_batch is not None:
+                            final_response = _policy_response
+                            _mailbox_failure_error = _policy_error
+                            _turn_exit_reason = "mailbox_content_policy_blocked"
+                            failed = True
+                            break
                         return {
                             "final_response": _policy_response,
                             "messages": messages,
                             "api_calls": api_call_count,
                             "completed": False,
                             "failed": True,
-                            "error": f"content_policy_blocked: {_summary}",
+                            "error": _policy_error,
                         }
+                    if _mailbox_batch is not None:
+                        final_response = f"Provider request failed: {api_error}"
+                        _mailbox_failure_error = str(api_error)
+                        _turn_exit_reason = "mailbox_nonretryable_provider_error"
+                        failed = True
+                        break
                     return {
                         "final_response": None,
                         "messages": messages,
@@ -3371,6 +3683,16 @@ def run_conversation(
                             "execute_code with Python's open() for large "
                             "files, or to write in smaller sections."
                         )
+                    if _mailbox_batch is not None:
+                        # Mailbox-owned turns must cross the shared tail so
+                        # session idle/end hooks and cleanup still run.  The
+                        # wrapper preserves the already-included active batch
+                        # for a later response attempt.
+                        final_response = _final_response
+                        _mailbox_failure_error = _final_summary
+                        _turn_exit_reason = "mailbox_provider_failed"
+                        failed = True
+                        break
                     return {
                         "final_response": _final_response,
                         "messages": messages,
@@ -3413,8 +3735,18 @@ def run_conversation(
                         agent._vprint(f"{agent.log_prefix}⚡ Interrupt detected during retry wait, aborting.", force=True)
                         agent._persist_session(messages, conversation_history)
                         agent.clear_interrupt()
+                        _interrupt_response = (
+                            "Operation interrupted: retrying API call after error "
+                            f"(retry {retry_count}/{max_retries})."
+                        )
+                        if _mailbox_batch is not None:
+                            final_response = _interrupt_response
+                            interrupted = True
+                            _mailbox_exit_requested = True
+                            _turn_exit_reason = "mailbox_provider_retry_interrupted"
+                            break
                         return {
-                            "final_response": f"Operation interrupted: retrying API call after error (retry {retry_count}/{max_retries}).",
+                            "final_response": _interrupt_response,
                             "messages": messages,
                             "api_calls": api_call_count,
                             "completed": False,
@@ -3429,7 +3761,12 @@ def run_conversation(
                             f"error retry backoff ({retry_count}/{max_retries}), "
                             f"{int(sleep_end - time.time())}s remaining"
                         )
+                if _mailbox_exit_requested:
+                    break
         
+        if _mailbox_failure_error is not None or _mailbox_exit_requested:
+            break
+
         # If the API call was interrupted, skip response processing
         if interrupted:
             _turn_exit_reason = "interrupted_during_api_call"
@@ -3475,7 +3812,11 @@ def run_conversation(
             _normalize_kwargs = {}
             if agent.api_mode == "anthropic_messages":
                 _normalize_kwargs["strip_tool_prefix"] = agent._is_anthropic_oauth
-            normalized = _transport.normalize_response(response, **_normalize_kwargs)
+            normalized = (
+                _mailbox_normalized_response
+                if _mailbox_normalized_response is not None
+                else _transport.normalize_response(response, **_normalize_kwargs)
+            )
             assistant_message = normalized
             finish_reason = normalized.finish_reason
             
@@ -3882,6 +4223,26 @@ def run_conversation(
                         pass
 
                 agent._execute_tool_calls(assistant_message, messages, effective_task_id, api_call_count)
+
+                # Phase 3 mid-turn crash recovery: flush the just-appended
+                # tool results to the session DB now, rather than only at the
+                # final _persist_session call. _flush_messages_to_session_db
+                # is idempotent (tracks progress via _last_flushed_db_idx),
+                # so this is a near-zero-cost no-op on the normal exit path
+                # and a lifesaver when the process is killed mid-loop. Also
+                # touch_activity so find_interrupted_session reports a fresh
+                # timestamp if a crash follows. Gated by agent.mid_turn_persist
+                # (default on) so users on slow disks can opt out.
+                if (
+                    getattr(agent, "_mid_turn_persist", True)
+                    and agent._session_db
+                    and agent.session_id
+                ):
+                    try:
+                        agent._flush_messages_to_session_db(messages, conversation_history)
+                        agent._session_db.touch_activity(agent.session_id)
+                    except Exception:
+                        pass
 
                 if agent._tool_guardrail_halt_decision is not None:
                     decision = agent._tool_guardrail_halt_decision
@@ -4449,6 +4810,7 @@ def run_conversation(
         final_response is not None
         and api_call_count < agent.max_iterations
         and not failed
+        and not interrupted
     )
 
     # Save trajectory if enabled.  ``user_message`` may be a multimodal
@@ -4675,6 +5037,9 @@ def run_conversation(
     }
     if agent._tool_guardrail_halt_decision is not None:
         result["guardrail"] = agent._tool_guardrail_halt_decision.to_metadata()
+    if _mailbox_failure_error is not None:
+        result["error"] = _mailbox_failure_error
+        result.update(_mailbox_failure_metadata)
     # If a /steer landed after the final assistant turn (no more tool
     # batches to drain into), hand it back to the caller so it can be
     # delivered as the next user turn instead of being silently lost.
@@ -4743,6 +5108,16 @@ def run_conversation(
         )
     except Exception as exc:
         logger.warning("on_session_end hook failed: %s", exc)
+
+    # Phase 3 mid-turn crash recovery: clear the mid-turn flag. If we got
+    # here, the turn ended cleanly (normal completion, interrupt, budget
+    # exhaustion, or error) — the session is no longer "running", so a
+    # future find_interrupted_session() will correctly skip it.
+    if agent._session_db and agent.session_id:
+        try:
+            agent._session_db.mark_run_idle(agent.session_id)
+        except Exception:
+            pass
 
     return result
 

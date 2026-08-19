@@ -528,6 +528,12 @@ def _normalize_profile(profile: Optional[str]) -> Optional[str]:
     return normalized
 
 
+def _normalize_memory_mode(memory: Optional[str]) -> str:
+    """Normalize the per-job memory opt-in: 'read' (briefing) or 'off'."""
+    mode = str(memory or "off").strip().lower()
+    return "read" if mode == "read" else "off"
+
+
 def create_job(
     prompt: Optional[str],
     schedule: str,
@@ -546,6 +552,7 @@ def create_job(
     workdir: Optional[str] = None,
     profile: Optional[str] = None,
     no_agent: bool = False,
+    memory: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Create a new cron job.
@@ -684,6 +691,10 @@ def create_job(
         "enabled_toolsets": normalized_toolsets,
         "workdir": normalized_workdir,
         "profile": normalized_profile,
+        # Phase 3 memory bus: "read" = per-run read-only briefing appended
+        # to the prompt (agent keeps skip_memory=True — no snapshot, no
+        # writes); "off" (default) = the historic memoryless behavior.
+        "memory": _normalize_memory_mode(memory),
     }
 
     jobs = load_jobs()
@@ -781,6 +792,10 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                 updates["profile"] = None
             else:
                 updates["profile"] = _normalize_profile(_profile)
+
+        # Validate / normalize the memory opt-in if present in updates.
+        if "memory" in updates:
+            updates["memory"] = _normalize_memory_mode(updates["memory"])
 
         updated = _apply_skill_fields({**job, **updates})
         schedule_changed = "schedule" in updates

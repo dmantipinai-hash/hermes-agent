@@ -1,0 +1,33 @@
+name: "Create + assign + complete"
+category: team
+difficulty: medium
+attempts: 1
+description: |
+  End-to-end /team flow: create a specialist agent, assign a kanban task,
+  verify the task lands on the board with the right assignee. The
+  dispatcher spawn is NOT exercised here (that needs a live process) —
+  this checks the agent_manager plumbing only.
+
+steps:
+  - action: create_agent
+    params:
+      name: "challenge-worker"
+      role: researcher
+      model: mock-model
+      provider: custom
+    expect:
+      result_path_contains: "profiles/challenge-worker"
+
+  - action: assign_task
+    params:
+      agent: "challenge-worker"
+      goal: "trivial research task"
+    expect:
+      result_has_field: task_id
+
+  - action: delete_agent
+    params:
+      name: "challenge-worker"
+      force: true
+    expect:
+      result_deleted: true

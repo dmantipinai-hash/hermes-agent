@@ -2430,8 +2430,40 @@ class TestConcurrentToolExecution:
                 skip_pre_tool_call_hook=True,
                 enabled_toolsets=agent.enabled_toolsets,
                 disabled_toolsets=agent.disabled_toolsets,
+                mailbox_principal=agent.mailbox_principal,
             )
             assert result == "result"
+
+    def test_sequential_forwards_mailbox_principal(self, agent):
+        principal = object()
+        agent.mailbox_principal = principal
+        msg = _mock_assistant_msg(
+            content="",
+            tool_calls=[_mock_tool_call(name="web_search", arguments='{}', call_id="m1")],
+        )
+        with patch("run_agent.handle_function_call", return_value="{}") as dispatch:
+            agent._execute_tool_calls_sequential(msg, [], "task-1")
+        assert dispatch.call_args.kwargs["mailbox_principal"] is principal
+
+    def test_concurrent_forwards_mailbox_principal(self, agent):
+        principal = object()
+        agent.mailbox_principal = principal
+        msg = _mock_assistant_msg(
+            content="",
+            tool_calls=[
+                _mock_tool_call(name="web_search", arguments='{}', call_id="m1"),
+                _mock_tool_call(name="web_search", arguments='{}', call_id="m2"),
+            ],
+        )
+        seen = []
+
+        def _dispatch(*args, **kwargs):
+            seen.append(kwargs.get("mailbox_principal"))
+            return "{}"
+
+        with patch("run_agent.handle_function_call", side_effect=_dispatch):
+            agent._execute_tool_calls_concurrent(msg, [], "task-1")
+        assert seen == [principal, principal]
 
     def test_sequential_tool_callbacks_fire_in_order(self, agent):
         tool_call = _mock_tool_call(name="web_search", arguments='{"query":"hello"}', call_id="c1")

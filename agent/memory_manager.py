@@ -578,6 +578,72 @@ class MemoryManager:
             return "positional"
         return "legacy"
 
+    _MIRRORED_WRITE_ACTIONS = frozenset({"add", "replace", "remove"})
+
+    def notify_memory_tool_write(self, tool_result, args, build_metadata=None) -> None:
+        """Bridge the built-in memory tool result + args to external providers.
+
+        The agent loop hands over the raw tool result (JSON string) and the
+        original tool args; this method decides whether/what to mirror via
+        ``on_memory_write``:
+
+        - Skips non-JSON / non-dict results, failed writes, and staged
+          (pending-approval) writes.
+        - Accepts a single-op ``args`` dict or a batch ``{"operations": [...]}``.
+        - Only mutating actions (add/replace/remove) are mirrored; read and
+          deprecate stay internal.
+        - ``old_text`` rides in ``metadata`` for replace/remove so providers
+          can locate the entry on their side.
+        - ``build_metadata`` (callable returning a dict) is invoked per op and
+          merged over the old_text metadata.
+        """
+        if not isinstance(tool_result, str):
+            return
+        import json
+        try:
+            result = json.loads(tool_result)
+        except (TypeError, ValueError):
+            return
+        if not isinstance(result, dict):
+            return
+        if not result.get("success"):
+            return
+        if result.get("staged"):
+            return
+        if not isinstance(args, dict):
+            return
+
+        target = args.get("target", "memory")
+        if "operations" in args and isinstance(args.get("operations"), list):
+            ops = []
+            for op in args["operations"]:
+                if isinstance(op, dict):
+                    ops.append(op)
+        else:
+            ops = [args]
+
+        for op in ops:
+            action = op.get("action", "")
+            if action not in self._MIRRORED_WRITE_ACTIONS:
+                continue
+            metadata: Dict[str, Any] = {}
+            old_text = op.get("old_text")
+            if old_text:
+                metadata["old_text"] = old_text
+            if callable(build_metadata):
+                try:
+                    extra = build_metadata()
+                    if isinstance(extra, dict):
+                        metadata.update(extra)
+                except Exception as e:
+                    logger.debug("build_metadata callback failed: %s", e)
+            try:
+                self.on_memory_write(
+                    action, target, op.get("content") or "", metadata=metadata,
+                )
+            except Exception as e:
+                logger.debug("notify_memory_tool_write mirror failed: %s", e)
+
     def on_memory_write(
         self,
         action: str,
