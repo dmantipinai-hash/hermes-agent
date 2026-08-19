@@ -2421,21 +2421,37 @@ def run_conversation(
             # never mutated beyond the api_content stamp, so nothing leaks
             # into the clean transcript content.
             if idx == current_turn_user_idx and msg.get("role") == "user":
-                _injections = []
-                # Built-in context pack first (core memory), then external
-                # provider prefetch, then plugin context.
-                if _memory_pack_cache:
-                    _injections.append(_memory_pack_cache)
-                if _ext_prefetch_cache:
-                    _fenced = build_memory_context_block(_ext_prefetch_cache)
-                    if _fenced:
-                        _injections.append(_fenced)
-                if _plugin_user_context:
-                    _injections.append(_plugin_user_context)
-                if _injections:
-                    _base = api_msg.get("content", "")
-                    if isinstance(_base, str):
-                        api_msg["content"] = _base + "\n\n" + "\n\n".join(_injections)
+                if isinstance(_api_content, str) and _api_content:
+                    # Stamped by the prologue from the same composition —
+                    # reuse it so the persisted sidecar and the wire cannot
+                    # drift, and so every pass this turn sends identical
+                    # bytes (composed from msg["content"], never from a
+                    # previously-injected copy).
+                    api_msg["content"] = _api_content
+                else:
+                    # Callers that bypass the prologue stamping: compose live.
+                    _composed = compose_user_api_content(
+                        api_msg.get("content", ""),
+                        _ext_prefetch_cache,
+                        _plugin_user_context,
+                    )
+                    if _composed is not None:
+                        api_msg["content"] = _composed
+            elif (
+                isinstance(_api_content, str)
+                and _api_content
+                and msg.get("role") in ("user", "assistant")
+            ):
+                # Historical message: replay the exact bytes sent when it was
+                # live, so the provider prompt-cache prefix stays byte-stable
+                # instead of diverging at the injection point and
+                # re-prefilling everything after it. User rows carry the
+                # prefetch/plugin injection sidecar; user AND assistant rows
+                # can carry a sanitize-divergence sidecar (content that
+                # ``get_messages_as_conversation``'s sanitize_context/strip
+                # would rewrite on reload — see the capture in
+                # ``_flush_messages_to_session_db``).
+                api_msg["content"] = _api_content
 
             # For ALL assistant messages, pass reasoning back to the API
             # This ensures multi-turn reasoning context is preserved
@@ -3606,7 +3622,7 @@ def run_conversation(
                             failed = True
                             break
                         return {
-                            "final_response": _final_response,
+                            "final_response": _invalid_response_error,
                             "messages": messages,
                             "completed": False,
                             "api_calls": api_call_count,
@@ -5910,7 +5926,7 @@ def run_conversation(
                             failed = True
                             break
                         return {
-                            "final_response": _final_response,
+                            "final_response": _payload_error,
                             "messages": messages,
                             "completed": False,
                             "api_calls": api_call_count,
@@ -5996,7 +6012,7 @@ def run_conversation(
                                 failed = True
                                 break
                             return {
-                                "final_response": _final_response,
+                                "final_response": _context_error,
                                 "messages": messages,
                                 "completed": False,
                                 "api_calls": api_call_count,
@@ -8780,57 +8796,10 @@ def run_conversation(
             )
         final_response = agent._handle_max_iterations(messages, api_call_count)
 
-        # If running as a kanban worker, signal the dispatcher that the
-        # worker could not complete (rather than treating it as a
-        # protocol violation).  The agent loop strips tools before calling
-        # _handle_max_iterations, so the model cannot call kanban_block
-        # itself — we must do it on its behalf.
-        #
-        # We route through ``_record_task_failure(outcome="timed_out")``
-        # rather than ``kanban_block`` so this counts toward the
-        # ``consecutive_failures`` counter and the dispatcher's
-        # ``failure_limit`` circuit breaker (#29747 gap 2).  Without this,
-        # a task whose worker keeps exhausting its budget would block
-        # silently each run, get auto-promoted by the operator (or never
-        # surface), and re-block in an endless loop with no signal.
-        _kanban_task = os.environ.get("HERMES_KANBAN_TASK")
-        if _kanban_task:
-            try:
-                from hermes_cli import kanban_db as _kb
-                _conn = _kb.connect()
-                try:
-                    _kb._record_task_failure(
-                        _conn,
-                        _kanban_task,
-                        error=(
-                            f"Iteration budget exhausted "
-                            f"({api_call_count}/{agent.max_iterations}) — "
-                            "task could not complete within the allowed "
-                            "iterations"
-                        ),
-                        outcome="timed_out",
-                        release_claim=True,
-                        end_run=True,
-                        event_payload_extra={
-                            "budget_used": api_call_count,
-                            "budget_max": agent.max_iterations,
-                        },
-                    )
-                    logger.info(
-                        "recorded budget-exhausted failure for task %s (%d/%d)",
-                        _kanban_task, api_call_count, agent.max_iterations,
-                    )
-                finally:
-                    try:
-                        _conn.close()
-                    except Exception:
-                        pass
-            except Exception:
-                logger.warning(
-                    "Failed to record budget-exhausted failure for task %s",
-                    _kanban_task,
-                    exc_info=True,
-                )
+        # Kanban budget-exhaustion recording lives in
+        # turn_finalizer.finalize_turn (single source: fires once for the
+        # summary path AND the #87096 bounded fallback; the previous inline
+        # duplicate here double-counted toward the failure circuit breaker).
 
     # Determine if conversation completed successfully
     completed = (
