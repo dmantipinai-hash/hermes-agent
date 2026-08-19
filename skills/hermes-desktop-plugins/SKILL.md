@@ -2,6 +2,8 @@
 name: hermes-desktop-plugins
 description: Write desktop app plugins that add UI panes and commands.
 version: 1.0.0
+author: Hermes Agent
+license: MIT
 platforms: [linux, macos, windows]
 metadata:
   hermes:

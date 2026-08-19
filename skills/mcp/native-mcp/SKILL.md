@@ -153,7 +153,7 @@ The most common transport. Hermes launches the MCP server as a subprocess and co
 mcp_servers:
   filesystem:
     command: "npx"
-    args: ["-y", "@modelcontextprotocol/server-filesystem", "/home/user/projects"]
+    args: ["-y", "@modelcontextprotocol/server-filesystem", "~/projects"]
 ```
 
 The subprocess inherits a **filtered** environment (see Security section below) plus any variables you specify in `env`.
@@ -262,7 +262,7 @@ Registers tools like `mcp_time_get_current_time`.
 mcp_servers:
   filesystem:
     command: "npx"
-    args: ["-y", "@modelcontextprotocol/server-filesystem", "/home/user/documents"]
+    args: ["-y", "@modelcontextprotocol/server-filesystem", "~/documents"]
     timeout: 30
 ```
 

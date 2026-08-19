@@ -2,6 +2,8 @@
 name: webhook-subscriptions
 description: "Webhook subscriptions: event-driven agent runs."
 version: 1.1.0
+author: Hermes Agent
+license: MIT
 platforms: [linux, macos, windows]
 metadata:
   hermes:
