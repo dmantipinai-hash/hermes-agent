@@ -447,6 +447,8 @@ class TestMailboxPersistenceBarriers:
             events=events,
         )
         agent._api_max_retries = 2
+        agent.compression_enabled = True  # this test exercises compression
+        # recovery; the compaction-disabled guard pre-empts it when disabled.
         agent._compress_context = (
             lambda messages, *_args, **_kwargs: (messages[-1:], "You are helpful.")
         )
@@ -559,6 +561,9 @@ class TestMailboxPersistenceBarriers:
             return []
 
         monkeypatch.setattr(plugin_runtime, "invoke_hook", hook)
+        # The loop guards post_api_request behind has_hook() (skip the
+        # payload build when nothing listens); the recorder IS a listener.
+        monkeypatch.setattr(plugin_runtime, "has_hook", lambda *_a, **_k: True)
 
         result = agent.run_conversation("start")
 
@@ -596,6 +601,9 @@ class TestMailboxPersistenceBarriers:
             return []
 
         monkeypatch.setattr(plugin_runtime, "invoke_hook", hook)
+        # The loop guards post_api_request behind has_hook() (skip the
+        # payload build when nothing listens); the recorder IS a listener.
+        monkeypatch.setattr(plugin_runtime, "has_hook", lambda *_a, **_k: True)
         monkeypatch.setattr(
             run_agent,
             "handle_function_call",
@@ -683,6 +691,9 @@ class TestMailboxPersistenceBarriers:
             return []
 
         monkeypatch.setattr(plugin_runtime, "invoke_hook", hook)
+        # The loop guards post_api_request behind has_hook() (skip the
+        # payload build when nothing listens); the recorder IS a listener.
+        monkeypatch.setattr(plugin_runtime, "has_hook", lambda *_a, **_k: True)
         monkeypatch.setattr(
             run_agent,
             "handle_function_call",
@@ -809,6 +820,8 @@ class TestMailboxPersistenceBarriers:
             monkeypatch,
             [_PayloadTooLarge("request too large")],
         )
+        agent.compression_enabled = True  # exercise the compression-exhaustion
+        # path (the compaction-disabled guard pre-empts it when disabled).
         agent._compress_context = (
             lambda messages, *_args, **_kwargs: (messages, "You are helpful.")
         )
@@ -873,6 +886,8 @@ class TestMailboxPersistenceBarriers:
             monkeypatch,
             [_ContextOverflow("Prompt exceeds max length")],
         )
+        agent.compression_enabled = True  # exercise the compression-exhaustion
+        # path (the compaction-disabled guard pre-empts it when disabled).
         agent._compress_context = (
             lambda messages, *_args, **_kwargs: (messages, "You are helpful.")
         )

@@ -132,6 +132,8 @@ def finalize_turn(
     original_user_message,
     _should_review_memory,
     _turn_exit_reason,
+    _mailbox_failure_error=None,
+    _mailbox_failure_metadata=None,
     _pending_verification_response=None,
     _pending_verification_response_previewed=False,
 ):
@@ -728,6 +730,12 @@ def finalize_turn(
     }
     if agent._tool_guardrail_halt_decision is not None:
         result["guardrail"] = agent._tool_guardrail_halt_decision.to_metadata()
+    # Mailbox-owned turns: the loop broke out through the shared tail with a
+    # captured failure error (+ barrier metadata). Stamp both so callers see
+    # the same shape the pre-extraction tail produced.
+    if _mailbox_failure_error is not None:
+        result["error"] = _mailbox_failure_error
+        result.update(_mailbox_failure_metadata or {})
     # Persistence failures already set failed=True + an explanation in
     # final_response; also stamp `error` so gateway surfaces status="error"
     # (and desktop can toast the cause) instead of a quiet complete frame.
@@ -832,5 +840,15 @@ def finalize_turn(
 
     agent._turn_preflight_display_snapshot = None
     agent._turn_received_provider_response = False
+
+    # Phase 3 mid-turn crash recovery: clear the mid-turn flag. If we got
+    # here, the turn ended cleanly (normal completion, interrupt, budget
+    # exhaustion, or error) — the session is no longer "running", so a
+    # future find_interrupted_session() will correctly skip it.
+    if agent._session_db and agent.session_id:
+        try:
+            agent._session_db.mark_run_idle(agent.session_id)
+        except Exception:
+            pass
 
     return result

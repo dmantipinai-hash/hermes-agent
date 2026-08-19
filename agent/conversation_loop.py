@@ -5496,6 +5496,21 @@ def run_conversation(
                         "(compression.enabled: false). Run /compress to compact manually, "
                         "/new to start fresh, or switch to a larger-context model."
                     )
+                    if _mailbox_batch is not None:
+                        # Mailbox-owned turns cross the shared tail so session
+                        # idle/end hooks still run and the batch stays
+                        # recoverable for a later response attempt.
+                        final_response = _final_response
+                        _mailbox_failure_error = _final_response
+                        _mailbox_failure_metadata = {
+                            "partial": True,
+                            "compaction_disabled": True,
+                        }
+                        _turn_exit_reason = (
+                            "mailbox_context_overflow_compression_disabled"
+                        )
+                        failed = True
+                        break
                     return {
                         "final_response": _final_response,
                         "messages": messages,
@@ -6509,6 +6524,14 @@ def run_conversation(
                             f"Provider message: {_nonretryable_summary}\n\n"
                             f"{_CONTENT_POLICY_RECOVERY_HINT}"
                         )
+                        if _mailbox_batch is not None:
+                            final_response = _policy_response
+                            _mailbox_failure_error = (
+                                f"content_policy_blocked: {_nonretryable_summary}"
+                            )
+                            _turn_exit_reason = "mailbox_content_policy_blocked"
+                            failed = True
+                            break
                         return _content_policy_blocked_result(
                             messages,
                             api_call_count,
@@ -6520,7 +6543,7 @@ def run_conversation(
                     # the max-retries path so every surface (CLI, TUI, desktop)
                     # renders one consistent billing signal.
                     if classified.reason == FailoverReason.billing:
-                        return _billing_failure_result(
+                        _billing_result = _billing_failure_result(
                             classified=classified,
                             summary=_nonretryable_summary,
                             messages=messages,
@@ -6529,21 +6552,23 @@ def run_conversation(
                             base_url=_base,
                             model=_model,
                         )
-                        _policy_error = f"content_policy_blocked: {_summary}"
                         if _mailbox_batch is not None:
-                            final_response = _policy_response
-                            _mailbox_failure_error = _policy_error
-                            _turn_exit_reason = "mailbox_content_policy_blocked"
+                            # Mailbox-owned turns cross the shared tail; keep
+                            # the structured billing fields as failure metadata.
+                            final_response = (
+                                _billing_result.get("final_response") or final_response
+                            )
+                            _mailbox_failure_error = (
+                                _billing_result.get("error") or _nonretryable_summary
+                            )
+                            _mailbox_failure_metadata = {
+                                k: v for k, v in _billing_result.items()
+                                if k not in ("final_response", "error")
+                            }
+                            _turn_exit_reason = "mailbox_billing_blocked"
                             failed = True
                             break
-                        return {
-                            "final_response": _policy_response,
-                            "messages": messages,
-                            "api_calls": api_call_count,
-                            "completed": False,
-                            "failed": True,
-                            "error": _policy_error,
-                        }
+                        return _billing_result
                     if _mailbox_batch is not None:
                         final_response = f"Provider request failed: {api_error}"
                         _mailbox_failure_error = str(api_error)
@@ -9072,57 +9097,10 @@ def run_conversation(
         original_user_message=original_user_message,
         _should_review_memory=_should_review_memory,
         _turn_exit_reason=_turn_exit_reason,
+        _mailbox_failure_error=_mailbox_failure_error,
+        _mailbox_failure_metadata=_mailbox_failure_metadata,
         _pending_verification_response=_pending_verification_response,
         _pending_verification_response_previewed=_pending_verification_response_previewed,
     )
-
-    # Background memory/skill review — runs AFTER the response is delivered
-    # so it never competes with the user's task for model attention.
-    if final_response and not interrupted and (_should_review_memory or _should_review_skills):
-        try:
-            agent._spawn_background_review(
-                messages_snapshot=list(messages),
-                review_memory=_should_review_memory,
-                review_skills=_should_review_skills,
-            )
-        except Exception:
-            pass  # Background review is best-effort
-
-    # Note: Memory provider on_session_end() + shutdown_all() are NOT
-    # called here — run_conversation() is called once per user message in
-    # multi-turn sessions. Shutting down after every turn would kill the
-    # provider before the second message. Actual session-end cleanup is
-    # handled by the CLI (atexit / /reset) and gateway (session expiry /
-    # _reset_session).
-
-    # Plugin hook: on_session_end
-    # Fired at the very end of every run_conversation call.
-    # Plugins can use this for cleanup, flushing buffers, etc.
-    try:
-        from hermes_cli.plugins import invoke_hook as _invoke_hook
-        _invoke_hook(
-            "on_session_end",
-            session_id=agent.session_id,
-            completed=completed,
-            interrupted=interrupted,
-            model=agent.model,
-            platform=getattr(agent, "platform", None) or "",
-        )
-    except Exception as exc:
-        logger.warning("on_session_end hook failed: %s", exc)
-
-    # Phase 3 mid-turn crash recovery: clear the mid-turn flag. If we got
-    # here, the turn ended cleanly (normal completion, interrupt, budget
-    # exhaustion, or error) — the session is no longer "running", so a
-    # future find_interrupted_session() will correctly skip it.
-    if agent._session_db and agent.session_id:
-        try:
-            agent._session_db.mark_run_idle(agent.session_id)
-        except Exception:
-            pass
-
-    return result
-
-
 
 __all__ = ["run_conversation"]
