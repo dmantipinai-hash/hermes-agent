@@ -8784,24 +8784,10 @@ def run_conversation(
                 messages.append({"role": "assistant", "content": final_response})
                 break
     
-    if final_response is None and (
-        api_call_count >= agent.max_iterations
-        or agent.iteration_budget.remaining <= 0
-    ):
-        # Budget exhausted — ask the model for a summary via one extra
-        # API call with tools stripped.  _handle_max_iterations injects a
-        # user message and makes a single toolless request.
-        _turn_exit_reason = f"max_iterations_reached({api_call_count}/{agent.max_iterations})"
-        agent._emit_status(
-            f"⚠️ Iteration budget exhausted ({api_call_count}/{agent.max_iterations}) "
-            "— asking model to summarise"
-        )
-        if not agent.quiet_mode:
-            agent._safe_print(
-                f"\n⚠️  Iteration budget exhausted ({api_call_count}/{agent.max_iterations}) "
-                "— requesting summary..."
-            )
-        final_response = agent._handle_max_iterations(messages, api_call_count)
+    # Budget-exhaustion handling (summary call, verification-answer
+    # preservation) lives in turn_finalizer.finalize_turn — single source.
+    # The previous inline block here ran BEFORE the finalizer and replaced a
+    # verification gate's withheld answer with a fresh summary call (#61631).
 
         # Kanban budget-exhaustion recording lives in
         # turn_finalizer.finalize_turn (single source: fires once for the
