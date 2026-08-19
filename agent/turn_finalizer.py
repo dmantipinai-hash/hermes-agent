@@ -845,9 +845,10 @@ def finalize_turn(
     # here, the turn ended cleanly (normal completion, interrupt, budget
     # exhaustion, or error) — the session is no longer "running", so a
     # future find_interrupted_session() will correctly skip it.
-    if agent._session_db and agent.session_id:
+    _session_db = getattr(agent, "_session_db", None)
+    if _session_db is not None and agent.session_id:
         try:
-            agent._session_db.mark_run_idle(agent.session_id)
+            _session_db.mark_run_idle(agent.session_id)
         except Exception:
             pass
 

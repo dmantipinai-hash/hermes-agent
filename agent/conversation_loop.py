@@ -2437,6 +2437,13 @@ def run_conversation(
                     )
                     if _composed is not None:
                         api_msg["content"] = _composed
+                # Built-in memory pack (fork feature): rides the API copy of
+                # the current turn's user message — visible to the provider,
+                # never persisted into the transcript content.
+                if _memory_pack_cache:
+                    _base = api_msg.get("content", "")
+                    if isinstance(_base, str) and _memory_pack_cache not in _base:
+                        api_msg["content"] = _base + "\n\n" + _memory_pack_cache
             elif (
                 isinstance(_api_content, str)
                 and _api_content

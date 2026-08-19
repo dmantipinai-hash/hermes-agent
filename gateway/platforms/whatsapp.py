@@ -653,7 +653,14 @@ class WhatsAppAdapter(BasePlatformAdapter):
             # Build bridge subprocess environment.
             # Pass WHATSAPP_REPLY_PREFIX from config.yaml so the Node bridge
             # can use it without the user needing to set a separate env var.
-            bridge_env = os.environ.copy()
+            # build_subprocess_env(scrub_secrets=False, inherit_profile_home=False)
+            # is the legacy-exact os.environ snapshot, routed through the one
+            # owner module (see tests/agent/test_subprocess_env_guard.py).
+            from tools.environments.local import build_subprocess_env
+
+            bridge_env = build_subprocess_env(
+                scrub_secrets=False, inherit_profile_home=False
+            )
             if self._reply_prefix is not None:
                 bridge_env["WHATSAPP_REPLY_PREFIX"] = self._reply_prefix
 
