@@ -1067,7 +1067,7 @@ def test_gateway_dispatcher_disables_corrupt_board_without_traceback(
         SimpleNamespace(monotonic=lambda: next(time_values, 1301.0)),
     )
 
-    calls = {"tick": 0}
+    calls = {"connect": 0, "to_thread": 0}
 
     def _connect(*args, **kwargs):
         calls["connect"] += 1
