@@ -1421,6 +1421,71 @@ def _get_hermes_home() -> Path:
     return _hermes_home or get_hermes_home()
 
 
+@contextlib.contextmanager
+def _job_profile_context(job_id: str, profile: Optional[str]):
+    """Temporarily run a job under a specific Hermes profile.
+
+    Cron jobs are stored and scheduled by the profile running the scheduler, but
+    an individual job can opt into a different runtime profile. While active,
+    the scheduler's test/override hook and a context-local Hermes home override
+    both point at the resolved profile directory so _get_hermes_home(),
+    .env/config loading, script resolution, AIAgent construction, and downstream
+    get_hermes_home() callers agree on the same home.
+
+    Some existing provider/config paths still load profile .env values through
+    os.environ, so profile jobs also snapshot and restore the process
+    environment on exit. tick() runs profile jobs sequentially to keep that
+    temporary mutation isolated from other scheduled jobs.
+    """
+    raw_profile = str(profile or "").strip()
+    if not raw_profile:
+        yield None
+        return
+
+    global _hermes_home
+    prior_override = _hermes_home
+    env_snapshot = os.environ.copy()
+
+    from hermes_cli.profiles import normalize_profile_name, resolve_profile_env
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    normalized_profile = normalize_profile_name(raw_profile)
+    try:
+        profile_home = Path(resolve_profile_env(normalized_profile)).resolve()
+    except (FileNotFoundError, ValueError) as exc:
+        logger.warning(
+            "Job '%s': configured profile %r no longer valid (%s) — "
+            "falling back to scheduler default",
+            job_id, raw_profile, exc,
+        )
+        yield None
+        return
+
+    override_token = None
+    try:
+        override_token = set_hermes_home_override(profile_home)
+        _hermes_home = profile_home
+        logger.info(
+            "Job '%s': using Hermes profile '%s' (%s)",
+            job_id,
+            normalized_profile,
+            profile_home,
+        )
+        yield normalized_profile
+    finally:
+        _hermes_home = prior_override
+        if override_token is not None:
+            reset_hermes_home_override(override_token)
+        # Delta-based restore: remove added keys, restore changed keys.
+        # Avoids a brief window where other threads see an empty env.
+        added = set(os.environ.keys()) - set(env_snapshot.keys())
+        for k in added:
+            os.environ.pop(k, None)
+        for k, v in env_snapshot.items():
+            if os.environ.get(k) != v:
+                os.environ[k] = v
+
+
 def _get_lock_paths() -> tuple[Path, Path]:
     """Resolve cron lock paths at call time so profile/env changes are honored."""
     hermes_home = _get_hermes_home()
@@ -4500,6 +4565,38 @@ def _run_cron_cleanup_with_timeout(
     done = threading.Event()
     error: list[BaseException] = []
 
+    def _runner() -> None:
+        try:
+            cleanup()
+        except BaseException as exc:
+            error.append(exc)
+        finally:
+            done.set()
+
+    # A daemon thread is deliberate: unlike ThreadPoolExecutor workers it is
+    # not joined by Python's interpreter-exit hook if the cleanup target never
+    # returns. The scheduler can release its dispatch guard and the gateway can
+    # still shut down normally.
+    worker = threading.Thread(
+        target=_runner,
+        name=f"cron-cleanup-{job_id}",
+        daemon=True,
+    )
+    worker.start()
+    if not done.wait(timeout):
+        logger.error(
+            "Job '%s': %s exceeded %.1fs; abandoning cleanup so future runs remain dispatchable",
+            job_id,
+            label,
+            timeout,
+        )
+        return False
+    if error:
+        logger.debug("Job '%s': %s failed: %s", job_id, label, error[0])
+        return False
+    return True
+
+
 def _build_memory_briefing_for_job(job: dict, query: str) -> str:
     """Read-only memory briefing for a cron run (Phase 3 bus, roadmap 3.3).
 
@@ -4594,6 +4691,24 @@ class _BoundedCronSessionDB:
 
 
 def run_job(
+    job: dict,
+    *,
+    defer_agent_teardown: Optional[list] = None,
+    extra_prompt: Optional[str] = None,
+    cancel_event: Optional[_CancelEventLike] = None,
+) -> tuple[bool, str, str, Optional[str]]:
+    """Execute a single cron job, applying any per-job profile override."""
+    job_id = job["id"]
+    with _job_profile_context(job_id, job.get("profile")):
+        return _run_job_impl(
+            job,
+            defer_agent_teardown=defer_agent_teardown,
+            extra_prompt=extra_prompt,
+            cancel_event=cancel_event,
+        )
+
+
+def _run_job_impl(
     job: dict,
     *,
     defer_agent_teardown: Optional[list] = None,
@@ -6992,14 +7107,23 @@ def tick(
                 verbose=verbose,
             )
 
-        # Partition due jobs: those with a per-job workdir mutate
-        # os.environ["TERMINAL_CWD"] inside run_job, which is process-global, so
-        # they queue on the single-thread sequential pool to run one at a time.
-        # That alone only keeps workdir jobs from overlapping EACH OTHER;
+        # Partition due jobs: those with a per-job workdir OR profile mutate
+        # process-global runtime state inside run_job. Workdir jobs temporarily
+        # set os.environ["TERMINAL_CWD"]; profile jobs use a context-local
+        # Hermes home override, the scheduler's _hermes_home hook, and a
+        # temporary profile .env load into os.environ with snapshot/restore.
+        # They queue on the single-thread sequential pool to run one at a time.
+        # That alone only keeps them from overlapping EACH OTHER;
         # run_job's _terminal_cwd_lock is what additionally stops a concurrently
         # firing workdir-less parallel-pool job from observing the override.
-        sequential_jobs = [j for j in due_jobs if (j.get("workdir") or "").strip()]
-        parallel_jobs = [j for j in due_jobs if not (j.get("workdir") or "").strip()]
+        sequential_jobs = [
+            j for j in due_jobs
+            if (j.get("workdir") or "").strip() or (j.get("profile") or "").strip()
+        ]
+        parallel_jobs = [
+            j for j in due_jobs
+            if not ((j.get("workdir") or "").strip() or (j.get("profile") or "").strip())
+        ]
 
         _results: list = []
         _all_futures: list = []

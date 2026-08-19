@@ -18,6 +18,9 @@ def isolated_cron_profile_home(tmp_path, monkeypatch):
     root = tmp_path / "hermes-root"
     profile_home = root / "profiles" / "support"
     profile_home.mkdir(parents=True)
+    # A real (empty) profile .env: load_hermes_dotenv skips nonexistent files,
+    # and the profile-runtime feature only engages once the profile has an env.
+    (profile_home / ".env").write_text("# profile env\n")
     (root / "cron").mkdir(parents=True)
 
     monkeypatch.setenv("HERMES_HOME", str(root))
@@ -215,7 +218,7 @@ class TestRunJobProfileContext:
             },
         )
 
-        monkeypatch.setattr(sched, "_build_job_prompt", lambda job, prerun_script=None: "hi")
+        monkeypatch.setattr(sched, "_build_job_prompt", lambda job, prerun_script=None, extra_prompt=None: "hi")
         monkeypatch.setattr(sched, "_resolve_origin", lambda job: None)
         monkeypatch.setattr(sched, "_resolve_delivery_target", lambda job: None)
         monkeypatch.setattr(sched, "_resolve_cron_enabled_toolsets", lambda job, cfg: None)
@@ -224,7 +227,8 @@ class TestRunJobProfileContext:
 
         import dotenv
 
-        def fake_load_dotenv(path, *_a, **_kw):
+        def fake_load_dotenv(*_a, **_kw):
+            path = _kw.get("dotenv_path") or (_a[0] if _a else None)
             observed.setdefault("dotenv_paths", []).append(str(path))
             return True
 
@@ -272,7 +276,8 @@ class TestRunJobProfileContext:
         monkeypatch.setenv("HERMES_PROFILE_TEST_SHARED", "outer")
         monkeypatch.delenv("HERMES_PROFILE_TEST_ONLY", raising=False)
 
-        def fake_load_dotenv(path, *_a, **_kw):
+        def fake_load_dotenv(*_a, **_kw):
+            path = _kw.get("dotenv_path") or (_a[0] if _a else None)
             observed.setdefault("dotenv_paths", []).append(str(path))
             os.environ["HERMES_PROFILE_TEST_SHARED"] = "profile-value"
             os.environ["HERMES_PROFILE_TEST_ONLY"] = "profile-only"
@@ -407,18 +412,29 @@ class TestTickProfilePartition:
         assert sched._get_hermes_home() == root
 
     def test_profile_jobs_run_sequentially(self, isolated_cron_profile_home, monkeypatch):
+        """Profile jobs partition onto the single-thread sequential pool.
+
+        The fire-claim/execution-ledger machinery works against the real
+        isolated store, so the jobs are created for real; only the agent run,
+        persistence, and delivery are stubbed. The invariant: a profile job
+        mutates process-global env (profile .env load with snapshot/restore),
+        so it must never share a worker with another env-mutating job — it
+        rides the `cron-seq` single-thread pool while a profile-less job may
+        go to the parallel pool.
+        """
         import threading
         import cron.scheduler as sched
+        from cron.jobs import create_job
 
-        profile_job = {"id": "a", "name": "A", "profile": "default"}
-        parallel_job = {"id": "b", "name": "B", "profile": None}
+        profile_job = create_job(prompt="a", schedule="every 1h", name="A", profile="default")
+        parallel_job = create_job(prompt="b", schedule="every 1h", name="B")
 
         monkeypatch.setattr(sched, "get_due_jobs", lambda: [profile_job, parallel_job])
-        monkeypatch.setattr(sched, "advance_next_run", lambda *_a, **_kw: None)
+        monkeypatch.setattr(sched, "advance_next_runs", lambda *_a, **_kw: None)
 
         calls: list[tuple[str, str]] = []
 
-        def fake_run_job(job):
+        def fake_run_job(job, **_kw):
             calls.append((job["id"], threading.current_thread().name))
             return True, "output", "response", None
 
@@ -430,8 +446,14 @@ class TestTickProfilePartition:
         n = sched.tick(verbose=False)
 
         assert n == 2
-        ids = [job_id for job_id, _thread_name in calls]
-        assert ids.index("a") < ids.index("b")
-        main_thread_name = threading.current_thread().name
-        profile_thread_name = next(thread for job_id, thread in calls if job_id == "a")
-        assert profile_thread_name == main_thread_name
+        assert len(calls) == 2
+        profile_thread_name = next(
+            thread for job_id, thread in calls if job_id == profile_job["id"]
+        )
+        parallel_thread_name = next(
+            thread for job_id, thread in calls if job_id == parallel_job["id"]
+        )
+        assert profile_thread_name.startswith("cron-seq"), (
+            f"profile job must run on the sequential pool, got {profile_thread_name!r}"
+        )
+        assert parallel_thread_name != profile_thread_name
