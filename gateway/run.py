@@ -20933,7 +20933,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _title_note = t("gateway.reset.title_rejected", error=str(e))
             if sanitized:
                 try:
-                    self._session_db.set_session_title(new_entry.session_id, sanitized)
+                    _title_set = self._session_db.set_session_title(
+                        new_entry.session_id, sanitized
+                    )
+                    # Tolerate both the sync SessionDB and an async proxy
+                    # (AsyncSessionDB): await only when a coroutine came back.
+                    if inspect.isawaitable(_title_set):
+                        await _title_set
                     header = t("gateway.reset.header_titled", title=sanitized)
                 except ValueError as e:
                     _title_note = t("gateway.reset.title_error_untitled", error=str(e))
@@ -20976,12 +20982,33 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         return EphemeralReply(f"{header}{_tip_line}")
 
     async def _handle_profile_command(self, event: MessageEvent) -> str:
-        """Handle /profile — show active profile name and home directory."""
+        """Handle /profile — show the profile serving this source and its home.
+
+        On a multiplexed gateway the process-level active profile is always
+        the multiplexer's own (usually ``default``), so reporting it would
+        answer "default" in every chat regardless of which profile actually
+        serves the room/channel (``source.profile`` — stamped by the
+        ``/p/<profile>/`` URL prefix, a per-credential adapter, or a room→
+        profile map). Report the stamped profile and, like the scoped /reset
+        banner (#59003), resolve the displayed home under that profile's
+        runtime scope. Single-profile gateways are unchanged: an unstamped
+        source falls back to the active profile and the default home.
+        """
         from hermes_constants import display_hermes_home
         from hermes_cli.profiles import get_active_profile_name
 
-        display = display_hermes_home()
-        profile_name = get_active_profile_name()
+        source = getattr(event, "source", None)
+        profile_name = (
+            getattr(source, "profile", "") or ""
+        ).strip() or get_active_profile_name()
+        try:
+            from gateway.run import _profile_runtime_scope
+
+            profile_home = self._resolve_profile_home_for_source(source)
+            with _profile_runtime_scope(profile_home):
+                display = display_hermes_home()
+        except Exception:
+            display = display_hermes_home()
 
         lines = [
             t("gateway.profile.header", profile=profile_name),
@@ -21207,20 +21234,35 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
     async def _handle_status_command(self, event: MessageEvent) -> str:
         """Handle /status command."""
+        from gateway.run import _AGENT_PENDING_SENTINEL, _load_gateway_config, _resolve_gateway_model
+
         source = event.source
-        session_entry = self.session_store.get_or_create_session(source)
+        session_entry = await self.async_session_store.get_or_create_session(source)
 
         connected_platforms = [p.value for p in self.adapters.keys()]
 
-        # Check if there's an active agent
+        # Check if there's an active agent. Keep the sentinel distinct: a
+        # starting/pending run should not be treated as a fully usable agent for
+        # model/context display, but it still occupies the session slot.
         session_key = session_entry.session_key
-        is_running = session_key in self._running_agents
+        agent = self._running_agents.get(session_key)
+        is_running = agent is not None and agent is not _AGENT_PENDING_SENTINEL
 
         # Count pending /queue follow-ups (slot + overflow).
         adapter = self.adapters.get(source.platform) if source else None
         queue_depth = self._queue_depth(session_key, adapter=adapter)
 
+        def _clean_str(value: Any) -> str:
+            return value.strip() if isinstance(value, str) and value.strip() else ""
+
+        def _int_value(value: Any) -> int:
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                return 0
+
         title = None
+        session_row: dict[str, Any] = {}
         # Pull token totals from the SQLite session DB rather than the
         # in-memory SessionStore.  The agent's per-turn token deltas are
         # persisted into sessions_db (run_agent.py), not into SessionEntry,
@@ -21228,23 +21270,120 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # single source of truth; reading it here keeps /status accurate
         # without duplicating token writes into two stores.
         db_total_tokens = 0
+        persisted_route: dict[str, Any] = {}
         if self._session_db:
             try:
-                title = self._session_db.get_session_title(session_entry.session_id)
+                title = await self._session_db.get_session_title(session_entry.session_id)
             except Exception:
                 title = None
             try:
-                row = self._session_db.get_session(session_entry.session_id)
-                if row:
+                row = await self._session_db.get_session(session_entry.session_id)
+                if isinstance(row, dict):
+                    session_row = row
                     db_total_tokens = (
-                        (row.get("input_tokens") or 0)
-                        + (row.get("output_tokens") or 0)
-                        + (row.get("cache_read_tokens") or 0)
-                        + (row.get("cache_write_tokens") or 0)
-                        + (row.get("reasoning_tokens") or 0)
+                        _int_value(row.get("input_tokens"))
+                        + _int_value(row.get("output_tokens"))
+                        + _int_value(row.get("cache_read_tokens"))
+                        + _int_value(row.get("cache_write_tokens"))
+                        + _int_value(row.get("reasoning_tokens"))
                     )
             except Exception:
                 db_total_tokens = 0
+            try:
+                route = await self._session_db.get_dominant_session_model_route(
+                    session_entry.session_id
+                )
+                if isinstance(route, dict):
+                    persisted_route = route
+            except Exception:
+                persisted_route = {}
+
+        # Resolve model/context for cockpit-style status. Prefer the live or
+        # cached agent because it carries the actual runtime route and context
+        # compressor. Fall back to persisted SessionDB metadata plus the
+        # SessionStore's last_prompt_tokens so /status remains useful between
+        # turns without making billing/account calls.
+        status_agent = agent if is_running else None
+        if status_agent is None:
+            cache_lock = getattr(self, "_agent_cache_lock", None)
+            cache = getattr(self, "_agent_cache", None)
+            if cache_lock is not None and cache is not None:
+                try:
+                    with cache_lock:
+                        cached = cache.get(session_key)
+                    if cached:
+                        status_agent = cached[0]
+                except Exception:
+                    status_agent = None
+
+        model_name = ""
+        provider_name = ""
+        base_url = ""
+        route_resolved = False
+        context_used = 0
+        context_total = 0
+        if status_agent is not None and status_agent is not _AGENT_PENDING_SENTINEL:
+            live_model = _clean_str(getattr(status_agent, "model", ""))
+            live_provider = _clean_str(getattr(status_agent, "provider", ""))
+            if live_model and live_provider:
+                model_name = live_model
+                provider_name = live_provider
+                base_url = _clean_str(getattr(status_agent, "base_url", ""))
+                route_resolved = True
+            ctx = getattr(status_agent, "context_compressor", None)
+            if ctx is not None:
+                context_used = _int_value(getattr(ctx, "last_prompt_tokens", 0))
+                context_total = _int_value(getattr(ctx, "context_length", 0))
+
+        persisted_model = _clean_str(persisted_route.get("model"))
+        persisted_provider = _clean_str(persisted_route.get("billing_provider"))
+        if not route_resolved and persisted_model and persisted_provider:
+            model_name = persisted_model
+            provider_name = persisted_provider
+            base_url = _clean_str(persisted_route.get("billing_base_url"))
+            route_resolved = True
+        if not route_resolved:
+            model_name = _clean_str(session_row.get("model"))
+            provider_name = _clean_str(session_row.get("billing_provider"))
+            base_url = _clean_str(session_row.get("billing_base_url"))
+        context_used = context_used or _int_value(getattr(session_entry, "last_prompt_tokens", 0))
+
+        user_config: dict[str, Any] = {}
+        if not model_name or not provider_name or not context_total:
+            try:
+                user_config = _load_gateway_config()
+            except Exception:
+                user_config = {}
+        if not model_name:
+            model_name = _resolve_gateway_model(user_config)
+        if not provider_name:
+            model_cfg = user_config.get("model", {}) if isinstance(user_config, dict) else {}
+            if isinstance(model_cfg, dict):
+                provider_name = _clean_str(model_cfg.get("provider"))
+        if not context_total:
+            model_cfg = user_config.get("model", {}) if isinstance(user_config, dict) else {}
+            configured_context = model_cfg.get("context_length") if isinstance(model_cfg, dict) else None
+            if isinstance(configured_context, int) and configured_context > 0:
+                context_total = configured_context
+
+        model_line = ""
+        if model_name:
+            if provider_name:
+                model_line = t("gateway.status.model_provider", model=model_name, provider=provider_name)
+            else:
+                model_line = t("gateway.status.model", model=model_name)
+
+        context_line = ""
+        if context_total:
+            pct = min(100, round((context_used / context_total) * 100)) if context_total else 0
+            context_line = t(
+                "gateway.status.context",
+                used=f"{context_used:,}",
+                total=f"{context_total:,}",
+                pct=f"{pct}",
+            )
+        elif context_used:
+            context_line = t("gateway.status.context_used", used=f"{context_used:,}")
 
         lines = [
             t("gateway.status.header"),
@@ -21256,17 +21395,39 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         lines.extend([
             t("gateway.status.created", timestamp=session_entry.created_at.strftime('%Y-%m-%d %H:%M')),
             t("gateway.status.last_activity", timestamp=session_entry.updated_at.strftime('%Y-%m-%d %H:%M')),
+        ])
+        if model_line:
+            lines.append(model_line)
+        if context_line:
+            lines.append(context_line)
+        lines.extend([
             t("gateway.status.tokens", tokens=f"{db_total_tokens:,}"),
             t("gateway.status.agent_running", state=t("gateway.status.state_yes") if is_running else t("gateway.status.state_no")),
         ])
         if queue_depth:
             lines.append(t("gateway.status.queued", count=queue_depth))
+        if source.platform == Platform.MATRIX:
+            adapter = self.adapters.get(Platform.MATRIX)
+            scope = getattr(adapter, "_matrix_session_scope", os.getenv("MATRIX_SESSION_SCOPE", "auto"))
+            thread = source.thread_id or "none"
+            lines.extend([
+                "",
+                t("gateway.status.matrix_scope_header"),
+                t("gateway.status.matrix_scope_room", room=source.chat_name or source.chat_id),
+                t("gateway.status.matrix_scope_room_id", room_id=source.chat_id),
+                t("gateway.status.matrix_scope_thread", thread_id=thread),
+                t("gateway.status.matrix_scope_mode", scope=scope),
+                t(
+                    "gateway.status.matrix_scope_key",
+                    session_key=self._redact_matrix_session_key(session_key),
+                ),
+            ])
         lines.extend([
             "",
             t("gateway.status.platforms", platforms=', '.join(connected_platforms)),
         ])
 
-
+        return "\n".join(lines)
 
     def _check_slash_access(
         self, source: SessionSource, canonical_cmd: str
