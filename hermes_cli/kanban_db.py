@@ -6706,7 +6706,7 @@ def _complete_task(
             (task_id,),
         ).fetchone()
         if task_row is None or task_row["status"] not in {
-            "running", "ready", "blocked"
+            "running", "ready", "blocked", "review"
         }:
             return False
         current_run_id = (

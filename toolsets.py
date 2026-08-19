@@ -61,6 +61,11 @@ _HERMES_CORE_TOOLS = [
     "text_to_speech",
     # Planning & memory
     "todo", "memory",
+    # Board mailbox messaging. Schema stays gated: message_agent's check_fn
+    # only passes for dispatcher workers / explicitly configured coordinators,
+    # so listing the name here costs non-kanban sessions nothing while keeping
+    # the kanban toolset a subset of the platform composite (recovery).
+    "message_agent",
     # NOTE: the desktop Project tools (project_list/create/switch) are
     # deliberately NOT here. They only make sense where a GUI can follow the
     # move, so they live in the `project` toolset and are enabled solely by the
