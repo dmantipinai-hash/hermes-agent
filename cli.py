@@ -10170,9 +10170,21 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         self._pending_title = None
         _sync_process_session_id(target_id)
 
-        # Load conversation history (strip transcript-only metadata entries)
-        restored = self._session_db.get_messages_as_conversation(target_id)
-        restored = [m for m in (restored or []) if m.get("role") != "session_meta"]
+        # Load conversation history (strip transcript-only metadata entries).
+        # repair_alternation: this /resume feeds LIVE REPLAY — ``restored``
+        # becomes ``self.conversation_history`` for subsequent turns. Heal a
+        # durable ``user;user`` violation once here instead of re-firing the
+        # pre-request repair on every request for the rest of the session.
+        #
+        # Both projections come from one lineage SELECT: model_history is
+        # alternation-repaired for live replay; display_history is the full
+        # lineage verbatim, used by _display_resumed_history() so timeline
+        # events and ancestor rows render correctly (matching the startup
+        # --resume path in _preload_resumed_session).
+        model_history, display_history = self._session_db.get_resume_conversations(
+            target_id
+        )
+        restored = [m for m in (model_history or []) if m.get("role") != "session_meta"]
         # Phase 3: repair a dangling tail from a mid-turn crash.
         if self.agent and hasattr(self.agent, "_repair_interrupted_tail"):
             try:
@@ -10180,6 +10192,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             except Exception:
                 pass
         self.conversation_history = restored
+        self._resume_display_history = [
+            m for m in (display_history or []) if m.get("role") != "session_meta"
+        ]
 
         # Re-open the target session so it's not marked as ended
         try:
@@ -10209,29 +10224,36 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             try:
                 _mm = getattr(self.agent, "_memory_manager", None)
                 if _mm is not None:
-                    if _boundary_snapshot:
-                        _mm.commit_session_boundary_async(
-                            _boundary_snapshot,
-                            new_session_id=self.session_id,
-                            parent_session_id=old_session_id or "",
-                            reason="new_session",
-                        )
-                    else:
-                        _mm.on_session_switch(
-                            self.session_id,
-                            parent_session_id=old_session_id or "",
-                            reset=True,
-                            reason="new_session",
-                        )
+                    _mm.on_session_switch(
+                        target_id,
+                        parent_session_id=old_session_id or "",
+                        reset=False,
+                        reason="resume",
+                    )
             except Exception:
                 pass
-            self._notify_session_boundary("on_session_reset")
 
-        if not silent:
-            if title:
-                print(f"(^_^)v New session started: {title}")
-            else:
-                print("(^_^)v New session started!")
+        title_part = f" \"{session_meta['title']}\"" if session_meta.get("title") else ""
+        from agent.context_compressor import is_user_originated_turn
+
+        # Count only user-originated turns (#80622): legacy compaction
+        # handoffs are durable role=user rows without display_kind.
+        msg_count = len([m for m in self._resume_display_history if is_user_originated_turn(m)])
+        if self.conversation_history:
+            _cprint(
+                f"  ↻ Resumed session {target_id}{title_part}"
+                f" ({msg_count} user message{'s' if msg_count != 1 else ''},"
+                f" {len(self.conversation_history)} total)"
+            )
+            self._display_resumed_history()
+        else:
+            _cprint(f"  ↻ Resumed session {target_id}{title_part} — no messages, starting fresh.")
+
+        # Retarget the process + tool cwd to where the session was started, so a
+        # mid-chat /resume lands in the same directory as a startup
+        # `hermes -c`/`--resume`. Idempotent and a no-op when the session
+        # recorded no cwd. See #38562.
+        self._restore_session_cwd(session_meta)
 
 
     def _consume_pending_resume_selection(self, text: str) -> bool:
