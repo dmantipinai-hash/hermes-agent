@@ -1891,6 +1891,7 @@ def create_job(
     normalized_toolsets = [str(t).strip() for t in enabled_toolsets if str(t).strip()] if enabled_toolsets else None
     normalized_toolsets = normalized_toolsets or None
     normalized_workdir = _normalize_workdir(workdir)
+    normalized_profile = (str(profile).strip() or None) if profile else None
     normalized_no_agent = bool(no_agent)
     normalized_attach = attach_to_session if isinstance(attach_to_session, bool) else None
     normalized_monitor_script = str(monitor_script).strip() if isinstance(monitor_script, str) else None
