@@ -695,19 +695,6 @@ def test_kanban_guidance_prompt_size_bounded():
     assert "Do not shell out" in prompt or "tools — they work" in prompt
 
 
-def test_kanban_guidance_prompt_size_bounded(monkeypatch, tmp_path):
-    """Sanity: the guidance block stays bounded so it doesn't blow up the
-    cached prompt. The bound is 5 KB rather than 4 KB because the block now
-    merges upstream's clearer rewrite with the A2 mailbox checkpoint protocol
-    (paragraph 3a) — both are load-bearing."""
-    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_fake")
-    home = tmp_path / ".hermes"
-    home.mkdir()
-    monkeypatch.setenv("HERMES_HOME", str(home))
-    from pathlib import Path as _P
-    monkeypatch.setattr(_P, "home", lambda: tmp_path)
-
-
 def test_kanban_guidance_orchestrator_decision_ownership():
     """The orchestrator section must carry the split-brain prevention
     contract: decisions are made by the orchestrator before fan-out and

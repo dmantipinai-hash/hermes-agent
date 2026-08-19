@@ -4,46 +4,44 @@ for orchestration templates that still reference /usr/bin/tini.
 This is a documentation-as-test guard: removing the shim is a real
 choice, but it should be done deliberately (e.g. once Hostinger's
 'Hermes WebUI' catalog updates to /init) and not by accident.
+
+The mechanism evolved past the original `ln -sf /init` symlink: a plain
+symlink forwarded tini CLI flags into s6 rc.init and boot-looped
+`restart: unless-stopped` deploys, so the compat path is now a shim
+script (docker/tini-shim.sh) that strips the tini flag surface and
+exec's /init + main-wrapper. ENTRYPOINT is the dispatcher, not /init
+directly — the dispatcher keeps docker's `--init`-style contracts and
+forwards to s6.
 """
-
-from __future__ import annotations
-
 from pathlib import Path
 
-
-def _dockerfile_text() -> str:
-    return (Path(__file__).parent.parent / "Dockerfile").read_text(encoding="utf-8")
+ROOT = Path(__file__).resolve().parents[1]
 
 
-def test_tini_compat_symlink_present():
-    """The /usr/bin/tini -> /init symlink line must exist for #34192."""
-    df = _dockerfile_text()
-    assert "ln -sf /init /usr/bin/tini" in df, (
-        "Dockerfile must keep the tini compat symlink (#34192). "
-        "Removing it breaks orchestration templates that still pin "
-        "/usr/bin/tini as the entrypoint (Hostinger 'Hermes WebUI' "
-        "catalog as of v0.14.x)."
+def test_tini_compat_shim_present():
+    df = (ROOT / "Dockerfile").read_text(encoding="utf-8")
+    assert "COPY --chmod=0755 docker/tini-shim.sh /usr/bin/tini" in df, (
+        "Dockerfile must keep the tini compat shim (#34192). Removing it "
+        "breaks orchestration templates that still pin /usr/bin/tini as the "
+        "entrypoint (Hostinger 'Hermes WebUI' catalog as of v0.14.x)."
+    )
+    assert (ROOT / "docker" / "tini-shim.sh").exists(), (
+        "the shim script referenced by the Dockerfile must ship in docker/"
     )
 
 
 def test_tini_compat_comment_explains_why():
-    """The symlink line is comment-anchored to #34192 so a future reader
-    knows why it exists. Removing the comment makes it look like dead
-    code worth deleting."""
-    df = _dockerfile_text()
+    df = (ROOT / "Dockerfile").read_text(encoding="utf-8")
     assert "#34192" in df, (
-        "The Dockerfile tini compat shim must keep its #34192 anchor "
-        "comment so future maintainers know why the symlink is there."
+        "The compat shim needs its rationale comment: it is deliberately "
+        "load-bearing until external catalogs move off /usr/bin/tini."
     )
 
 
-def test_entrypoint_still_init_not_tini():
-    """Sanity check: the actual ENTRYPOINT is still /init (s6-overlay).
-    The shim is for legacy external wrappers, not for the image's own
-    runtime — that path must continue to use the canonical /init."""
-    df = _dockerfile_text()
-    assert 'ENTRYPOINT [ "/init"' in df, (
-        "Dockerfile ENTRYPOINT must remain /init (s6-overlay). The "
-        "tini shim is only for external wrappers that haven't been "
-        "updated yet."
+def test_entrypoint_is_dispatcher():
+    df = (ROOT / "Dockerfile").read_text(encoding="utf-8")
+    assert 'ENTRYPOINT [ "/opt/hermes/docker/entrypoint-dispatch.sh" ]' in df, (
+        "Dockerfile ENTRYPOINT must remain the dispatcher (which exec's "
+        "s6-overlay's /init); the tini shim is only for external wrappers "
+        "that haven't been updated yet."
     )
