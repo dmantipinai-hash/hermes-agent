@@ -108,6 +108,10 @@ def test_mixin_notifier_sends_status_without_synthetic_followup(tmp_path, monkey
     runner._running = True
     runner.adapters = {Platform.TELEGRAM: adapter}
     runner._kanban_sub_fail_counts = {}
+    # Upstream notifier contract: only the dispatcher-lock owner serves
+    # legacy (unowned) subscription rows — stamp the handle like the live
+    # gateway does, matching _make_runner in test_kanban_notifier.py.
+    runner._kanban_dispatcher_lock_handle = object()
 
     real_sleep = asyncio.sleep
 
@@ -167,7 +171,14 @@ def test_named_profile_notifier_uses_its_own_adapter_registry(tmp_path, monkeypa
     runner._running = True
     runner.adapters = {Platform.TELEGRAM: adapter}
     runner._kanban_sub_fail_counts = {}
+    # Upstream notifier contract: only the dispatcher-lock owner serves
+    # legacy (unowned) subscription rows — stamp the handle like the live
+    # gateway does, matching _make_runner in test_kanban_notifier.py.
+    runner._kanban_dispatcher_lock_handle = object()
     runner._kanban_notifier_profile = "business-partner"
+    # This gateway IS the business-partner profile: the authz adapter
+    # resolver must see the active profile match so self.adapters serves it.
+    runner._active_profile_name = lambda: "business-partner"
 
     real_sleep = asyncio.sleep
 
