@@ -62,6 +62,11 @@ _ALLOWED: dict[tuple[str, str], str] = {
         "can only run what is on that subshell's PATH, which local.py populates "
         "with the managed dirs — so PATH is the correct question to ask here."
     ),
+    ("hermes_cli/config.py", "uv"): (
+        "recommended_update_command_for_method(): the PATH question is "
+        "deliberate — the returned string is display-only advice the user "
+        "pastes into their own shell, where PATH applies, not this process."
+    ),
     ("hermes_cli/update_cmd.py", "uv"): (
         "Termux fallback: a pkg-installed uv lands on PATH but not in the "
         "managed bin dir, and it is checked only after resolve_uv() misses."

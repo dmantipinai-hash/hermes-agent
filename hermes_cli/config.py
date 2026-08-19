@@ -619,6 +619,15 @@ def recommended_update_command_for_method(method: str) -> str:
     if method == "pip":
         if is_uv_tool_install():
             return "uv tool upgrade hermes-agent"
+        try:
+            from hermes_cli.managed_uv import resolve_uv
+            if resolve_uv():
+                return "uv pip install --upgrade hermes-agent"
+        except Exception:
+            pass
+        # Fallback rung: a user-installed uv on PATH. The returned string is
+        # display-only advice pasted into the user's own shell, where PATH
+        # applies — allow-listed in tests/test_managed_runtime_resolution.py.
         import shutil
         if shutil.which("uv"):
             return "uv pip install --upgrade hermes-agent"

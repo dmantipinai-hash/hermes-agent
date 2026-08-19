@@ -713,7 +713,10 @@ def test_kanban_guidance_orchestrator_decision_ownership():
     contract: decisions are made by the orchestrator before fan-out and
     stamped into every dependent card body."""
     from agent.prompt_builder import KANBAN_GUIDANCE
-    assert 1_500 < len(KANBAN_GUIDANCE) < 5_120, (
+    # Budget aligned with test_kanban_guidance_size_budget: upstream's
+    # richer guidance alone is ~6.6k chars — the old fork ceiling (5120)
+    # predates it and can no longer hold.
+    assert 1_500 < len(KANBAN_GUIDANCE) < 8_000, (
         f"KANBAN_GUIDANCE is {len(KANBAN_GUIDANCE)} chars — too short (missing?) or too long"
     )
 
