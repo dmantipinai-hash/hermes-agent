@@ -1408,6 +1408,11 @@ class GatewayStreamConsumer:
         Retries each chunk once on flood-control failures with a short delay.
         """
         final_text = self._clean_for_display(text)
+        # Whether the streaming preview carried any user-visible content
+        # BEFORE the fallback chunks go out — the cleanup decision below
+        # must never delete a preview the user actually read (a true-prefix
+        # partial), only a frozen cursor-only one or a duplicate full resend.
+        _preview_had_content = bool((self._last_sent_text or "").strip())
         # Ensure balanced code fences before computing continuation,
         # so the closing fence reaches the user even when the fallback
         # only delivers the tail after mid-stream edits failed.
@@ -1671,7 +1676,10 @@ class GatewayStreamConsumer:
             and stale_message_id != last_message_id
             and (
                 _empty_tail_resend
-                or not (self._fallback_prefix or "").strip()
+                # Duplicate full resend — the preview is now redundant.
+                or continuation == final_text
+                # Frozen cursor-only preview that never showed content.
+                or not _preview_had_content
             )
         )
         if _cleanup_preview:

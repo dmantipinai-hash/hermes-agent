@@ -116,7 +116,13 @@ _FLY_ENV = {FLY_APP_NAME_ENV: "hermes-agent-stg-test", FLY_MACHINE_ID_ENV: "d891
 
 def _fake_flaps(tmp_path, status_line, capture):
     """One-shot unix-socket HTTP server standing in for flaps."""
-    sock_path = str(tmp_path / "fly-api.sock")
+    # macOS caps AF_UNIX sun_path at 104 bytes and pytest's tmp_path nests
+    # deep under /private/var/folders — bind in a short OS-tmp dir (the
+    # daemon thread closes the socket; the dir is left to the OS tmp
+    # reaper, same lifetime as pytest's own tmp tree).
+    import tempfile
+    short_dir = tempfile.mkdtemp(prefix="flaps-")
+    sock_path = short_dir + "/s.sock"
     server = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
     server.bind(sock_path)
     server.listen(1)

@@ -100,7 +100,7 @@ def _kill_stale_bridge_by_pidfile(session_path: Path) -> None:
     if not pid_file.exists():
         return
     try:
-        pid = int(pid_file.read_text().strip())
+        pid = int(pid_file.read_text(encoding="utf-8").strip())
     except (ValueError, OSError, TypeError):
         try:
             pid_file.unlink()
@@ -125,7 +125,7 @@ def _kill_stale_bridge_by_pidfile(session_path: Path) -> None:
 def _write_bridge_pidfile(session_path: Path, pid: int) -> None:
     """Write the bridge PID to a file for later cleanup."""
     try:
-        (session_path / "bridge.pid").write_text(str(pid))
+        (session_path / "bridge.pid").write_text(str(pid), encoding="utf-8")
     except OSError:
         pass
 

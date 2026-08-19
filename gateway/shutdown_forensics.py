@@ -254,8 +254,16 @@ def spawn_async_diagnostic(
         # would also reap us anyway, but defense in depth).  Without
         # start_new_session, a SIGKILL on our cgroup takes the diag down
         # before it can flush.
+        # GNU timeout is not universal (macOS ships without coreutils);
+        # every command in the script is already fast/bounded and guards
+        # its own errors, so fall back to a plain bash run without it.
+        import shutil
+        if shutil.which("timeout"):
+            argv = ["timeout", f"{timeout_seconds:.0f}", "bash", "-c", script]
+        else:
+            argv = ["bash", "-c", script]
         proc = subprocess.Popen(
-            ["timeout", f"{timeout_seconds:.0f}", "bash", "-c", script],
+            argv,
             stdout=fd,
             stderr=subprocess.STDOUT,
             stdin=subprocess.DEVNULL,

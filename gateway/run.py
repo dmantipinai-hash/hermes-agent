@@ -2546,6 +2546,7 @@ from gateway.session_state import (
 from gateway.authz_mixin import GatewayAuthorizationMixin
 from gateway.kanban_watchers import GatewayKanbanWatchersMixin
 from gateway.slash_commands import GatewaySlashCommandsMixin
+from gateway.slash_commands import _RESET_CLEANUP_TIMEOUT_S
 from gateway.turn_context import TurnContext
 from gateway.platforms.base import (
     BasePlatformAdapter,
@@ -20848,7 +20849,29 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _cached = self._agent_cache.get(session_key)
                 _old_agent = _cached[0] if isinstance(_cached, tuple) else _cached if _cached else None
             if _old_agent is not None:
-                self._cleanup_agent_resources(_old_agent)
+                # Off-loop + bounded (#35994): a wedged teardown (memory
+                # provider IO, subprocess close) must not block /new; on
+                # timeout or error the reset proceeds regardless.
+                try:
+                    await asyncio.wait_for(
+                        self._run_in_executor_with_context(
+                            self._cleanup_agent_resources, _old_agent
+                        ),
+                        timeout=_RESET_CLEANUP_TIMEOUT_S,
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        "Agent resource cleanup for session %s exceeded %ss during "
+                        "/new reset; proceeding with reset (the worker thread is left "
+                        "to finish on its own). (#35994)",
+                        session_key, _RESET_CLEANUP_TIMEOUT_S,
+                    )
+                except Exception as cleanup_exc:
+                    logger.warning(
+                        "Agent resource cleanup failed during /new reset for session "
+                        "%s: %s — proceeding with reset. (#35994)",
+                        session_key, cleanup_exc,
+                    )
         self._evict_cached_agent(session_key)
 
         # Discard any /queue overflow for this session — /new is a
@@ -20870,8 +20893,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception:
             pass
 
-        # Reset the session
-        new_entry = self.session_store.reset_session(session_key)
+        # Reset the session. The async boundary wraps the (possibly blocking)
+        # store mutation off the event loop and enforces one awaited access
+        # per turn — the raw store must not be called from async code.
+        new_entry = await self.async_session_store.reset_session(session_key)
 
         # Clear any session-scoped model/reasoning overrides so the next agent
         # picks up configured defaults instead of previous session switches.
@@ -20918,7 +20943,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             header = self._telegram_topic_new_header(source) or t("gateway.reset.header_default")
         else:
             # No existing session, just create one
-            new_entry = self.session_store.get_or_create_session(source, force_new=True)
+            new_entry = await self.async_session_store.get_or_create_session(
+                source, force_new=True
+            )
             header = self._telegram_topic_new_header(source) or t("gateway.reset.header_new")
 
         # Set session title if provided with /new <title>
@@ -21180,8 +21207,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         platform.value if hasattr(platform, "value") else str(platform or "")
                     ).lower()
                     chat_id = str(getattr(source, "chat_id", "") or "")
+                    chat_type = str(getattr(source, "chat_type", "") or "") or None
                     thread_id = str(getattr(source, "thread_id", "") or "")
                     user_id = str(getattr(source, "user_id", "") or "") or None
+                    # Persist the platform-specific stable alt id (Signal UUID,
+                    # Feishu union_id) too: build_session_key keys the participant
+                    # on ``user_id_alt or user_id``, so a replayed wake only rebuilds
+                    # the same session key when the alt id survives the round-trip.
+                    user_id_alt = str(getattr(source, "user_id_alt", "") or "") or None
+                    delivery_metadata = self._thread_metadata_for_source(
+                        source, self._reply_anchor_for_event(event)
+                    ) or None
+                    if isinstance(delivery_metadata, dict):
+                        chat_type = str(getattr(source, "chat_type", "") or "")
+                        if chat_type:
+                            delivery_metadata.setdefault("chat_type", chat_type)
                     if platform_str and chat_id:
                         def _sub():
                             from hermes_cli import kanban_db as _kb
@@ -21190,9 +21230,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 _kb.add_notify_sub(
                                     conn, task_id=task_id,
                                     platform=platform_str, chat_id=chat_id,
+                                    chat_type=chat_type,
                                     thread_id=thread_id or None,
                                     user_id=user_id,
+                                    user_id_alt=user_id_alt,
                                     notifier_profile=getattr(self, "_kanban_notifier_profile", None) or self._active_profile_name(),
+                                    # Subscribing from chat: deliver the passive
+                                    # message and wake the destination agent.
+                                    delivery_mode="notify+wake",
+                                    delivery_metadata=delivery_metadata,
                                 )
                             finally:
                                 conn.close()
