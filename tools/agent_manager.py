@@ -159,8 +159,9 @@ def _write_profile_config(
     cfg: dict = {}
     if cfg_path.exists():
         try:
-            with open(cfg_path, "r", encoding="utf-8") as f:
-                loaded = yaml.safe_load(f)
+            from hermes_cli.config import read_user_config_raw
+
+            loaded = read_user_config_raw(cfg_path)
             if isinstance(loaded, dict):
                 cfg = loaded
         except Exception:

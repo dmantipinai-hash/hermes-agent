@@ -13,7 +13,7 @@ def test_prompt_model_selection_uses_curses_radiolist():
 
     seen = {}
 
-    def _fake(title, items, *, selected=0, cancel_returns=None, description=None):
+    def _fake(title, items, *, selected=0, cancel_returns=None, description=None, **_kw):
         seen["title"] = title
         seen["items"] = items
         return 1  # pick second model
@@ -25,7 +25,9 @@ def test_prompt_model_selection_uses_curses_radiolist():
     assert result == "model-b"
     assert seen["title"] == "Select default model:"
     # Items are the models plus the custom/skip entries.
-    assert seen["items"][:2] == ["model-a", "model-b"]
+    # The searchable radiolist paginates: one single-item page per model
+    # ((label, description) tuples), then the custom/skip trailing options.
+    assert [page[0][0] for page in seen["items"][:2]] == ["model-a", "model-b"]
     assert "Skip (keep current)" in seen["items"]
 
 
@@ -67,7 +69,7 @@ def test_model_selection_with_pricing_passes_description():
 
     seen = {}
 
-    def _fake(title, items, *, selected=0, cancel_returns=None, description=None):
+    def _fake(title, items, *, selected=0, cancel_returns=None, description=None, **_kw):
         seen["description"] = description
         return len(items) - 1  # Skip
 

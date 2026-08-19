@@ -175,6 +175,7 @@ _CREDENTIAL_NAMES = frozenset({
     "KIMI_API_KEY",
     "MOONSHOT_API_KEY",
     "GLM_API_KEY",
+    "GLM_BASE_URL",
     "ZAI_API_KEY",
     "MINIMAX_API_KEY",
     "OLLAMA_API_KEY",

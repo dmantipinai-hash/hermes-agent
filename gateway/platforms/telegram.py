@@ -1334,9 +1334,9 @@ class TelegramAdapter(BasePlatformAdapter):
                 logger.warning("[%s] Config file not found at %s, cannot persist thread_id", self.name, config_path)
                 return
 
-            import yaml as _yaml
-            with open(config_path, "r", encoding="utf-8") as f:
-                config = _yaml.safe_load(f) or {}
+            from hermes_cli.config import load_config_readonly
+
+            config = load_config_readonly()
 
             # Navigate to platforms.telegram.extra.dm_topics, creating the path
             # when a named delivery target asks us to create a topic that was
@@ -5662,9 +5662,9 @@ class TelegramAdapter(BasePlatformAdapter):
             if not config_path.exists():
                 return
 
-            import yaml as _yaml
-            with open(config_path, "r", encoding="utf-8") as f:
-                config = _yaml.safe_load(f) or {}
+            from hermes_cli.config import load_config_readonly
+
+            config = load_config_readonly()
 
             dm_topics = (
                 config.get("platforms", {})

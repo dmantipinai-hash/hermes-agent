@@ -143,3 +143,5 @@ PHASE3-TEST-CHECKLIST.md
 CHALLENGE-TESTING.md
 MODIFICATIONS.md
 KNOWN-ISSUES.md
+.web_ui_build.lock
+.hermes-bootstrap-complete

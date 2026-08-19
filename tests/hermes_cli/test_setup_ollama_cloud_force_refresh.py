@@ -9,10 +9,13 @@ from __future__ import annotations
 
 def test_setup_ollama_cloud_passes_force_refresh(monkeypatch):
     """The provider-setup model-fetch for ollama-cloud must pass ``force_refresh=True``."""
-    import hermes_cli.main as main_mod
+    # The provider-setup flow was extracted from main.py into
+    # hermes_cli/model_setup_flows.py (god-file decomposition); the
+    # ollama-cloud branch lives there now.
+    import hermes_cli.model_setup_flows as flows_mod
     import inspect
 
-    src = inspect.getsource(main_mod)
+    src = inspect.getsource(flows_mod)
 
     # Locate the ollama-cloud branch in the provider setup flow.
     marker = 'provider_id == "ollama-cloud"'
