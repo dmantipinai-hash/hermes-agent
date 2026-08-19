@@ -668,7 +668,7 @@ def test_worker_lifecycle_through_tools(worker_env):
 # ---------------------------------------------------------------------------
 
 
-def test_kanban_guidance_prompt_size_bounded():
+def test_kanban_guidance_prompt_size_bounded(monkeypatch, tmp_path):
     """KANBAN_GUIDANCE is injected into every kanban-capable process's system
     prompt and resolved once at agent init, so its size is a per-worker token
     tax paid on every spawn. Bound it as an invariant, not a change-detector:
@@ -682,6 +682,26 @@ def test_kanban_guidance_prompt_size_bounded():
         f"KANBAN_GUIDANCE is {len(KANBAN_GUIDANCE)} chars; it is injected into "
         "every kanban worker's system prompt — trim it or consciously re-bound "
         "this invariant with justification."
+    )
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_fake")
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    from pathlib import Path as _P
+    monkeypatch.setattr(_P, "home", lambda: tmp_path)
+
+    from tools.registry import invalidate_check_fn_cache
+    from model_tools import _clear_tool_defs_cache
+    invalidate_check_fn_cache()
+    _clear_tool_defs_cache()
+
+    from run_agent import AIAgent
+    a = AIAgent(
+        api_key="test",
+        base_url="https://openrouter.ai/api/v1",
+        quiet_mode=True,
+        skip_context_files=True,
+        skip_memory=True,
     )
     prompt = a._build_system_prompt()
     # Header phrase (identity-free — SOUL.md owns identity, layer 3 is protocol)
