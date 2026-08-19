@@ -8236,168 +8236,14 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     missing_display,
                     ", ".join(loaded_skills),
                 )
-                self.session_id = resolved_id
-                resolved_meta = self._session_db.get_session(self.session_id)
-                if resolved_meta:
-                    session_meta = resolved_meta
-            restored = self._session_db.get_messages_as_conversation(self.session_id)
-            if restored:
-                restored = [m for m in restored if m.get("role") != "session_meta"]
-                # Phase 3: repair any dangling tail left by a mid-turn crash
-                # before adopting the history. Idempotent no-op on clean tails.
-                if self.agent and hasattr(self.agent, "_repair_interrupted_tail"):
-                    try:
-                        self.agent._repair_interrupted_tail(restored)
-                    except Exception:
-                        pass
-                self.conversation_history = restored
-                msg_count = len([m for m in restored if m.get("role") == "user"])
-                title_part = ""
-                if session_meta.get("title"):
-                    title_part = f" \"{session_meta['title']}\""
-                if _quiet_mode:
-                    print(
-                        f"↻ Resumed session {self.session_id}{title_part} "
-                        f"({msg_count} user message{'s' if msg_count != 1 else ''}, "
-                        f"{len(restored)} total messages)",
-                        file=sys.stderr,
-                    )
-                else:
-                    ChatConsole().print(
-                        f"[bold {_accent_hex()}]↻ Resumed session[/] "
-                        f"[bold]{_escape(self.session_id)}[/]"
-                        f"[bold {_accent_hex()}]{_escape(title_part)}[/] "
-                        f"({msg_count} user message{'s' if msg_count != 1 else ''}, {len(restored)} total messages)"
-                    )
             else:
-                if _quiet_mode:
-                    print(
-                        f"Session {self.session_id} found but has no messages. Starting fresh.",
-                        file=sys.stderr,
-                    )
-                else:
-                    ChatConsole().print(
-                        f"[bold {_accent_hex()}]Session {_escape(self.session_id)} found but has no messages. Starting fresh.[/]"
-                    )
-            # Re-open the session (clear ended_at so it's active again)
-            try:
-                self._session_db._conn.execute(
-                    "UPDATE sessions SET ended_at = NULL, end_reason = NULL WHERE id = ?",
-                    (self.session_id,),
-                )
-                self._session_db._conn.commit()
-            except Exception:
-                pass
-        
-        try:
-            runtime = runtime_override or {
-                "api_key": self.api_key,
-                "base_url": self.base_url,
-                "provider": self.provider,
-                "api_mode": self.api_mode,
-                "command": self.acp_command,
-                "args": list(self.acp_args or []),
-                "credential_pool": getattr(self, "_credential_pool", None),
-            }
-            effective_model = model_override or self.model
-            self.agent = AIAgent(
-                model=effective_model,
-                api_key=runtime.get("api_key"),
-                base_url=runtime.get("base_url"),
-                provider=runtime.get("provider"),
-                api_mode=runtime.get("api_mode"),
-                acp_command=runtime.get("command"),
-                acp_args=runtime.get("args"),
-                credential_pool=runtime.get("credential_pool"),
-                max_iterations=self.max_turns,
-                enabled_toolsets=self.enabled_toolsets,
-                disabled_toolsets=self.disabled_toolsets,
-                verbose_logging=self.verbose,
-                quiet_mode=not self.verbose,
-                ephemeral_system_prompt=self.system_prompt if self.system_prompt else None,
-                prefill_messages=self.prefill_messages or None,
-                reasoning_config=self.reasoning_config,
-                service_tier=self.service_tier,
-                request_overrides=request_overrides,
-                providers_allowed=self._providers_only,
-                providers_ignored=self._providers_ignore,
-                providers_order=self._providers_order,
-                provider_sort=self._provider_sort,
-                provider_require_parameters=self._provider_require_params,
-                provider_data_collection=self._provider_data_collection,
-                openrouter_min_coding_score=self._openrouter_min_coding_score,
-                session_id=self.session_id,
-                platform="cli",
-                session_db=self._session_db,
-                clarify_callback=self._clarify_callback,
-                reasoning_callback=self._current_reasoning_callback(),
+                raise ValueError(f"Unknown skill(s): {missing_display}")
+        if skills_prompt:
+            self.system_prompt = "\n\n".join(
+                part for part in (self.system_prompt, skills_prompt) if part
+            ).strip()
+            self.preloaded_skills = loaded_skills
 
-                fallback_model=self._fallback_model,
-                thinking_callback=self._on_thinking,
-                checkpoints_enabled=self.checkpoints_enabled,
-                checkpoint_max_snapshots=self.checkpoint_max_snapshots,
-                checkpoint_max_total_size_mb=self.checkpoint_max_total_size_mb,
-                checkpoint_max_file_size_mb=self.checkpoint_max_file_size_mb,
-                pass_session_id=self.pass_session_id,
-                skip_context_files=self.ignore_rules,
-                skip_memory=self.ignore_rules,
-                tool_progress_callback=self._on_tool_progress,
-                tool_start_callback=self._on_tool_start if self._inline_diffs_enabled else None,
-                tool_complete_callback=self._on_tool_complete if self._inline_diffs_enabled else None,
-                stream_delta_callback=self._stream_delta if self.streaming_enabled else None,
-                tool_gen_callback=self._on_tool_gen_start if self.streaming_enabled else None,
-            )
-            # Only this root CLI construction site grants mailbox authority.
-            # Delegates, background agents, auxiliary clients, and MCP paths
-            # construct AIAgent elsewhere and retain the default None.
-            from agent.mailbox_principal import grant_top_level_mailbox_principal
-            from hermes_cli.profiles import get_active_profile_name
-
-            _mailbox_profile = get_active_profile_name() or "default"
-            grant_top_level_mailbox_principal(
-                self.agent,
-                platform="cli",
-                sender_profile=_mailbox_profile,
-                actor_identity=f"cli:{_mailbox_profile}:{self.session_id}",
-            )
-            # Start the Kanban mailbox listener for worker principals only.
-            # No-op (returns False) for manager principals and ordinary chat;
-            # the initializer checks mailbox_principal.kind == "worker".
-            from agent.kanban_mailbox import initialize_kanban_mailbox_runtime
-
-            initialize_kanban_mailbox_runtime(self.agent)
-            # Store reference for atexit memory provider shutdown
-            global _active_agent_ref
-            _active_agent_ref = self.agent
-            # Route agent status output through prompt_toolkit so ANSI escape
-            # sequences aren't garbled by patch_stdout's StdoutProxy (#2262).
-            self.agent._print_fn = _cprint
-            self._active_agent_route_signature = (
-                effective_model,
-                runtime.get("provider"),
-                runtime.get("base_url"),
-                runtime.get("api_mode"),
-                runtime.get("command"),
-                tuple(runtime.get("args") or ()),
-            )
-
-            # Force-create DB row on /title intent, then apply title.
-            if self._pending_title and self._session_db and self.agent:
-                try:
-                    self.agent._ensure_db_session()
-                    if self.agent._session_db_created:
-                        self._session_db.set_session_title(self.session_id, self._pending_title)
-                        _cprint(f"  Session title applied: {self._pending_title}")
-                        self._pending_title = None
-                    # else: row creation failed transiently — keep _pending_title for retry
-                except (ValueError, Exception) as e:
-                    _cprint(f"  Could not apply pending title: {e}")
-                    # Keep _pending_title so it can be retried after row creation succeeds
-            return True
-        except Exception as e:
-            ChatConsole().print(f"[bold red]Failed to initialize agent: {e}[/]")
-            return False
-    
     def show_banner(self):
         """Display the welcome banner in Claude Code style."""
         self.console.clear()
@@ -10111,7 +9957,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # numbered prompt.
         self._pending_resume_sessions = None
 
-        if not self._session_db:
+        _session_db = getattr(self, "_session_db", None)
+        if not _session_db:
             from hermes_state import format_session_db_unavailable
             _cprint(f"  {format_session_db_unavailable()}")
             return
@@ -10131,7 +9978,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             resolved = _resolve_session_by_name_or_id(target)
             target_id = resolved or target
 
-        session_meta = self._session_db.get_session(target_id)
+        session_meta = _session_db.get_session(target_id)
         if not session_meta:
             _cprint(f"  Session not found: {target}")
             _cprint("  Use /history or `hermes sessions list` to see available sessions.")
@@ -10149,7 +9996,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 f"resuming the descendant with your transcript."
             )
             target_id = resolved_id
-            resolved_meta = self._session_db.get_session(target_id)
+            resolved_meta = _session_db.get_session(target_id)
             if resolved_meta:
                 session_meta = resolved_meta
 
@@ -10158,9 +10005,18 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             return
 
         old_session_id = self.session_id
+        # Flush un-persisted messages before ending the old session (#47202).
+        if self.agent:
+            try:
+                self.agent._flush_messages_to_session_db(
+                    self.conversation_history,
+                    conversation_history=self.conversation_history,
+                )
+            except Exception:
+                pass
         # End current session
         try:
-            self._session_db.end_session(self.session_id, "resumed_other")
+            _session_db.end_session(self.session_id, "resumed_other")
         except Exception:
             pass
 
@@ -10181,7 +10037,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # lineage verbatim, used by _display_resumed_history() so timeline
         # events and ancestor rows render correctly (matching the startup
         # --resume path in _preload_resumed_session).
-        model_history, display_history = self._session_db.get_resume_conversations(
+        model_history, display_history = _session_db.get_resume_conversations(
             target_id
         )
         restored = [m for m in (model_history or []) if m.get("role") != "session_meta"]
@@ -10198,7 +10054,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
 
         # Re-open the target session so it's not marked as ended
         try:
-            self._session_db.reopen_session(target_id)
+            _session_db.reopen_session(target_id)
         except Exception:
             pass
 
