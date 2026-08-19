@@ -8895,45 +8895,10 @@ def run_conversation(
     # explanation derived from ``_turn_exit_reason``, mirroring the
     # file-mutation verifier footer pattern above.
     #
-    # Gate carefully so healthy turns stay quiet:
-    #   - ``text_response(...)`` exits never produce an explanation
-    #     (handled inside the formatter), so a terse ``Done.`` is silent.
-    #   - We only ACT when there is no genuinely usable reply this turn:
-    #     an empty response, the "(empty)" terminal sentinel, or a
-    #     suspiciously short partial fragment with no terminating
-    #     punctuation (e.g. "The").  A real short answer keeps its text.
-    if not interrupted:
-        try:
-            if agent._turn_completion_explainer_enabled():
-                _stripped = (final_response or "").strip()
-                _is_empty_terminal = _stripped == "" or _stripped == "(empty)"
-                # A short fragment that is not a normal text_response exit
-                # and lacks sentence-ending punctuation is treated as a
-                # truncated partial (the "The" case from #34452).
-                _is_partial_fragment = (
-                    not _is_empty_terminal
-                    and not str(_turn_exit_reason).startswith("text_response")
-                    and len(_stripped) <= 24
-                    and _stripped[-1:] not in {".", "!", "?", "。", "！", "？", "`", ")"}
-                )
-                if _is_empty_terminal or _is_partial_fragment:
-                    _explanation = agent._format_turn_completion_explanation(
-                        _turn_exit_reason
-                    )
-                    if _explanation:
-                        if _is_empty_terminal:
-                            # Replace the bare "(empty)"/blank sentinel with
-                            # the actionable explanation.
-                            final_response = _explanation
-                        else:
-                            # Keep the partial fragment, append the reason so
-                            # the user sees both what arrived and why it
-                            # stopped.
-                            final_response = (
-                                _stripped + "\n\n" + _explanation
-                            )
-        except Exception as _exp_err:
-            logger.debug("turn-completion explainer failed: %s", _exp_err)
+    # Turn-completion explanation lives in turn_finalizer.finalize_turn
+    # (single cause-aware owner — it passes _last_persistence_error_cause so
+    # lock contention reads as "busy storage", not the generic advice).
+
 
     _response_transformed = False
 
