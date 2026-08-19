@@ -820,12 +820,28 @@ class TestFTS5Search:
         db.append_message("s1", role="user", content="after")
 
         statements = []
-        read_conn = db._get_read_conn() or db._conn
-        traced_connections = [db._conn]
-        if read_conn is not db._conn:
-            traced_connections.append(read_conn)
-        for conn in traced_connections:
-            conn.set_trace_callback(statements.append)
+
+        # The enrichment CTE runs on a connection BORROWED from the read
+        # pool inside _read_ctx — trace at the borrow point so whichever
+        # pooled connection serves the query is captured.
+        import contextlib
+
+        _orig_read_ctx = db._read_ctx
+
+        traced_connections = []
+
+        @contextlib.contextmanager
+        def _traced_read_ctx():
+            with _orig_read_ctx() as conn:
+                if conn not in traced_connections:
+                    traced_connections.append(conn)
+                try:
+                    conn.set_trace_callback(statements.append)
+                except Exception:
+                    pass
+                yield conn
+
+        db._read_ctx = _traced_read_ctx
 
         def context_query_count():
             normalized = (" ".join(sql.upper().split()) for sql in statements)
@@ -850,6 +866,7 @@ class TestFTS5Search:
             assert default[0]["context"]
             assert context_query_count() == 2
         finally:
+            db._read_ctx = _orig_read_ctx
             for conn in traced_connections:
                 conn.set_trace_callback(None)
 
