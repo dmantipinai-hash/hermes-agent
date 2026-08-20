@@ -22574,7 +22574,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
     def _should_echo_stt_transcripts(self) -> bool:
         """Return whether inbound voice/STT transcripts should be echoed to chat."""
-        return bool(getattr(self.config, "stt_echo_transcripts", True))
+        # Fork default: off — before the upstream merge the transcript was
+        # agent-internal only; users who want the 🎙️ feedback echo can set
+        # stt.echo_transcripts: true.
+        return bool(getattr(self.config, "stt_echo_transcripts", False))
 
     async def _send_voice_reply(self, event: MessageEvent, text: str) -> None:
         """Generate TTS audio and send as a voice message before the text reply."""
@@ -25090,11 +25093,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         When a voice message arrives as an interrupt (while the agent is busy),
         the user has no other signal that their message was understood — the
         agent's response will only come after the current turn is interrupted.
-        Echoing ``🎙️ "<transcript>"`` gives immediate feedback. Default is on;
-        operators can disable it via ``stt.echo_transcripts: false`` in
+        Echoing ``🎙️ "<transcript>"`` gives immediate feedback.
+
+        Fork default is OFF: before the upstream merge the transcript was
+        agent-internal only, and that quiet behavior is what this fork ships.
+        Operators can opt in via ``stt.echo_transcripts: true`` in
         ``config.yaml``.
         """
-        return bool(getattr(self.config, "stt_echo_transcripts", True))
+        return bool(getattr(self.config, "stt_echo_transcripts", False))
 
     async def _transcribe_pending_audio_event_once(
         self,
@@ -25159,43 +25165,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # No transcript available — fall back to whatever text the event
         # already carried so the interrupt still fires with the raw caption.
         return current_text or "", []
-
-    async def _echo_pending_stt_transcripts_once(
-        self,
-        event: "MessageEvent",
-        adapter: Any,
-        source: "SessionSource",
-        transcripts: list[str],
-        metadata: Any = None,
-    ) -> None:
-        """Echo ``🎙️ "<transcript>"`` for a pending voice event exactly once.
-
-        Latched by ``event.stt_echo_sent`` so multiple interrupt paths (busy
-        handler, PRIORITY path, backup monitor) can all call this without
-        producing duplicate echoes for the same voice message.
-
-        ``metadata`` is forwarded verbatim to ``adapter.send`` so each call
-        site controls threading/notify context.
-        """
-        if not transcripts:
-            return
-        if getattr(event, "stt_echo_sent", False):
-            return
-        if not self._should_echo_stt_transcripts():
-            event.stt_echo_sent = True
-            return
-        if adapter is None or source is None:
-            return
-        try:
-            await adapter.send(
-                source.chat_id,
-                f'🎙️ "{transcripts[0]}"',
-                metadata=metadata,
-            )
-        except Exception as exc:
-            logger.debug("Pending-voice STT echo failed: %s", exc)
-        finally:
-            event.stt_echo_sent = True
 
     async def _enrich_message_with_transcription(
         self,

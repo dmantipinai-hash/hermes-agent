@@ -125,6 +125,10 @@ def _run_agent_runner(adapter):
 async def test_pending_voice_interrupt_reuses_transcript_and_echo():
     adapter = SimpleNamespace(send=AsyncMock())
     runner = _runner(adapter)
+    # The fork ships the transcript echo OFF by default (pre-merge quiet
+    # behavior); this test exercises the echo mechanics under explicit
+    # opt-in, mirroring `stt.echo_transcripts: true`.
+    runner.config.stt_echo_transcripts = True
     source = _source()
     event = MessageEvent(
         text="",
