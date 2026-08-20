@@ -41,7 +41,7 @@ import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from tools.memory_tool import (
     ENTRY_DELIMITER,
@@ -155,6 +155,43 @@ def _fts_quote(query: str) -> str:
 _TOKEN_SPLIT_RE = re.compile(r"[^\w]+", re.UNICODE)
 _TOKEN_SEARCH_MAX = 8
 _TOKEN_MIN_STEM = 4
+# Short domain terms (vpn/vps/dns/kvm/fts/мчд) are shorter than the stem
+# minimum and used to be dropped outright — the orchestrator search was
+# blind to them (live incident 2026-08-19: «vpn» present in stored entries,
+# «что там с vpn?» recalled zero). Exactly-3-char tokens are matched EXACTLY
+# (whole token), never as prefixes: a 3-char prefix is noise (сер* hits
+# сервер/серия/серый). Function words of the same length are excluded so
+# they cannot OR-open the search. No alias dictionary is required for this
+# path to work (Gap B′ is a retrieval bug, not a synonymy gap).
+_TOKEN_EXACT_LEN = 3
+_EXACT_STOPWORDS = frozenset({
+    "все", "всё", "где", "для", "его", "ещё", "как", "кто", "или", "над",
+    "она", "они", "под", "при", "там", "тут", "чем", "что", "эта", "эти",
+    "and", "are", "but", "can", "for", "had", "has", "its", "not", "off",
+    "our", "out", "per", "the", "via", "was", "you",
+})
+
+
+def _query_exact_terms(query: str) -> List[str]:
+    """Distinct lowercase 3-char tokens for exact (whole-token) matching.
+
+    Complements :func:`_query_stems`: short domain terms stay searchable
+    without stemming (which would both truncate them into noise and, before
+    this, discard them entirely).
+    """
+    seen: set = set()
+    out: List[str] = []
+    for token in _TOKEN_SPLIT_RE.split(query or ""):
+        token = token.lower()
+        if len(token) != _TOKEN_EXACT_LEN or token in _EXACT_STOPWORDS:
+            continue
+        if token in seen:
+            continue
+        seen.add(token)
+        out.append(token)
+        if len(out) >= _TOKEN_SEARCH_MAX:
+            break
+    return out
 
 
 def _query_stems(query: str) -> List[str]:
@@ -423,24 +460,38 @@ class MemoryStoreV2(MemoryStore):
         the system prompt.
         """
         for target in ("memory", "user"):
-            rows = self._visible_rows(target)
-            budgeted: List[str] = []
-            used = 0
-            limit = self._char_limit(target)
-            included_contents: set = set()
-            for row in rows:
-                text = self._render_entry_for_prompt(row)
-                cost = len(text) + (len(ENTRY_DELIMITER) if budgeted else 0)
-                if budgeted and used + cost > limit:
-                    continue  # entry stays in store, drops out of prompt
-                budgeted.append(text)
-                used += cost
-                included_contents.add(row["content"])
-            self._snapshot_entry_contents[target] = included_contents
+            budgeted, included, _used, _visible = self._budget_walk(target)
+            self._snapshot_entry_contents[target] = included
             sanitized = self._sanitize_entries_for_snapshot(
                 budgeted, "MEMORY.md" if target == "memory" else "USER.md"
             )
             self._system_prompt_snapshot[target] = self._render_block(target, sanitized)
+
+    def _budget_walk(self, target: str) -> Tuple[List[str], set, int, int]:
+        """One budget pass over the visible rows.
+
+        Returns ``(rendered_texts, included_contents, used_chars,
+        visible_count)`` — the single source of the projection ordering and
+        cost math, shared by :meth:`_rebuild_snapshot` (which freezes the
+        prompt block) and the v2 write telemetry, so the usage a memory
+        write reports is by construction what the next session's snapshot
+        will contain. Read-only: never mutates the frozen snapshot, so
+        calling it mid-session cannot break the prompt-cache invariant.
+        """
+        rows = self._visible_rows(target)
+        limit = self._char_limit(target)
+        budgeted: List[str] = []
+        included: set = set()
+        used = 0
+        for row in rows:
+            text = self._render_entry_for_prompt(row)
+            cost = len(text) + (len(ENTRY_DELIMITER) if budgeted else 0)
+            if budgeted and used + cost > limit:
+                continue  # entry stays in store, drops out of prompt
+            budgeted.append(text)
+            included.add(row["content"])
+            used += cost
+        return budgeted, included, used, len(rows)
 
     @staticmethod
     def _render_entry_for_prompt(row: sqlite3.Row) -> str:
@@ -575,7 +626,7 @@ class MemoryStoreV2(MemoryStore):
                 (target, f"%{old_text.lower()}%"),
             ).fetchall()
             if not rows:
-                outcome.update({"success": False, "error": f"No entry matched '{old_text}'."})
+                outcome["no_match"] = True
                 return
             unique = {r["content"] for r in rows}
             if len(unique) > 1:
@@ -602,6 +653,8 @@ class MemoryStoreV2(MemoryStore):
             outcome.update({"success": True})
 
         self._execute_write(_update)
+        if outcome.get("no_match"):
+            return self._no_match_error("replace", target, old_text)
         if not outcome.get("success"):
             return outcome
         self._rewrite_projection(target)
@@ -627,7 +680,7 @@ class MemoryStoreV2(MemoryStore):
                 (target, f"%{old_text.lower()}%"),
             ).fetchall()
             if not rows:
-                outcome.update({"success": False, "error": f"No entry matched '{old_text}'."})
+                outcome["no_match"] = True
                 return
             unique = {r["content"] for r in rows}
             if len(unique) > 1:
@@ -644,10 +697,77 @@ class MemoryStoreV2(MemoryStore):
             outcome.update({"success": True})
 
         self._execute_write(_delete)
+        if outcome.get("no_match"):
+            return self._no_match_error("remove", target, old_text)
         if not outcome.get("success"):
             return outcome
         self._rewrite_projection(target)
         return self._success_response(target, "Entry removed.")
+
+    # ------------------------------------------------------------------
+    # v2 write telemetry + error feedback
+    # ------------------------------------------------------------------
+
+    def _success_response(self, target: str, message: str = None) -> Dict[str, Any]:
+        """Success telemetry over the PROMPT projection, not the whole store.
+
+        The inherited v1 response measured every visible entry against the
+        char limit, so a store that had outgrown its prompt read
+        ``"100% — 3,092/2,200 chars"`` — a number the model dutifully
+        "fixed" by deleting searchable entries (live incident 2026-08-19:
+        ~40 memory calls squeezing 3,722 → 2,199 chars, five entries hard-
+        deleted, details surviving only in an Obsidian archive). The v2
+        budget already drops the excess from the prompt automatically, so
+        the honest usage is the projection's size; entries beyond it are
+        reported as cold storage with an explicit do-not-remove instruction.
+        """
+        self._consolidation_failures = 0  # progress resets the per-turn cap (#42405)
+        budgeted, _included, used, visible = self._budget_walk(target)
+        limit = self._char_limit(target)
+        pct = min(100, int((used / limit) * 100)) if limit > 0 else 0
+        evicted = visible - len(budgeted)
+        resp = {
+            "success": True,
+            "done": True,
+            "target": target,
+            "usage": f"{pct}% — {used:,}/{limit:,} chars",
+            "entry_count": visible,
+        }
+        if message:
+            resp["message"] = message
+        if evicted > 0:
+            resp["evicted_to_cold"] = evicted
+            resp["note"] = (
+                f"Write saved. Prompt budget is full: {evicted} of {visible} entries "
+                "live in cold storage — automatically excluded from the prompt, still "
+                "fully searchable via recall. Eviction is automatic; do NOT remove, "
+                "shorten or archive entries to free space. This update is complete — "
+                "do not repeat it."
+            )
+        else:
+            resp["note"] = "Write saved. This update is complete — do not repeat it."
+        return resp
+
+    def _no_match_error(self, action: str, target: str, old_text: str) -> Dict[str, Any]:
+        """No-match error carrying the store's current entries (v1 contract).
+
+        The v2 mutations originally returned a bare ``No entry matched``
+        dict, dropping v1's ``current_entries`` feedback — the model had to
+        re-guess ``old_text`` blind and thrashed on retries (live incident
+        2026-08-20: two failed replaces quoting a document's wording instead
+        of the stored entry text). Restore the entries list and route through
+        the per-turn consolidation-failure cap like v1.
+        """
+        entries = [r["content"] for r in self._visible_rows(target)]
+        return self._consolidation_failure({
+            "success": False,
+            "error": (
+                f"No entry matched '{old_text}'. Check current_entries below and "
+                f"retry with a short unique substring of the exact stored text "
+                f"(to {action})."
+            ),
+            "current_entries": entries,
+        })
 
     # ------------------------------------------------------------------
     # New v2 operations
@@ -676,7 +796,7 @@ class MemoryStoreV2(MemoryStore):
                 (target, f"%{old_text.lower()}%"),
             ).fetchall()
             if not rows:
-                outcome.update({"success": False, "error": f"No entry matched '{old_text}'."})
+                outcome["no_match"] = True
                 return
             unique = {r["content"] for r in rows}
             if len(unique) > 1:
@@ -715,6 +835,8 @@ class MemoryStoreV2(MemoryStore):
             outcome.update({"success": True, "deprecated_content": row["content"][:120]})
 
         self._execute_write(_dep)
+        if outcome.get("no_match"):
+            return self._no_match_error("deprecate", target, old_text)
         if not outcome.get("success"):
             return outcome
         self._rewrite_projection(target)
@@ -774,12 +896,12 @@ class MemoryStoreV2(MemoryStore):
 
         Unlike :meth:`recall` (exact-phrase FTS with whole-substring LIKE
         fallback — precision-oriented, for the tool surface), this is
-        recall-oriented: the query is stem-tokenized (see :func:`_query_stems`)
-        and stems are OR-matched as prefixes, so a full inflected user message
-        ("как ставим зависимостей в новых проектах?") still hits entries
-        ("зависимости..."). Ranking is delegated to the orchestrator's scorer;
-        no access bumping here — the orchestrator bumps only entries that
-        actually enter the context pack.
+        recall-oriented: the query is term-tokenized (see :func:`_query_stems`
+        and :func:`_query_exact_terms`) and terms are OR-matched — long words
+        as prefix stems (so a full inflected user message still hits entries),
+        short domain terms (vpn, vps, dns) as exact tokens. Ranking is
+        delegated to the orchestrator's scorer; no access bumping here — the
+        orchestrator bumps only entries that actually enter the context pack.
 
         ``project`` applies the realm filter for scoped consumers (Phase 3,
         invariant Codex §8.4: no foreign-project memory by lexical accident):
@@ -787,11 +909,12 @@ class MemoryStoreV2(MemoryStore):
         pass. ``None`` sees everything.
         """
         stems = _query_stems(query)
-        if not stems:
+        exact_terms = _query_exact_terms(query)
+        if not stems and not exact_terms:
             return []
-        rows: Optional[List[sqlite3.Row]] = self._fts_search_any(stems)
+        rows: Optional[List[sqlite3.Row]] = self._fts_search_any(stems, exact_terms)
         if rows is None:
-            rows = self._like_search_any(stems)
+            rows = self._like_search_any(stems, exact_terms)
         seen: set = set()
         out: List[Dict[str, Any]] = []
         for r in rows:
@@ -916,6 +1039,18 @@ class MemoryStoreV2(MemoryStore):
             # FTS matches whole tokens only ("персонаж" ≠ "персонажа"), so a
             # zero-hit phrase query falls through to substring search.
             rows = self._like_search(query)
+        if not rows:
+            # Natural-language queries ("репутация сервер для блокировок")
+            # rarely share one contiguous phrase with a stored entry — both
+            # the phrase match and the whole-query substring miss while the
+            # entries exist. Retry recall-oriented (stem/exact OR-search,
+            # the orchestrator's mechanics) before reporting an empty recall.
+            stems = _query_stems(query)
+            exact_terms = _query_exact_terms(query)
+            if stems or exact_terms:
+                rows = self._fts_search_any(stems, exact_terms)
+                if rows is None:
+                    rows = self._like_search_any(stems, exact_terms)
 
         out = []
         for r in rows:
@@ -952,13 +1087,20 @@ class MemoryStoreV2(MemoryStore):
             (f"%{query.lower()}%",),
         )
 
-    def _fts_search_any(self, stems: List[str]) -> Optional[List[sqlite3.Row]]:
-        """FTS5 any-stem prefix OR search; ``None`` → FTS unavailable (fallback).
+    def _fts_search_any(
+        self, stems: List[str], exact_terms: Sequence[str] = (),
+    ) -> Optional[List[sqlite3.Row]]:
+        """FTS5 any-term OR search; ``None`` → FTS unavailable (fallback).
 
         Stems are ``\\w+``-only (see :func:`_query_stems`), so the unquoted
-        ``stem*`` prefix syntax is safe — no FTS metacharacters can smuggle in.
+        ``stem*`` prefix syntax is safe — no FTS metacharacters can smuggle
+        in. Exact short terms are quoted phrases (whole-token match): ``"vpn"``
+        must match the token vpn, never prefix-match ``vpnhub``.
         """
-        match = " OR ".join(f"{s}*" for s in stems)
+        terms = [f"{s}*" for s in stems] + [_fts_quote(t) for t in exact_terms]
+        if not terms:
+            return None
+        match = " OR ".join(terms)
         conn = self._connect()
         try:
             with self._db_lock:
@@ -969,15 +1111,20 @@ class MemoryStoreV2(MemoryStore):
                 ).fetchall()
             return list(rows)
         except sqlite3.OperationalError as exc:
-            logger.debug("memory v2: FTS any-stem search failed (%s); LIKE fallback", exc)
+            logger.debug("memory v2: FTS any-term search failed (%s); LIKE fallback", exc)
             return None
 
-    def _like_search_any(self, stems: List[str]) -> List[sqlite3.Row]:
-        """Substring OR fallback for stem search (FTS5 unavailable/mismatch)."""
-        clauses = " OR ".join("ulower(content) LIKE ?" for _ in stems)
-        params = [f"%{s.lower()}%" for s in stems]
+    def _like_search_any(
+        self, stems: List[str], exact_terms: Sequence[str] = (),
+    ) -> List[sqlite3.Row]:
+        """Substring OR fallback for term search (FTS5 unavailable/mismatch)."""
+        patterns = [f"%{s.lower()}%" for s in stems]
+        patterns.extend(f"%{t.lower()}%" for t in exact_terms)
+        if not patterns:
+            return []
+        clauses = " OR ".join("ulower(content) LIKE ?" for _ in patterns)
         return self._query(
-            f"SELECT * FROM memories WHERE ({clauses}) LIMIT 120", tuple(params),
+            f"SELECT * FROM memories WHERE ({clauses}) LIMIT 120", tuple(patterns),
         )
 
     def _find_related_active(
