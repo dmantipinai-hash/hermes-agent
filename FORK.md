@@ -1,5 +1,7 @@
 # This fork: install, update, and the version story
 
+**Русская версия: [FORK.ru.md](FORK.ru.md).**
+
 This repository is the **dmantipinai-hash fork** of
 [NousResearch/hermes-agent](https://github.com/NousResearch/hermes-agent).
 It carries **Architecture 2.0** — the memory system (v2, with FTS5 search),

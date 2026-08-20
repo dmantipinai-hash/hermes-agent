@@ -1819,6 +1819,7 @@ def _print_fork_update_guidance() -> None:
     print('      git pull && uv pip install -e ".[all]"')
     print()
     print("  See FORK.md in the repository for all install/update paths.")
+    print("  (Russian: FORK.ru.md — русская документация по установке и обновлению.)")
 
 SKIP_UPSTREAM_PROMPT_FILE = ".skip_upstream_prompt"
 

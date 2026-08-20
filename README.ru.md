@@ -124,6 +124,16 @@ supermemory, ...) остаются доступны через `memory.provider`
 
 ### Установка
 
+> **Это форк.** Сначала прочитайте **[FORK.ru.md](FORK.ru.md)**. Коротко:
+> фичи Architecture 2.0 (память v2, доставка сообщений, оркестрация) есть
+> только на линии этого форка — в релизах апстрима и пакете PyPI их нет.
+> `hermes update` в форке отключён (он тянет апстрим и молча сносит
+> архитектуру); обновляйтесь одной командой из FORK.ru.md. Быстрая
+> установка одной командой:
+>
+> - **Windows 10/11 (PowerShell):** `iex (irm https://raw.githubusercontent.com/dmantipinai-hash/hermes-agent/main/scripts/install.ps1)`
+> - **macOS / Linux:** `curl -fsSL https://raw.githubusercontent.com/dmantipinai-hash/hermes-agent/main/scripts/install.sh | bash`
+
 ```bash
 git clone https://github.com/dmantipinai-hash/hermes-agent.git
 cd hermes-agent
@@ -148,6 +158,13 @@ cd hermes-agent
 git pull
 source .venv/bin/activate
 uv pip install -e ".[all]"      # нужно только при изменении зависимостей
+```
+
+Для глобальной (uv tool) установки — одна команда, покрывает любой тип
+установки:
+
+```bash
+uv tool install --force --from "git+https://github.com/dmantipinai-hash/hermes-agent.git" "hermes-agent[all]"
 ```
 
 Release-теги (`v0.16.0`, ...) отмечают стабильные точки — `git checkout
