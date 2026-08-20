@@ -1,43 +1,90 @@
-# Installing and updating THIS fork
+# This fork: install, update, and the version story
 
-This repository is a fork of [NousResearch/hermes-agent](https://github.com/NousResearch/hermes-agent)
-carrying extra features (Architecture 2.0: memory v2 with FTS5, multi-agent
-`/team` orchestration, kanban mailbox, Codex subscription auth, and more).
-Everything below exists because **the obvious install/update paths silently
-give you upstream code instead of this fork**. Read this before installing;
-the upstream README instructions do not all apply here.
+This repository is the **dmantipinai-hash fork** of
+[NousResearch/hermes-agent](https://github.com/NousResearch/hermes-agent).
+It carries **Architecture 2.0** — the memory system (v2, with FTS5 search),
+the fast message-delivery pipeline, and the multi-agent orchestration
+(`/team`, kanban board, agent mailbox) — which does **not exist in any
+upstream release**.
 
-## TL;DR — the three safe paths
+## Version lineage — read this before touching versions
 
-**1. Global tool from this fork's git URL (recommended for users):**
+- The architecture was built on the **v0.16.0** line of this fork and is
+  carried forward **only on this fork's `main`**.
+- Upstream releases **0.17 / 0.18 / 0.19 / 0.20** (the PyPI package, the
+  NousResearch installers, GitHub NousResearch archives) do **not** contain
+  the architecture. Installing or "updating" to them loses the memory
+  system, the message-delivery pipeline, and the orchestration. There is no
+  migration path back except reinstalling the fork.
+- The fork's version string (e.g. `0.20.4`) is inherited from the upstream
+  base the maintainer merged underneath the architecture. It identifies the
+  merge base, **not** "upstream 0.20.4 code". Identify the fork by this
+  repository, never by the version number.
+- Upstream merges into the fork are deliberate, manually-resolved events by
+  the maintainer. They are never automated and never happen through
+  `hermes update`.
+- **`hermes update` is disabled in this fork.** All of its automatic
+  channels resolve to upstream (the PyPI package, the GitHub archive ZIP
+  fallback, the upstream-remote sync) and would silently replace the fork.
+  Running it prints the fork's update command instead.
+
+## Install — one command per platform
+
+**Windows 10/11 (PowerShell):**
+
+```powershell
+iex (irm https://raw.githubusercontent.com/dmantipinai-hash/hermes-agent/main/scripts/install.ps1)
+```
+
+**macOS / Linux:**
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/dmantipinai-hash/hermes-agent/main/scripts/install.sh | bash
+```
+
+**Any OS, if you already have [uv](https://docs.astral.sh/uv/):**
 
 ```bash
 uv tool install --from "git+https://github.com/dmantipinai-hash/hermes-agent.git" "hermes-agent[all]"
-hermes setup
 ```
 
-Update later by re-running the same command with `--force` (pins to the
-current tip of the fork's `main`):
+The installers clone this repository (not NousResearch) and provision uv,
+Python and Node as needed. After installing, run `hermes setup` to pick a
+model and keys.
+
+## Update — one command
+
+The fork updates **from this repository only**. When the maintainer pushes
+improvements to the fork's `main`:
 
 ```bash
 uv tool install --force --from "git+https://github.com/dmantipinai-hash/hermes-agent.git" "hermes-agent[all]"
 ```
 
-**2. Dev checkout (editable venv):**
+If you installed via the platform installer (which leaves a git checkout),
+`hermes update` still works for you — it pulls this fork's repository. The
+uv-tool command above covers every install type regardless.
 
-```bash
-git clone https://github.com/dmantipinai-hash/hermes-agent.git
-cd hermes-agent
-uv venv .venv --python 3.11 && source .venv/bin/activate
-uv pip install -e ".[all]"
-```
+## Traps — do NOT do these
 
-Update with `git pull` (re-run the editable install only when dependencies
-changed). Fine for development — but do **not** point an always-on gateway
-at a checkout you actively merge or rebase: mid-merge breakage flows
-straight into the running agent.
+- **Do not install or update from PyPI.** The `hermes-agent` PyPI package is
+  the upstream release without the architecture. `pip install --upgrade
+  hermes-agent` and `uv tool upgrade hermes-agent` both resolve to it.
+- **Do not use upstream installers.** Anything pointing at
+  `NousResearch/hermes-agent` or `hermes-agent.nousresearch.com` installs
+  upstream. Use the commands above, which point at this fork.
+- **Do not mix installs.** Running upstream hermes against a `~/.hermes`
+  produced by this fork (memory v2 database, fork config keys) is untested
+  and can lose or misread data. Back up `~/.hermes` before switching in
+  either direction.
+- **Do not use an editable dev checkout as your always-on gateway's
+  runtime.** A checkout that is mid-merge or mid-rebase feeds breakage
+  straight into the running agent.
 
-**3. Pinned wheel snapshot (most stable — what the maintainer uses):**
+## Advanced paths
+
+**Pinned wheel snapshot** (most stable — what the maintainer uses; the
+install never changes until you rebuild it):
 
 ```bash
 git clone https://github.com/dmantipinai-hash/hermes-agent.git
@@ -46,35 +93,22 @@ HERMES_NIX_BUILD=1 uv build --wheel -o /tmp/hermes-dist
 uv tool install --force 'hermes-agent[all] @ file:///tmp/hermes-dist/hermes_agent-<VERSION>-py3-none-any.whl'
 ```
 
-A snapshot install never changes until you explicitly rebuild it. To move
-to a newer state: `git pull`, re-run the two commands. `HERMES_NIX_BUILD=1`
-is required — upstream deliberately fails wheel builds without it.
+`HERMES_NIX_BUILD=1` is required — upstream deliberately fails wheel builds
+without it.
 
-## Traps — do NOT do these
+**Development checkout (editable venv):**
 
-- **Do not run `hermes update`.** For pip / uv-tool / pipx installs it
-  upgrades the `hermes-agent` package **from PyPI**, which is the upstream
-  release — it silently replaces this fork and drops every fork feature.
-  Its archive fallback also downloads from NousResearch directly. Update
-  only via the commands above.
-- **Do not use the upstream installers.** `scripts/install.sh`,
-  `scripts/install.ps1`, `scripts/install.cmd`, and
-  `https://hermes-agent.nousresearch.com/install.ps1` hardcode
-  `NousResearch/hermes-agent` — they install upstream, not this fork.
-- **Do not mix installs.** Running upstream hermes against a `~/.hermes`
-  produced by this fork (memory v2 database, fork config keys) is
-  untested and can lose or misread data. Back up `~/.hermes` before
-  switching between fork and upstream in either direction.
-- **Do not use an editable install as your daily driver's runtime.**
-  See path 2 above.
+```bash
+git clone https://github.com/dmantipinai-hash/hermes-agent.git
+cd hermes-agent
+uv venv .venv --python 3.11 && source .venv/bin/activate
+uv pip install -e ".[all]"
+```
 
 ## Notes
 
-- The version string (e.g. `0.20.4`) is inherited from upstream at merge
-  time. It identifies the merge base, not "upstream 0.20.4 code".
 - User data lives in `~/.hermes/` (config.yaml, .env secrets, skills,
-  memories, sessions). Profiles are isolated under
-  `~/.hermes/profiles/<name>/`.
+  memories, sessions). Profiles are isolated under `~/.hermes/profiles/<name>/`.
 - After updating a global install that runs as a service, restart the
   service (e.g. `launchctl kickstart -k gui/$(id -u)/ai.hermes.gateway`).
   Expect a "Gateway shutting down" notification to the home channel —

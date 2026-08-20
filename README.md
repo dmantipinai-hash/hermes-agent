@@ -124,11 +124,11 @@ isolated by `HERMES_HOME` under `~/.hermes/profiles/<name>/`.
 
 ### Install
 
-> **This is a fork.** Before installing or updating, read **[FORK.md](FORK.md)**.
-> In short: do **not** run `hermes update` (it upgrades from PyPI and silently
-> replaces this fork with upstream), and do not use the upstream install
-> scripts or the Windows installer below — they are hardcoded to
-> NousResearch/hermes-agent.
+> **This is a fork.** Read **[FORK.md](FORK.md)** first. In short: the
+> Architecture 2.0 features (memory v2, message delivery, orchestration)
+> exist only on this fork's line — upstream releases and the PyPI package
+> do not have them. `hermes update` is disabled in this fork (it would pull
+> upstream and silently remove them); update with the one command in FORK.md.
 
 ```bash
 git clone https://github.com/dmantipinai-hash/hermes-agent.git
@@ -147,20 +147,15 @@ Or as a global tool without activating a venv:
 uv tool install --from "git+https://github.com/dmantipinai-hash/hermes-agent.git" "hermes-agent[all]"
 ```
 
-**Windows (native, no WSL):**
+**Windows 10/11 (native, no WSL):**
 
 ```powershell
-iex (irm https://hermes-agent.nousresearch.com/install.ps1)
+iex (irm https://raw.githubusercontent.com/dmantipinai-hash/hermes-agent/main/scripts/install.ps1)
 ```
-
-> ⚠️ This installs the **upstream** agent, not this fork — the installer
-> hardcodes NousResearch/hermes-agent. Fork users on Windows: use the
-> git-clone or wheel paths from [FORK.md](FORK.md) instead.
 
 The installer handles everything: uv, Python 3.11, Node.js, ripgrep,
 ffmpeg, and a portable Git Bash (MinGit — no admin required, isolated
-from any system Git install). See the upstream
-[Windows guide](https://hermes-agent.nousresearch.com/docs) for details.
+from any system Git install) — installing **this fork**, not upstream.
 
 **Updating:**
 

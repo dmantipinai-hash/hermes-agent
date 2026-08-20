@@ -10,6 +10,17 @@ import pytest
 from hermes_cli.main import cmd_update, PROJECT_ROOT
 
 
+@pytest.fixture(autouse=True)
+def _upstream_mechanics_mode(monkeypatch):
+    """The fork build disables the upstream update channels (PyPI, archive
+    ZIP fallback — see FORK.md); these tests exercise the mechanics
+    underneath, which future upstream merges must keep working. Neutralize
+    the fork marker for the duration of each test."""
+    from hermes_cli import update_cmd
+
+    monkeypatch.setattr(update_cmd, "FORK_REPO_URL", None)
+
+
 def _make_run_side_effect(branch="main", verify_ok=True, commit_count="0"):
     """Build a side_effect function for subprocess.run that simulates git commands."""
 

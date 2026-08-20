@@ -17,6 +17,15 @@ import sys
 __version__ = "0.20.4"
 __release_date__ = "2026.8.18"
 
+# Fork marker: this tree is the dmantipinai-hash Hermes fork — Architecture 2.0
+# (memory v2 with FTS5, message delivery, multi-agent orchestration) built on
+# the v0.16 line and carried forward on top of upstream merges. Every automatic
+# update channel (the PyPI package, the GitHub archive ZIP fallback, the
+# upstream-remote sync) resolves to the upstream NousResearch release and would
+# silently replace the fork architecture; they are disabled while this marker
+# is present. FORK.md documents the fork's own install/update commands.
+FORK_REPO_URL = "https://github.com/dmantipinai-hash/hermes-agent.git"
+
 
 def _ensure_utf8():
     """Force UTF-8 stdout/stderr to prevent UnicodeEncodeError crashes.

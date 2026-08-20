@@ -36,6 +36,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
+from hermes_cli import FORK_REPO_URL
 from hermes_cli.config import get_hermes_home
 from hermes_constants import venv_python_path
 
@@ -1079,6 +1080,13 @@ def _update_via_zip(args, *, had_desktop_app_before_update: bool = False) -> boo
 
     Returns ``False`` when a Desktop rebuild ran and failed; ``True`` otherwise.
     """
+    if FORK_REPO_URL:
+        # The archive URL below points at the upstream repo — for the fork it
+        # would replace the tree with upstream code. Refuse before anything
+        # is downloaded.
+        _print_fork_update_guidance()
+        sys.exit(1)
+
     active_tool_dependencies = _m()._capture_active_tool_dependencies()
 
     import tempfile
@@ -1794,6 +1802,24 @@ OFFICIAL_REPO_URLS = {
 
 OFFICIAL_REPO_URL = "https://github.com/NousResearch/hermes-agent.git"
 
+
+def _print_fork_update_guidance() -> None:
+    """Explain why the automatic update was refused and how to update the fork."""
+    print("✗ Update refused: this install is the dmantipinai-hash Hermes fork")
+    print("  (Architecture 2.0). `hermes update` would pull the upstream")
+    print("  NousResearch release and silently remove the fork's architecture")
+    print("  (memory v2, message delivery, multi-agent orchestration).")
+    print()
+    print("  Update the fork instead — pick the line matching your install:")
+    print()
+    print("    global tool (macOS / Linux / Windows):")
+    print('      uv tool install --force --from "git+https://github.com/dmantipinai-hash/hermes-agent.git" "hermes-agent[all]"')
+    print()
+    print("    local development checkout:")
+    print('      git pull && uv pip install -e ".[all]"')
+    print()
+    print("  See FORK.md in the repository for all install/update paths.")
+
 SKIP_UPSTREAM_PROMPT_FILE = ".skip_upstream_prompt"
 
 def _get_origin_url(git_cmd: list[str], cwd: Path) -> Optional[str]:
@@ -1908,6 +1934,12 @@ def _sync_with_upstream_if_needed(git_cmd: list[str], cwd: Path) -> None:
     - If origin/main is strictly behind upstream/main, pull from upstream
     - Try to sync fork back to origin if possible
     """
+    if FORK_REPO_URL:
+        # In this tree the fork IS the product line. Upstream merges are
+        # deliberate, manually-resolved events done by the maintainer (see
+        # FORK.md) — never an automatic ff-pull after a routine update.
+        return
+
     has_upstream = _has_upstream_remote(git_cmd, cwd)
 
     if not has_upstream:
@@ -2785,7 +2817,11 @@ def _cmd_update_check(branch: str = "main", *, branch_explicit: bool = False):
     )
     depth_args = ["--depth", "1"] if is_shallow else []
 
-    if branch == "main":
+    if branch == "main" and not FORK_REPO_URL:
+        # Fork builds always fall through to the origin compare below: the
+        # canonical reference for this tree is the fork's own repository, and
+        # "behind upstream/main" would push users toward the channel that
+        # removes the fork architecture (see FORK.md).
         # Probe locally (~6 ms) whether an 'upstream' remote exists at all
         # before spending a network fetch on it. Non-fork installs have no
         # 'upstream' remote, and the old flow burned a failed network attempt
@@ -4646,6 +4682,13 @@ def _rebuild_desktop_after_update(
 
 def _cmd_update_pip(args):
     """Update Hermes via pip/uv-tool/pipx (for PyPI installs)."""
+    if FORK_REPO_URL:
+        # `uv tool upgrade` / `pip install --upgrade` resolve the bare
+        # `hermes-agent` name against PyPI, which is the upstream release —
+        # for the fork that is a silent downgrade that drops Architecture 2.0.
+        _print_fork_update_guidance()
+        sys.exit(1)
+
     from hermes_cli import __version__
     from hermes_cli.config import is_uv_tool_install
 

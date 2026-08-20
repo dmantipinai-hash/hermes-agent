@@ -16,6 +16,17 @@ from unittest.mock import patch
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _upstream_mechanics_mode(monkeypatch):
+    """The fork build disables the upstream archive-ZIP update channel (it
+    downloads the NousResearch tree — see FORK.md); these tests exercise the
+    zip-slip defenses underneath, which future upstream merges must keep
+    working. Neutralize the fork marker for the duration of each test."""
+    from hermes_cli import update_cmd
+
+    monkeypatch.setattr(update_cmd, "FORK_REPO_URL", None)
+
+
 def _build_zip_with_symlink_member(zip_path: str, link_name: str, target: str) -> None:
     """Write a ZIP containing a single member with S_IFLNK mode bits set."""
     with zipfile.ZipFile(zip_path, "w") as zf:

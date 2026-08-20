@@ -20,6 +20,17 @@ from unittest.mock import patch
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _upstream_mechanics_mode(monkeypatch):
+    """The fork build disables the PyPI update channel (it resolves to the
+    upstream release — see FORK.md); these tests exercise the subprocess
+    mechanics underneath, which future upstream merges must keep working.
+    Neutralize the fork marker for the duration of each test."""
+    from hermes_cli import update_cmd
+
+    monkeypatch.setattr(update_cmd, "FORK_REPO_URL", None)
+
+
 # ---------------------------------------------------------------------------
 # is_uv_tool_install
 # ---------------------------------------------------------------------------

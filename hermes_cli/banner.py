@@ -65,7 +65,7 @@ def _skin_color(key: str, fallback: str) -> str:
 # ASCII Art & Branding
 # =========================================================================
 
-from hermes_cli import __version__ as VERSION, __release_date__ as RELEASE_DATE
+from hermes_cli import FORK_REPO_URL, __version__ as VERSION, __release_date__ as RELEASE_DATE
 
 HERMES_AGENT_LOGO = """[bold #FFD700]██╗  ██╗███████╗██████╗ ███╗   ███╗███████╗███████╗       █████╗  ██████╗ ███████╗███╗   ██╗████████╗[/]
 [bold #FFD700]██║  ██║██╔════╝██╔══██╗████╗ ████║██╔════╝██╔════╝      ██╔══██╗██╔════╝ ██╔════╝████╗  ██║╚══██╔══╝[/]
@@ -480,8 +480,11 @@ def check_for_updates() -> Optional[int]:
         if not (repo_dir / ".git").exists():
             # No git checkout and no embedded revision — Docker/apt installs
             # are short-circuited above; what remains is a pip/pipx/uv-tool
-            # install, where PyPI IS the source of truth.
-            behind = check_via_pypi()
+            # install, where PyPI IS the source of truth. Fork builds are the
+            # exception: PyPI carries only the upstream release, so a "behind"
+            # count would nag users toward a channel that removes the fork
+            # architecture (see FORK.md). None = show no banner.
+            behind = None if FORK_REPO_URL else check_via_pypi()
         else:
             behind = _check_via_local_git(repo_dir)
 
