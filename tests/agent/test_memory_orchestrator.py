@@ -645,9 +645,33 @@ def e2e_env():
     with open(os.path.join(hermes_home, "config.yaml"), "w", encoding="utf-8") as f:
         f.write("memory:\n  memory_char_limit: 200\n")
 
-    for mod in list(sys.modules):
-        if mod == "run_agent" or mod.startswith("agent.") or mod.startswith("tools.") or mod.startswith("hermes_"):
-            del sys.modules[mod]
+    # Purge so the re-import below resolves path/state against the isolated
+    # HERMES_HOME. Snapshot first and restore in teardown: without the
+    # restore, every purged module comes back as a NEW object in sys.modules,
+    # splitting module identity for the rest of the process — later tests
+    # that patch e.g. agent.context_compressor while holding classes imported
+    # at collection time patch the new namespace while the old class resolves
+    # its globals in the old one, so the patch never intercepts (issue class
+    # #61597; observed as 7 phantom failures in joint single-process runs:
+    # test_pre_compress_memory_context ×4, test_post_compression_trim,
+    # test_models_dev ×2 — green solo, red together).
+    #
+    # The purge must take the whole namespace ROOTS (bare ``agent``/``tools``
+    # packages included), not just dotted submodules: a surviving parent
+    # package gets its submodule attributes overwritten by the re-import
+    # (``agent.models_dev = new_module``), and ``import a.b as m`` resolves
+    # through that attribute while ``from a.b import f`` goes through
+    # sys.modules — restoring sys.modules alone leaves the two disagreeing.
+    # Purging the roots means every surviving object stays untouched.
+    def _purged(name: str) -> bool:
+        if name == "run_agent":
+            return True
+        root = name.split(".", 1)[0]
+        return root in ("agent", "tools") or name.startswith("hermes_")
+
+    _saved_modules = {n: m for n, m in sys.modules.items() if _purged(n)}
+    for mod in [n for n in sys.modules if _purged(n)]:
+        del sys.modules[mod]
 
     from run_agent import AIAgent
 
@@ -664,6 +688,7 @@ def e2e_env():
     finally:
         srv.shutdown()
         shutil.rmtree(test_home, ignore_errors=True)
+        sys.modules.update(_saved_modules)
         if prev_home is None:
             os.environ.pop("HERMES_HOME", None)
         else:
