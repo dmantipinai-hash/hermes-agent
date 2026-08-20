@@ -183,3 +183,181 @@ class TestNoMatchFeedback:
         # thrash can never block the reply (#42405).
         assert any(r.get("done") and "Stop retrying" in r.get("error", "")
                    for r in responses)
+
+
+class TestSupersedesProvenance:
+    """P1: 1-hop link-aware recall — the decision trajectory, not just the final.
+
+    Chain fixture: A («не используем Docker») ← B («Docker разрешён…») ←
+    C («Docker обязателен…»), built through the only existing write path
+    (deprecate + «superseded by:» marker).
+    """
+
+    OLD = "Хостинг: не используем Docker — тяжело для сервера"
+    MID = "Хостинг: Docker разрешён на выделенном узле"
+    NEW = "Хостинг: Docker обязателен для всех сервисов"
+
+    def _seed_chain(self, store, depth=2):
+        store.add("memory", self.OLD, entry_type="decision", importance=0.8)
+        store.add("memory", self.MID, entry_type="decision", importance=0.85)
+        store.deprecate("memory", "не используем Docker",
+                        reason=f"superseded by: {self.MID}")
+        if depth == 3:
+            store.add("memory", self.NEW, entry_type="decision", importance=0.9)
+            store.deprecate("memory", "Docker разрешён",
+                            reason=f"superseded by: {self.NEW}")
+
+    def test_recall_shows_superseded_neighbor(self, store):
+        self._seed_chain(store)
+        r = store.recall("Docker разрешён")
+        assert r["count"] == 1
+        sup = r["results"][0].get("supersedes")
+        assert sup, "active successor must surface what it superseded"
+        assert "не используем Docker" in sup[0]["content"]
+        assert sup[0]["status"] == "deprecated"
+
+    def test_no_neighbors_output_unchanged(self, store):
+        store.add("memory", "Одиночная запись без истории замен")
+        r = store.recall("Одиночная запись")
+        assert r["count"] == 1
+        assert "supersedes" not in r["results"][0]
+        pack = MemoryOrchestrator(store).build_pack("одиночная запись без истории")
+        assert "supersedes" not in pack
+
+    def test_one_hop_only_no_transitive_pull(self, store):
+        self._seed_chain(store, depth=3)
+        r = store.recall("Docker обязателен")
+        assert r["count"] == 1
+        sup = r["results"][0]["supersedes"]
+        assert len(sup) == 1
+        assert "Docker разрешён" in sup[0]["content"]
+        # A (the neighbor's neighbor) must not ride along.
+        assert all("не используем Docker" not in n["content"] for n in sup)
+
+    def test_pack_renders_provenance_line(self, store):
+        self._seed_chain(store)
+        pack = MemoryOrchestrator(store).build_pack("как мы относимся к Docker на хостинге?")
+        assert "[supersedes:" in pack
+        assert "не используем Docker" in pack
+
+    def test_write_path_unchanged_by_p1(self, store):
+        # Only the marker path creates links; plain deprecate and replace
+        # must keep writing none (write-path expansion is separate work).
+        store.add("memory", self.OLD, entry_type="decision")
+        store.add("memory", self.MID, entry_type="decision")
+        store.deprecate("memory", "не используем Docker", reason="просто передумали")
+        assert store._query("SELECT COUNT(*) AS c FROM memory_links")[0]["c"] == 0
+        store.replace("memory", "Docker разрешён", "Хостинг: Docker разрешён везде")
+        assert store._query("SELECT COUNT(*) AS c FROM memory_links")[0]["c"] == 0
+
+
+class TestEvictionDemotion:
+    """P6 remainder: evicted entries demote importance, stay active + findable."""
+
+    def test_evicted_demoted_below_in_prompt_minimum(self, mem_dir):
+        s = MemoryStoreV2(memory_char_limit=200)
+        s.load_from_disk()
+        s.add("memory", "Важное правило один " + "а" * 80, importance=0.9)
+        s.add("memory", "Второй факт средний " + "б" * 80, importance=0.6)
+        r = s.add("memory", "Хвостовая запись " + "в" * 80, importance=0.5)
+        try:
+            assert r["success"] and r.get("evicted_to_cold") == 1
+            rows = s._query("SELECT content, importance, status FROM memories")
+            walk = s._budget_walk("memory")
+            in_prompt = [row for row in rows if row["content"] in walk.included_contents]
+            evicted = [row for row in rows if row["content"] not in walk.included_contents]
+            assert len(evicted) == 1 and len(in_prompt) == 2
+            # The evicted entry ranks below everything still in the prompt...
+            assert evicted[0]["importance"] < min(
+                row["importance"] for row in in_prompt
+            )
+            # ...stays active and remains searchable (cold tier, not garbage).
+            assert evicted[0]["status"] == "active"
+            probe = evicted[0]["content"][:12]
+            assert s.recall(probe)["count"] == 1
+        finally:
+            s.close()
+
+    def test_demotion_is_monotonic_never_raises(self, mem_dir):
+        s = MemoryStoreV2(memory_char_limit=200)
+        s.load_from_disk()
+        s.add("memory", "Опорное правило один " + "а" * 80, importance=0.9)
+        s.add("memory", "Хвостовая запись " + "в" * 80, importance=0.5)
+
+        def imp_of(prefix):
+            return [
+                row for row in s._query("SELECT content, importance FROM memories")
+                if row["content"].startswith(prefix)
+            ][0]["importance"]
+
+        try:
+            first = imp_of("Хвостовая запись")
+            # A second overflow write recomputes the ceiling — MIN() must
+            # never raise the already-demoted entry back up.
+            s.add("memory", "Ещё одна хвостовая " + "г" * 80, importance=0.4)
+            assert imp_of("Хвостовая запись") <= first
+        finally:
+            s.close()
+
+
+class TestRecallAuditLog:
+    """P3: the recall funnel is observable; one switch gates both channels."""
+
+    def _log_rows(self, store, channel=None):
+        rows = store._query("SELECT * FROM memory_recall_log")
+        return [r for r in rows if channel is None or r["channel"] == channel]
+
+    def test_recall_logs_memory_read_channel(self, store):
+        store.add("memory", "Запись для аудита поиска")
+        store.recall("аудит поиска")
+        rows = self._log_rows(store, "memory-read")
+        assert rows and rows[-1]["outcome_nonempty"] == 1
+
+    def test_pack_logs_auto_pack_channel_with_funnel(self, store):
+        store.add("memory", "Решение про канбан-доску диспетчеризации")
+        MemoryOrchestrator(store).build_pack("как там канбан-доска устроена?")
+        rows = self._log_rows(store, "auto-pack")
+        assert rows and rows[-1]["outcome_nonempty"] == 1
+        # The funnel is visible: retrieval ≥ selection ≥ 1.
+        assert rows[-1]["candidates_before_score"] >= rows[-1]["candidates_after_score"] >= 1
+
+    def test_empty_pack_is_logged_too(self, store):
+        MemoryOrchestrator(store).build_pack("абракадабра незнакомая тема")
+        assert any(
+            r["channel"] == "auto-pack" and not r["outcome_nonempty"]
+            for r in self._log_rows(store)
+        ), "empty funnel is itself the metric — must be audited"
+
+    def test_disabled_gate_writes_nothing(self, mem_dir):
+        s = MemoryStoreV2(recall_log_enabled=False)
+        s.load_from_disk()
+        s.add("memory", "Запись при выключенном аудите")
+        s.recall("выключенном аудите")
+        MemoryOrchestrator(s).build_pack("выключенный аудит")
+        try:
+            assert self._log_rows(s) == []
+        finally:
+            s.close()
+
+    def test_summary_aggregates_and_prune_removes_old_rows(self, mem_dir):
+        s = MemoryStoreV2()
+        s.load_from_disk()
+        s.add("memory", "Часто всплывающая запись про поиск аудита")
+        for _ in range(3):
+            s.recall("поиск аудита")
+        try:
+            summary = s.recall_log_summary(days=7)
+            assert summary["total_recalls"] == 3
+            assert summary["nonempty_recalls"] == 3
+            assert summary["by_channel"]["memory-read"]["total"] == 3
+            assert summary["top_accessed"][0]["access_count"] >= 3
+            # Fresh rows survive a prune; forced-ancient rows do not.
+            assert s.prune_recall_log(keep_days=1) == 0
+            s._execute_write(
+                lambda conn: conn.execute(
+                    "UPDATE memory_recall_log SET ts='2020-01-01T00:00:00+00:00'"
+                )
+            )
+            assert s.prune_recall_log(keep_days=1) == 3
+        finally:
+            s.close()

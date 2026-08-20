@@ -50,4 +50,19 @@ def build_memory_parser(subparsers, *, cmd_memory: Callable) -> None:
         default="all",
         help="Which store to reset: 'all' (default), 'memory', or 'user'",
     )
+    _report_parser = memory_sub.add_parser(
+        "report",
+        help="Memory health digest from the recall-audit log (Phase-4 P3)",
+    )
+    _report_parser.add_argument(
+        "--days",
+        type=int,
+        default=7,
+        help="Window to aggregate (default: 7)",
+    )
+    _report_parser.add_argument(
+        "--prune",
+        action="store_true",
+        help="Also drop audit rows older than memory.recall_log.retain_days",
+    )
     memory_parser.set_defaults(func=cmd_memory)

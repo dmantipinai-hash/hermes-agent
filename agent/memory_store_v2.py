@@ -39,9 +39,9 @@ import sqlite3
 import threading
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, NamedTuple, Optional, Sequence, Tuple
 
 from tools.memory_tool import (
     ENTRY_DELIMITER,
@@ -93,6 +93,22 @@ CREATE TABLE IF NOT EXISTS memory_links (
     created_at TEXT NOT NULL,
     PRIMARY KEY (source_id, target_id, relation_type)
 );
+
+-- Recall-audit log (Phase-4 P3): one row per memory recall, written by the
+-- orchestrator (channel='auto-pack') and the explicit read (channel=
+-- 'memory-read'). Feeds `hermes memory report`; volume is tiny (hundreds of
+-- rows/month). "channel" — "trigger" is a reserved word in SQLite.
+CREATE TABLE IF NOT EXISTS memory_recall_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts TEXT NOT NULL,
+    channel TEXT NOT NULL,
+    intent TEXT,
+    query_stems TEXT,
+    candidates_before_score INTEGER NOT NULL DEFAULT 0,
+    candidates_after_score INTEGER NOT NULL DEFAULT 0,
+    outcome_nonempty INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_memory_recall_log_ts ON memory_recall_log(ts);
 
 CREATE TABLE IF NOT EXISTS meta (
     key TEXT PRIMARY KEY,
@@ -228,6 +244,7 @@ class MemoryStoreV2(MemoryStore):
         memory_char_limit: int = 2200,
         user_char_limit: int = 1375,
         db_path: Optional[Path] = None,
+        recall_log_enabled: bool = True,
     ):
         super().__init__(memory_char_limit, user_char_limit)
         # db_path defaults next to MEMORY.md (path via the parent helper so
@@ -237,6 +254,9 @@ class MemoryStoreV2(MemoryStore):
         )
         self._db_lock = threading.Lock()
         self._conn: Optional[sqlite3.Connection] = None
+        # Recall-audit gate (memory.recall_log.enabled) — single switch for
+        # both channels; the store is the one place that knows it.
+        self._recall_log_enabled = bool(recall_log_enabled)
         # Contents of the entries currently included in the frozen prompt
         # snapshot (per target, original content strings) — the Phase-2
         # orchestrator dedupes its per-turn context pack against this set.
@@ -460,38 +480,89 @@ class MemoryStoreV2(MemoryStore):
         the system prompt.
         """
         for target in ("memory", "user"):
-            budgeted, included, _used, _visible = self._budget_walk(target)
-            self._snapshot_entry_contents[target] = included
+            walk = self._budget_walk(target)
+            self._snapshot_entry_contents[target] = walk.included_contents
             sanitized = self._sanitize_entries_for_snapshot(
-                budgeted, "MEMORY.md" if target == "memory" else "USER.md"
+                walk.texts, "MEMORY.md" if target == "memory" else "USER.md"
             )
             self._system_prompt_snapshot[target] = self._render_block(target, sanitized)
 
-    def _budget_walk(self, target: str) -> Tuple[List[str], set, int, int]:
-        """One budget pass over the visible rows.
+    class _ProjectionWalk(NamedTuple):
+        """One budget pass over the visible rows (see :meth:`_budget_walk`)."""
 
-        Returns ``(rendered_texts, included_contents, used_chars,
-        visible_count)`` — the single source of the projection ordering and
-        cost math, shared by :meth:`_rebuild_snapshot` (which freezes the
-        prompt block) and the v2 write telemetry, so the usage a memory
-        write reports is by construction what the next session's snapshot
-        will contain. Read-only: never mutates the frozen snapshot, so
-        calling it mid-session cannot break the prompt-cache invariant.
+        texts: List[str]                      # rendered entries included in the prompt
+        included_contents: set                # their original content strings
+        evicted_ids: List[str]                # visible rows dropped by the budget
+        used: int                             # chars the projection costs
+        visible: int                          # visible rows walked
+        min_included_importance: Optional[float]  # lowest importance still in-prompt
+
+    def _budget_walk(self, target: str) -> "_ProjectionWalk":
+        """Single source of the projection ordering and cost math.
+
+        Shared by :meth:`_rebuild_snapshot` (freezes the prompt block), the
+        v2 write telemetry (so the usage a memory write reports is by
+        construction what the next session's snapshot will contain), and
+        :meth:`_demote_evicted` (P6 ordering hygiene). Read-only: never
+        mutates the frozen snapshot, so calling it mid-session cannot break
+        the prompt-cache invariant.
         """
         rows = self._visible_rows(target)
         limit = self._char_limit(target)
-        budgeted: List[str] = []
-        included: set = set()
+        texts: List[str] = []
+        included_contents: set = set()
+        evicted_ids: List[str] = []
         used = 0
+        min_importance: Optional[float] = None
         for row in rows:
             text = self._render_entry_for_prompt(row)
-            cost = len(text) + (len(ENTRY_DELIMITER) if budgeted else 0)
-            if budgeted and used + cost > limit:
-                continue  # entry stays in store, drops out of prompt
-            budgeted.append(text)
-            included.add(row["content"])
+            cost = len(text) + (len(ENTRY_DELIMITER) if texts else 0)
+            if texts and used + cost > limit:
+                evicted_ids.append(row["id"])  # stays in store, drops out of prompt
+                continue
+            texts.append(text)
+            included_contents.add(row["content"])
             used += cost
-        return budgeted, included, used, len(rows)
+            imp = row["importance"]
+            min_importance = imp if min_importance is None else min(min_importance, imp)
+        return self._ProjectionWalk(
+            texts, included_contents, evicted_ids, used, len(rows), min_importance,
+        )
+
+    def _demote_evicted(self, target: str) -> int:
+        """Demote entries the prompt budget just evicted (P6 remainder).
+
+        One UPDATE over the evicted ids: importance drops to at most half
+        the minimum importance still inside the prompt (floor 0.05). This
+        keeps future snapshot orderings stable — an evicted entry can no
+        longer out-rank an in-prompt entry and flip back in when a
+        same-importance entry arrives. ``MIN(importance, ceiling)`` makes
+        it monotonic: already-demoted rows are never raised, and repeated
+        overflows converge instead of compounding. Status, searchability
+        and ``updated_at`` are untouched — this is ordering hygiene, not
+        degradation. Returns the number of rows actually lowered.
+        """
+        walk = self._budget_walk(target)
+        if not walk.evicted_ids or walk.min_included_importance is None:
+            return 0
+        ceiling = max(0.05, round(walk.min_included_importance / 2, 3))
+        changed = {"n": 0}
+
+        def _demote(conn: sqlite3.Connection) -> None:
+            placeholders = ",".join("?" * len(walk.evicted_ids))
+            cur = conn.execute(
+                f"UPDATE memories SET importance = MIN(importance, ?)"
+                f" WHERE id IN ({placeholders}) AND importance > ?",
+                (ceiling, *walk.evicted_ids, ceiling),
+            )
+            changed["n"] = cur.rowcount
+
+        try:
+            self._execute_write(_demote)
+        except sqlite3.Error as exc:  # best-effort — never fail a write on demotion
+            logger.debug("memory v2: eviction demotion failed: %s", exc)
+            return 0
+        return int(changed["n"])
 
     @staticmethod
     def _render_entry_for_prompt(row: sqlite3.Row) -> str:
@@ -578,6 +649,7 @@ class MemoryStoreV2(MemoryStore):
             return self._success_response(target, "Entry already exists (no duplicate added).")
 
         self._rewrite_projection(target)
+        self._demote_evicted(target)
         resp = self._success_response(target, f"Entry added (type={entry_type}).")
 
         # Contradiction hint: for standing decisions/rules, surface similar
@@ -658,6 +730,7 @@ class MemoryStoreV2(MemoryStore):
         if not outcome.get("success"):
             return outcome
         self._rewrite_projection(target)
+        self._demote_evicted(target)
         return self._success_response(target, "Entry replaced.")
 
     def remove(self, target: str, old_text: str) -> Dict[str, Any]:
@@ -722,23 +795,23 @@ class MemoryStoreV2(MemoryStore):
         reported as cold storage with an explicit do-not-remove instruction.
         """
         self._consolidation_failures = 0  # progress resets the per-turn cap (#42405)
-        budgeted, _included, used, visible = self._budget_walk(target)
+        walk = self._budget_walk(target)
         limit = self._char_limit(target)
-        pct = min(100, int((used / limit) * 100)) if limit > 0 else 0
-        evicted = visible - len(budgeted)
+        pct = min(100, int((walk.used / limit) * 100)) if limit > 0 else 0
+        evicted = walk.visible - len(walk.texts)
         resp = {
             "success": True,
             "done": True,
             "target": target,
-            "usage": f"{pct}% — {used:,}/{limit:,} chars",
-            "entry_count": visible,
+            "usage": f"{pct}% — {walk.used:,}/{limit:,} chars",
+            "entry_count": walk.visible,
         }
         if message:
             resp["message"] = message
         if evicted > 0:
             resp["evicted_to_cold"] = evicted
             resp["note"] = (
-                f"Write saved. Prompt budget is full: {evicted} of {visible} entries "
+                f"Write saved. Prompt budget is full: {evicted} of {walk.visible} entries "
                 "live in cold storage — automatically excluded from the prompt, still "
                 "fully searchable via recall. Eviction is automatic; do NOT remove, "
                 "shorten or archive entries to free space. This update is complete — "
@@ -862,24 +935,37 @@ class MemoryStoreV2(MemoryStore):
             return {"success": False, "error": "query cannot be empty."}
 
         rows = self._search_rows(query, target, types, status, limit)
+        neighbors: Dict[str, List[Dict[str, Any]]] = {}
         if rows:
             self._bump_access([r["id"] for r in rows])
+            neighbors = self.supersedes_neighbors([r["id"] for r in rows])
+        self.log_recall(
+            "memory-read", None,
+            _query_stems(query) + _query_exact_terms(query),
+            len(rows), len(rows), bool(rows),
+        )
+
+        results = []
+        for r in rows:
+            item = {
+                "id": r["id"],
+                "target": r["target"],
+                "type": r["type"],
+                "status": r["status"],
+                "importance": r["importance"],
+                "content": r["content"],
+            }
+            # Provenance rides along only when present, so link-free stores
+            # produce byte-identical output to the pre-P1 surface.
+            if neighbors.get(r["id"]):
+                item["supersedes"] = neighbors[r["id"]]
+            results.append(item)
 
         return {
             "success": True,
             "query": query,
-            "results": [
-                {
-                    "id": r["id"],
-                    "target": r["target"],
-                    "type": r["type"],
-                    "status": r["status"],
-                    "importance": r["importance"],
-                    "content": r["content"],
-                }
-                for r in rows
-            ],
-            "count": len(rows),
+            "results": results,
+            "count": len(results),
         }
 
     # ------------------------------------------------------------------
@@ -929,6 +1015,52 @@ class MemoryStoreV2(MemoryStore):
             out.append(dict(r))
             if len(out) >= max(1, int(limit)):
                 break
+        # 1-hop supersedes provenance (P1): the recalled trajectory, not just
+        # the final state — what each entry replaced, and when it was decided.
+        neighbors = self.supersedes_neighbors([c["id"] for c in out])
+        for cand in out:
+            if neighbors.get(cand["id"]):
+                cand["supersedes"] = neighbors[cand["id"]]
+        return out
+
+    def supersedes_neighbors(
+        self, row_ids: Sequence[str],
+    ) -> Dict[str, List[Dict[str, Any]]]:
+        """1-hop ``supersedes`` predecessors for the given rows (P1).
+
+        One JOIN of ``memory_links`` restricted to the given ids — a
+        neighbor's own neighbors are deliberately NOT followed (graph
+        traversal is a roadmap non-goal; for <10K rows the written links are
+        all a reader needs). Returns ``{row_id: [neighbor, ...]}`` with only
+        the rows that actually supersede something; capped at 3 predecessors
+        per row. Empty dict when the link table is empty — callers attach the
+        data only when present so link-free stores render identically.
+        """
+        ids = [rid for rid in (row_ids or []) if rid]
+        if not ids:
+            return {}
+        placeholders = ",".join("?" * len(ids))
+        rows = self._query(
+            "SELECT l.source_id AS sid, m.id AS nid, m.content AS ncontent,"
+            " m.status AS nstatus, m.created_at AS ncreated, l.created_at AS linked"
+            f" FROM memory_links l JOIN memories m ON m.id = l.target_id"
+            f" WHERE l.relation_type='supersedes' AND l.source_id IN ({placeholders})"
+            " ORDER BY datetime(l.created_at) DESC",
+            tuple(ids),
+        )
+        out: Dict[str, List[Dict[str, Any]]] = {}
+        for r in rows:
+            entry = {
+                "id": r["nid"],
+                "short_id": r["nid"][:8],
+                "content": r["ncontent"][:160],
+                "status": r["nstatus"],
+                "created_at": r["ncreated"],
+                "linked_at": r["linked"],
+            }
+            bucket = out.setdefault(r["sid"], [])
+            if len(bucket) < 3:
+                bucket.append(entry)
         return out
 
     def rollback_consumer(self, written_by: str, reason: str = "") -> Dict[str, Any]:
@@ -991,6 +1123,115 @@ class MemoryStoreV2(MemoryStore):
     def bump_access(self, row_ids: List[str]) -> None:
         """Record retrieval usage (public wrapper for the orchestrator)."""
         self._bump_access(row_ids)
+
+    # ------------------------------------------------------------------
+    # Recall-audit log (Phase-4 P3 — observability)
+    # ------------------------------------------------------------------
+
+    def log_recall(
+        self,
+        channel: str,
+        intent: Optional[str],
+        terms: Sequence[str],
+        candidates_before_score: int,
+        candidates_after_score: int,
+        outcome_nonempty: bool,
+    ) -> None:
+        """Append one recall-audit row. Best-effort, never raises (P3).
+
+        Called by the orchestrator (``auto-pack``) and :meth:`recall`
+        (``memory-read``). No-ops when ``memory.recall_log.enabled`` is false.
+        """
+        if not self._recall_log_enabled:
+            return
+
+        def _append(conn: sqlite3.Connection) -> None:
+            conn.execute(
+                "INSERT INTO memory_recall_log(ts, channel, intent, query_stems,"
+                " candidates_before_score, candidates_after_score, outcome_nonempty)"
+                " VALUES (?,?,?,?,?,?,?)",
+                (
+                    _now(), str(channel or "?"), intent or None,
+                    " ".join(str(t) for t in (terms or []))[:200] or None,
+                    int(candidates_before_score or 0),
+                    int(candidates_after_score or 0),
+                    1 if outcome_nonempty else 0,
+                ),
+            )
+
+        try:
+            self._execute_write(_append)
+        except sqlite3.Error as exc:  # never fail a recall on its audit trail
+            logger.debug("memory v2: recall log append failed: %s", exc)
+
+    def recall_log_summary(self, days: int = 7, stale_days: int = 30) -> Dict[str, Any]:
+        """Aggregate the recall log into a health digest (P3).
+
+        The key metric is "knew but stayed silent": an empty outcome whose
+        query terms recur. After the B′ fix an empty recall for a term that
+        IS stored is an event worth investigating, not the norm.
+        """
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=max(1, int(days)))).isoformat(timespec="seconds")
+        rows = self._query(
+            "SELECT channel, intent, query_stems, candidates_before_score,"
+            " candidates_after_score, outcome_nonempty FROM memory_recall_log"
+            " WHERE ts >= ? ORDER BY ts",
+            (cutoff,),
+        )
+        by_channel: Dict[str, Dict[str, int]] = {}
+        empty_queries: Dict[str, int] = {}
+        had_candidates_but_empty = 0
+        for r in rows:
+            bucket = by_channel.setdefault(r["channel"], {"total": 0, "nonempty": 0})
+            bucket["total"] += 1
+            bucket["nonempty"] += r["outcome_nonempty"]
+            if not r["outcome_nonempty"]:
+                if r["candidates_before_score"]:
+                    had_candidates_but_empty += 1
+                if r["query_stems"]:
+                    key = r["query_stems"]
+                    empty_queries[key] = empty_queries.get(key, 0) + 1
+        total = len(rows)
+        nonempty = sum(b["nonempty"] for b in by_channel.values())
+        stale_cutoff = f"-{max(1, int(stale_days))} days"
+        dead_weight = self._query(
+            "SELECT COUNT(*) AS c FROM memories WHERE status='active'"
+            " AND access_count=0 AND datetime(created_at) < datetime('now', ?)",
+            (stale_cutoff,),
+        )[0]["c"]
+        top_accessed = [
+            {"content": r["content"][:80], "access_count": r["access_count"]}
+            for r in self._query(
+                "SELECT content, access_count FROM memories"
+                " ORDER BY access_count DESC, datetime(updated_at) DESC LIMIT 5"
+            )
+        ]
+        return {
+            "days": max(1, int(days)),
+            "total_recalls": total,
+            "nonempty_recalls": nonempty,
+            "by_channel": by_channel,
+            "empty_with_candidates": had_candidates_but_empty,
+            "top_empty_queries": sorted(empty_queries.items(), key=lambda kv: -kv[1])[:5],
+            "dead_weight_older_than_stale_days": dead_weight,
+            "top_accessed": top_accessed,
+        }
+
+    def prune_recall_log(self, keep_days: int = 90) -> int:
+        """Drop recall-audit rows older than ``keep_days``. Returns rows removed."""
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=max(1, int(keep_days)))).isoformat(timespec="seconds")
+        removed = {"n": 0}
+
+        def _prune(conn: sqlite3.Connection) -> None:
+            cur = conn.execute("DELETE FROM memory_recall_log WHERE ts < ?", (cutoff,))
+            removed["n"] = cur.rowcount
+
+        try:
+            self._execute_write(_prune)
+        except sqlite3.Error as exc:
+            logger.debug("memory v2: recall log prune failed: %s", exc)
+            return 0
+        return int(removed["n"])
 
     # ------------------------------------------------------------------
     # Internal helpers

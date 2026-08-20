@@ -11987,6 +11987,55 @@ def cmd_memory(args):
             "\n  Memory reset complete. New sessions will start with a blank slate."
         )
         print(f"  Files were in: {display_hermes_home()}/memories/\n")
+    elif sub == "report":
+        from hermes_cli.config import load_config
+        from hermes_constants import display_hermes_home
+
+        try:
+            from agent.memory_store_v2 import MemoryStoreV2
+        except Exception as exc:  # pragma: no cover - import guard
+            print(f"\n  ✗ Memory v2 store unavailable: {exc}\n")
+            return
+
+        mem_cfg = (load_config() or {}).get("memory", {}) or {}
+        log_cfg = mem_cfg.get("recall_log", {}) or {}
+        store = MemoryStoreV2(
+            memory_char_limit=int(mem_cfg.get("memory_char_limit", 2200)),
+            user_char_limit=int(mem_cfg.get("user_char_limit", 1375)),
+            recall_log_enabled=True,  # reporting must read even when writing is off
+        )
+        try:
+            store.load_from_disk()
+            days = max(1, int(getattr(args, "days", 7) or 7))
+            s = store.recall_log_summary(days=days)
+            total, nonempty = s["total_recalls"], s["nonempty_recalls"]
+            hit = f"{(nonempty / total * 100):.0f}%" if total else "—"
+            print(f"\n  🧠 Memory v2 health — last {s['days']} day(s)")
+            print(f"  (source: {display_hermes_home()}/memories/memory.db)\n")
+            print(f"  Recall events: {total}, non-empty: {nonempty} ({hit})")
+            for channel, b in sorted(s["by_channel"].items()):
+                ch_hit = f"{(b['nonempty'] / b['total'] * 100):.0f}%" if b["total"] else "—"
+                print(f"    {channel}: {b['total']} events, {b['nonempty']} non-empty ({ch_hit})")
+            print(f"  Empty recall despite candidates (scored out): {s['empty_with_candidates']}")
+            if s["top_empty_queries"]:
+                print("  Recurring empty-recall queries (alias candidates — P2):")
+                for terms, n in s["top_empty_queries"]:
+                    print(f"    · {terms}  ×{n}")
+            print(
+                f"  Dead weight (active, access_count=0, older than 30d): "
+                f"{s['dead_weight_older_than_stale_days']}"
+            )
+            if s["top_accessed"]:
+                print("  Top accessed entries:")
+                for row in s["top_accessed"]:
+                    print(f"    · [{row['access_count']}×] {row['content']}")
+            if getattr(args, "prune", False):
+                keep = int(log_cfg.get("retain_days", 90) or 90)
+                removed = store.prune_recall_log(keep_days=keep)
+                print(f"\n  ✓ Pruned {removed} audit row(s) older than {keep} day(s)")
+            print()
+        finally:
+            store.close()
     else:
         from hermes_cli.memory_setup import memory_command
 

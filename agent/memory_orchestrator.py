@@ -320,6 +320,17 @@ def render_pack(
             f" · {str(row.get('updated_at') or '')[:10]}] "
             f"{row.get('content', '')}"
         )
+        # P1 provenance: what this entry superseded (1-hop, store-attached).
+        # Rendered ONLY when neighbors exist, so a link-free store produces
+        # byte-identical packs to the pre-P1 renderer.
+        supersedes = row.get("supersedes") or []
+        if supersedes:
+            parts = "; ".join(
+                f"{n.get('short_id')} ({str(n.get('created_at') or '')[:10]},"
+                f" «{str(n.get('content') or '')[:60]}»)"
+                for n in supersedes[:2]
+            )
+            line += f"\n  [supersedes: {parts}]"
         by_type.setdefault(rtype, []).append(line)
     sections = []
     for rtype in order:
@@ -378,6 +389,17 @@ class MemoryOrchestrator:
             logger.warning("memory orchestrator: pack build failed: %s", exc)
             return ""
 
+    def _log_recall(self, *, intent: str, query: str, before: int, after: int, nonempty: bool) -> None:
+        """Recall-audit hook (P3). Duck-typed + best-effort: stores without
+        ``log_recall`` (legacy flat-file) and failures are silently fine."""
+        log = getattr(self._store, "log_recall", None)
+        if log is None:
+            return
+        try:
+            log("auto-pack", intent, _message_tokens(query)[:8], before, after, nonempty)
+        except Exception as exc:
+            logger.debug("memory orchestrator: recall log failed: %s", exc)
+
     def _build_pack(self, message: str) -> str:
         if not self._token_budget:
             return ""
@@ -411,6 +433,9 @@ class MemoryOrchestrator:
             )
 
         if not candidates:
+            # An empty funnel is itself the metric ("knew but stayed silent"
+            # candidates come from here) — log every exit, not just success.
+            self._log_recall(intent=intent, query=query, before=0, after=0, nonempty=False)
             return ""
 
         # The frozen snapshot already carries these entries in the system
@@ -423,6 +448,7 @@ class MemoryOrchestrator:
                 continue
             scored.append((row, score_candidate(row, query_tokens, self._weights, now)))
         if not scored:
+            self._log_recall(intent=intent, query=query, before=len(candidates), after=0, nonempty=False)
             return ""
 
         # Token budget cut, best score first ("big memory ≠ big prompt").
@@ -441,6 +467,7 @@ class MemoryOrchestrator:
             selected.append((row, score))
             used += line_cost
         if not selected:
+            self._log_recall(intent=intent, query=query, before=len(candidates), after=0, nonempty=False)
             return ""
 
         # One INFO line per non-empty pack: the pack is injected into the
@@ -449,6 +476,10 @@ class MemoryOrchestrator:
         logger.info(
             "memory orchestrator: context pack intent=%s entries=%d tokens~%d",
             intent, len(selected), used,
+        )
+        self._log_recall(
+            intent=intent, query=query,
+            before=len(candidates), after=len(selected), nonempty=True,
         )
 
         # Usage signal for future scoring/consolidation (best-effort).

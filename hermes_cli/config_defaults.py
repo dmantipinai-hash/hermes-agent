@@ -1829,6 +1829,15 @@ DEFAULT_CONFIG = {
         # readable projections; SQLite (memories/memory.db) is canonical.
         # Set false to roll back to the legacy flat-file store.
         "store_v2": True,
+        # Recall-audit log (memory roadmap Phase-4 P3): one row per memory
+        # recall (orchestrator auto-pack + explicit memory read), stored in
+        # memories/memory.db. Feeds `hermes memory report` — the health
+        # digest (hit-rate by channel, empty-recall queries, dead weight).
+        # Volume is tiny; prune with `hermes memory report --prune`.
+        "recall_log": {
+            "enabled": True,
+            "retain_days": 90,
+        },
         # External memory provider plugin (empty = built-in only).
         # Set to a provider name to activate: "openviking", "mem0",
         # "hindsight", "holographic", "retaindb", "byterover".

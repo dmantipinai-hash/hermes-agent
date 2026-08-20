@@ -1799,9 +1799,11 @@ def init_agent(
                     # Typed SQLite store (Phase 1 of the memory roadmap):
                     # types/statuses/FTS5 recall, MEMORY.md kept as projection.
                     from agent.memory_store_v2 import MemoryStoreV2
+                    recall_log_cfg = mem_config.get("recall_log", {}) or {}
                     agent._memory_store = MemoryStoreV2(
                         memory_char_limit=mem_config.get("memory_char_limit", 2200),
                         user_char_limit=mem_config.get("user_char_limit", 1375),
+                        recall_log_enabled=bool(recall_log_cfg.get("enabled", True)),
                     )
                 else:
                     from tools.memory_tool import MemoryStore
