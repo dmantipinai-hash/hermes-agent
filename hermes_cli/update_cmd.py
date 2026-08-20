@@ -4900,6 +4900,12 @@ def _cmd_update_impl(args, gateway_mode: bool):
     git_dir = _m().PROJECT_ROOT / ".git"
 
     if not git_dir.exists():
+        if FORK_REPO_URL:
+            # A fork install without a git checkout (uv tool / wheel / pip)
+            # must never be pointed at the upstream installer or archive —
+            # both would replace the fork with upstream code (see FORK.md).
+            _print_fork_update_guidance()
+            sys.exit(1)
         if sys.platform == "win32":
             use_zip_update = True
         else:
