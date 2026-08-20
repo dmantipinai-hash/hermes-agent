@@ -305,6 +305,9 @@ hermes-agent/
 ├── cron/                 # Scheduler — jobs.py, scheduler.py
 ├── scripts/              # run_tests.sh, release.py, auxiliary scripts
 ├── website/              # Docusaurus docs site
+│                         #   user-facing memory contract: website/docs/user-guide/features/memory.md —
+│                         #   UPDATE IT when the memory store/tool behavior changes (it is written
+│                         #   agent-first: a fresh install's agent reads it to learn its own memory)
 └── tests/                # Pytest suite (~17k tests across ~900 files as of May 2026)
 ```
 

@@ -1,214 +1,195 @@
 ---
 sidebar_position: 3
 title: "Persistent Memory"
-description: "How Hermes Agent remembers across sessions — MEMORY.md, USER.md, and session search"
+description: "How Hermes Agent remembers across sessions — the typed memory store, eviction to cold storage, recall search, aliases, and health reporting"
 ---
 
 # Persistent Memory
 
-Hermes Agent has bounded, curated memory that persists across sessions. This lets it remember your preferences, your projects, your environment, and things it has learned.
+Hermes Agent has bounded, curated memory that persists across sessions: your preferences, projects, environment, and lessons it has learned. This page documents the **typed memory store (v2)** — the SQLite-backed architecture with automatic eviction, full-text recall, decision provenance, synonym aliases, and a health report.
 
-## How It Works
-
-Two files make up the agent's memory:
-
-| File | Purpose | Char Limit |
-|------|---------|------------|
-| **MEMORY.md** | Agent's personal notes — environment facts, conventions, things learned | 2,200 chars (~800 tokens) |
-| **USER.md** | User profile — your preferences, communication style, expectations | 1,375 chars (~500 tokens) |
-
-Both are stored in `~/.hermes/memories/` and are injected into the system prompt as a frozen snapshot at session start. The agent manages its own memory via the `memory` tool — it can add, replace, or remove entries.
-
-:::caution One agent per Hermes home
-Don't point two agent processes at the same Hermes home directory. Memory writes are automatic and load back into the system prompt at session start, so two writers sharing one home will compound each other's entries into state neither of them (nor you) authored. Memory is scoped per [profile](/user-guide/profiles) by design — give a second agent its own profile, and if they need shared memory, use an [external memory provider](/user-guide/features/memory-providers) instead.
+:::note Who should read this
+This page is written **for the agent first**. A freshly installed agent reads it to learn how its own memory works and what it must and must not do (see [Operating Rules for Agents](#operating-rules-for-agents)). Humans will find the configuration reference and the day-to-day commands below. If you are setting up a new install, the two sections that matter most are the [architecture overview](#how-it-works-two-tiers) and [aliases](#synonym-aliases-memoryaliases).
 :::
 
-:::info
-Character limits keep memory focused. Memory does **not** auto-compact: when a
-write would exceed the limit, the `memory` tool returns an error instead of
-silently dropping entries. The agent then makes room itself — consolidating or
-removing entries in the same turn before retrying (see [What Happens When Memory
-is Full](#what-happens-when-memory-is-full)). Note that `replace` is also bound
-by the limit: swapping an entry for a longer one can still overflow, so the new
-content must be shortened (or another entry removed) to fit.
-:::
+## How It Works (Two Tiers)
 
-## How Memory Appears in the System Prompt
+Memory is a single SQLite database — `~/.hermes/memories/memory.db` — with two tiers of *visibility*, not two stores:
 
-At the start of every session, memory entries are loaded from disk and rendered into the system prompt as a frozen block:
+| Tier | What it is | Bound |
+|------|-----------|-------|
+| **Hot** | A frozen snapshot rendered into the system prompt at session start | `memory.memory_char_limit` (default 2,200 chars) for `memory`, `user_char_limit` (1,375) for `user` |
+| **Cold** | Every record ever saved — full-text searchable via `memory(action="read")` and re-injected per turn by the orchestrator when relevant | Unbounded |
 
-```
-══════════════════════════════════════════════
-MEMORY (your personal notes) [67% — 1,474/2,200 chars]
-══════════════════════════════════════════════
-User's project is a Rust web service at ~/code/myapi using Axum + SQLx
-§
-This machine runs Ubuntu 22.04, has Docker and Podman installed
-§
-User prefers concise responses, dislikes verbose explanations
-```
+Everything lives in the same tables. When the snapshot budget overflows, the least-important entries **drop out of the prompt only** — they stay in the store, fully searchable, and are re-injected into individual turns when your message matches them. Eviction is automatic and lossless.
 
-The format includes:
-- A header showing which store (MEMORY or USER PROFILE)
-- Usage percentage and character counts so the agent knows capacity
-- Individual entries separated by `§` (section sign) delimiters
-- Entries can be multiline
+`MEMORY.md` and `USER.md` in the same directory are **human-readable projections** — rewritten from the database after every change so you can read and git-track your memory. They are derived views: direct edits to them are overwritten on the next write. SQLite is the source of truth.
 
-**Frozen snapshot pattern:** The system prompt injection is captured once at session start and never changes mid-session. This is intentional — it preserves the LLM's prefix cache for performance. When the agent adds/removes memory entries during a session, the changes are persisted to disk immediately but won't appear in the system prompt until the next session starts. Tool responses always show the live state.
+### Tables in memory.db
+
+| Table | Purpose |
+|-------|---------|
+| `memories` | Every entry: `type`, `importance`, `status` (`active`/`dormant`/`archived`/`deprecated`/`pinned`), provenance columns, `access_count` |
+| `memories_fts` | FTS5 full-text index over entry content |
+| `memory_links` | `supersedes` links between decisions (see [provenance](#decision-provenance-supersedes-links)) |
+| `memory_recall_log` | Recall audit log feeding `hermes memory report` |
+| `memory_aliases` | Cache of the synonym dictionary from `memory.aliases` in config.yaml |
+
+### The frozen snapshot (prompt-cache invariant)
+
+The system-prompt block is captured once at session start and never changes mid-session — this preserves the LLM's prefix cache. Writes made during a session are persisted immediately but appear in the system prompt only next session. Mid-session, the per-turn [context pack](#the-per-turn-context-pack-orchestrator) supplements the snapshot with records your current message matches.
+
+## Operating Rules for Agents
+
+If you are an agent reading this, these rules are your contract with the memory system. They exist because every one of them was violated by a real agent at least once, with real data loss.
+
+1. **Overflow is not a problem. Never "clean" memory.** When a write response shows `evicted_to_cold`, the excess has moved to cold storage automatically — still active, still searchable. Do **not** remove, shorten, or archive-and-delete entries to "free space". The store is unbounded by design.
+2. **The `usage` number is the prompt projection, not the store size.** `"98% — 2,167/2,200 chars"` describes what the next session's prompt will contain. A store 3× larger than the limit is healthy.
+3. **A changed decision is `deprecate`, not `remove`.** Removing destroys history. Deprecate hides the old entry from retrieval but keeps it for audit — and with the `superseded by:` marker it records the lineage (below).
+4. **Read before deciding.** Before saving a decision or constraint, `memory(action="read", query=...)` on the topic. If an active entry contradicts the new one, deprecate it with the marker, then add the new one.
+5. **When `old_text` fails, the response lists `current_entries`.** Retry with a short unique substring of the *actual stored text* — not text you remember writing. After three consecutive failures the tool goes terminal for the turn: stop retrying and answer the user; save in a later turn.
+6. **Save what will still matter next week** — decisions with reasons, constraints, preferences, environment facts. Not task progress (that's `session_search` territory), not data dumps.
 
 ## Memory Tool Actions
 
-The agent uses the `memory` tool with these actions:
-
-- **add** — Add a new memory entry
-- **replace** — Replace an existing entry with updated content (uses substring matching via `old_text`)
-- **remove** — Remove an entry that's no longer relevant (uses substring matching via `old_text`)
-
-There is no `read` action — memory content is automatically injected into the system prompt at session start. The agent sees its memories as part of its conversation context.
-
-### Substring Matching
-
-The `replace` and `remove` actions use short unique substring matching — you don't need the full entry text. The `old_text` parameter just needs to be a unique substring that identifies exactly one entry:
-
 ```python
-# If memory contains "User prefers dark mode in all editors"
-memory(action="replace", target="memory",
-       old_text="dark mode",
-       content="User prefers light mode in VS Code, dark mode in terminal")
+memory(action="add", target="memory", content="...", type="decision", importance=0.8)
+memory(action="replace", target="memory", old_text="unique substring", content="...", ...)
+memory(action="remove", target="memory", old_text="unique substring")
+memory(action="deprecate", target="memory", old_text="...", reason="...")
+memory(action="read", target="memory", query="vpn сервер")
 ```
 
-If the substring matches multiple entries, an error is returned asking for a more specific match.
+- **add** — insert a typed entry. Duplicate content is rejected softly. If you add a `decision`/`constraint` that resembles an active one, the response carries `related_active` + a hint — review it for conflicts (rule 4).
+- **replace** — edit-in-place of the entry matched by `old_text` (substring). Preserves `type`/`importance` unless overridden. Replacing does **not** create links — it's the same entry, reworded.
+- **remove** — hard delete. For garbage only.
+- **deprecate** — retire a decision/constraint: hidden from retrieval and snapshot, kept for audit with the reason. **To link the successor, end `reason` with `superseded by: <exact substring of the new entry>`** — recall then shows what each decision replaced (see below).
+- **read** — full-text search over the *entire* cold store, including entries not in your current prompt. This is the primary "what do I know about X" tool.
 
-## Two Targets Explained
+Entry types: `fact` (default), `decision` (a choice made — include the reason), `constraint` (a rule to respect), `preference`, `pattern`. `decision` and `constraint` get a `[type]` prefix in the prompt snapshot so the model treats them as binding. `importance` (0..1, default 0.5) orders survival in the snapshot budget; `pinned` status beats importance.
 
-### `memory` — Agent's Personal Notes
+### Search semantics (what `read` matches)
 
-For information the agent needs to remember about the environment, workflows, and lessons learned:
+Queries go through a recall-oriented funnel:
 
-- Environment facts (OS, tools, project structure)
-- Project conventions and configuration
-- Tool quirks and workarounds discovered
-- Completed task diary entries
-- Skills and techniques that worked
+1. **Exact phrase** FTS match (whole tokens) — try `"Билайн душит"`.
+2. **Whole-query substring** — bridges simple inflection (`персонаж` → `персонажа`).
+3. **Term OR-search fallback** — for natural-language queries that share no contiguous phrase with any entry: every word ≥4 chars becomes a truncated prefix stem (`зависимости`/`зависимостей` → `завис*`), and **3-character terms match exactly** (`vpn`, `vps`, `dns`, `kvm` — whole tokens, never prefixes: `vpn` will not match `vpnhub`), plus configured [aliases](#synonym-aliases-memoryaliases).
 
-### `user` — User Profile
+Results carry `type`, `status`, `importance`, and — when the entry supersedes another — a `supersedes` block with the predecessor's id, date and content preview.
 
-For information about the user's identity, preferences, and communication style:
+### Decision provenance (`supersedes` links)
 
-- Name, role, timezone
-- Communication preferences (concise vs detailed, format preferences)
-- Pet peeves and things to avoid
-- Workflow habits
-- Technical skill level
+When a decision changes, the *trajectory* matters as much as the final state:
+
+```python
+memory(action="add", target="memory", type="decision", importance=0.8,
+       content="Хостинг: Docker обязателен для всех сервисов")
+memory(action="deprecate", target="memory", old_text="не используем Docker",
+       reason="пересмотрели:superseded by: Docker обязателен для всех сервисов")
+```
+
+Later, any recall that surfaces the new decision also shows:
+
+```
+[supersedes: 1f2a3b4c (2026-08-14, «Хостинг: не используем Docker — тяжело для сервера»)]
+```
+
+so the agent can say "you changed your mind — the original objection was server load; is that factor addressed?" instead of knowing only the latest state. The fragment after the marker is matched as a substring against active entries; if it matches nothing, the deprecate still succeeds and the link is simply not written (soft degradation). Links are strictly one hop — a predecessor's own predecessor does not ride along.
+
+### No-match feedback
+
+`replace`/`remove`/`deprecate` with an `old_text` that matches nothing return the full `current_entries` list — retry from the actual stored texts. Multiple matches return previews and ask for a more specific substring.
+
+## The Per-Turn Context Pack (Orchestrator)
+
+Each turn, before the model sees your message, the memory orchestrator searches the cold store with the message text (intent-routed, scored by relevance/importance/recency), drops entries already present in the frozen snapshot, and injects the rest as a compact context block attached to that one message. This is how evicted decisions resurface exactly when relevant — no explicit read needed. Packs are token-budgeted (`memory.orchestrator.token_budget`, default 2,500) and never persisted into the transcript.
+
+## Eviction and Importance Demotion
+
+When the snapshot budget overflows on a write:
+
+- the overflow entries leave the **prompt only** — `status` stays `active`, search still finds them;
+- each evicted entry's `importance` is lowered to at most half the minimum importance still in the prompt (floor 0.05), so future snapshot ordering is stable and an evicted entry cannot out-rank an in-prompt one. The demotion is monotonic (never raises) and does not touch `updated_at`.
+
+The write response states this explicitly: `usage` shows the projection, `evicted_to_cold` counts the spill, and the note repeats **"eviction is automatic; do NOT remove, shorten or archive entries to free space."**
+
+## Recall Audit and Health Report
+
+Every recall — the orchestrator's auto-pack and your explicit reads — appends one row to `memory_recall_log` (query terms, funnel counts, whether anything reached the turn). Aggregate it:
+
+```bash
+hermes memory report             # health digest for the last 7 days
+hermes memory report --days 30   # wider window
+hermes memory report --prune     # also drop rows older than memory.recall_log.retain_days
+```
+
+The report shows hit-rate by channel, empty recalls that *had* candidates (scored out), the **top recurring empty-recall queries** — your best candidates for new [aliases](#synonym-aliases-memoryaliases) — dead weight (active entries never accessed in 30+ days), and the most-accessed entries. A weekly cron of `hermes memory report --prune` delivered to your platform of choice is a cheap, high-signal health loop.
+
+Gate and retention:
+
+```yaml
+memory:
+  recall_log:
+    enabled: true     # one switch for both channels
+    retain_days: 90
+```
+
+## Synonym Aliases (`memory.aliases`)
+
+Lexical search cannot know that in *your* vocabulary «прокси», «vpn» and «туннель» are one topic. The alias dictionary teaches recall your synonyms — **search-only**: stored entries are never rewritten.
+
+```yaml
+# ~/.hermes/config.yaml
+memory:
+  aliases:
+    # keys are query words of 4+ chars; values may be any length
+    прокси: [vpn, vless, туннель]
+    роутер: [cudy, openwrt, luci]
+    сервер: [vps, kvm, хостинг]
+    оркестрация: [канбан, доска, диспетчер]
+    деньги: [бюджет, финмодель, цена]
+    # anchor names → the topic they belong to
+    миша: [flowwow]
+```
+
+Rules:
+
+- A key expands a **query** word to also match its aliases' terms. Short query terms (3 chars: `vpn`, `vps`, `dns`) are **not** alias-expanded — they already match exactly on their own; aliases apply to the 4+-char stemming path.
+- Aliases only ever **add** search terms — an empty dictionary is exactly the no-alias behavior; a wrong alias can add noise to recall, never remove results.
+- Takes effect on the next session start (config is read at agent init).
+- To grow the dictionary: watch `top_empty_queries` in `hermes memory report` — recurring misses are alias candidates. Hermes will suggest; **you** decide what goes into config.yaml.
 
 ## What to Save vs Skip
 
-### Save These (Proactively)
+**Save (proactively):** user preferences and corrections → `user`; decisions with reasons and constraints → `memory` as `type=decision`/`constraint`; environment facts, project conventions, tool quirks, stable lessons → `memory`.
 
-The agent saves automatically — you don't need to ask. It saves when it learns:
+**Skip:** trivial/obvious facts, easily re-discovered information, raw data dumps, session-specific ephemera, task progress (use `session_search`), anything already in context files.
 
-- **User preferences:** "I prefer TypeScript over JavaScript" → save to `user`
-- **Environment facts:** "This server runs Debian 12 with PostgreSQL 16" → save to `memory`
-- **Corrections:** "Don't use `sudo` for Docker commands, user is in docker group" → save to `memory`
-- **Conventions:** "Project uses tabs, 120-char line width, Google-style docstrings" → save to `memory`
-- **Completed work:** "Migrated database from MySQL to PostgreSQL on 2026-01-15" → save to `memory`
-- **Explicit requests:** "Remember that my API key rotation happens monthly" → save to `memory`
-
-### Skip These
-
-- **Trivial/obvious info:** "User asked about Python" — too vague to be useful
-- **Easily re-discovered facts:** "Python 3.12 supports f-string nesting" — can web search this
-- **Raw data dumps:** Large code blocks, log files, data tables — too big for memory
-- **Session-specific ephemera:** Temporary file paths, one-off debugging context
-- **Information already in context files:** SOUL.md and AGENTS.md content
-
-## Capacity Management
-
-Memory has strict character limits to keep system prompts bounded:
-
-| Store | Limit | Typical entries |
-|-------|-------|----------------|
-| memory | 2,200 chars | 8-15 entries |
-| user | 1,375 chars | 5-10 entries |
-
-### What Happens When Memory is Full
-
-When you try to add an entry that would exceed the limit, the tool returns an error:
-
-```json
-{
-  "success": false,
-  "error": "Memory at 2,100/2,200 chars. Adding this entry (250 chars) would exceed the limit. Consolidate now: use 'replace' to merge overlapping entries into shorter ones or 'remove' stale or less important entries (see current_entries below), then retry this add — all in this turn.",
-  "current_entries": ["..."],
-  "usage": "2,100/2,200"
-}
-```
-
-The agent should then:
-1. Read the current entries (shown in the error response)
-2. Identify entries that can be removed or consolidated
-3. Use `replace` to merge related entries into shorter versions
-4. Then `add` the new entry
-
-**Best practice:** When memory is above 80% capacity (visible in the system prompt header), consolidate entries before adding new ones. For example, merge three separate "project uses X" entries into one comprehensive project description entry.
-
-### Practical Examples of Good Memory Entries
-
-**Compact, information-dense entries work best:**
+Compact, information-dense entries work best:
 
 ```
-# Good: Packs multiple related facts
-User runs macOS 14 Sonoma, uses Homebrew, has Docker Desktop and Podman. Shell: zsh with oh-my-zsh. Editor: VS Code with Vim keybindings.
-
-# Good: Specific, actionable convention
-Project ~/code/api uses Go 1.22, sqlc for DB queries, chi router. Run tests with 'make test'. CI via GitHub Actions.
-
-# Good: Lesson learned with context
-The staging server (10.0.1.50) needs SSH port 2222, not 22. Key is at ~/.ssh/staging_ed25519.
-
-# Bad: Too vague
+# Good
+User runs macOS 14, Homebrew, Docker Desktop + Podman; zsh + oh-my-zsh; VS Code with Vim keys.
+# Good (decision with reason)
+[decision] Не используем Docker в проде — 2 ГБ RAM на VPS не тянет (2026-08).
+# Bad
 User has a project.
-
-# Bad: Too verbose
-On January 5th, 2026, the user asked me to look at their project which is
-located at ~/code/api. I discovered it uses Go version 1.22 and...
 ```
 
-## Duplicate Prevention
+## Security
 
-The memory system automatically rejects exact duplicate entries. If you try to add content that already exists, it returns success with a "no duplicate added" message.
+Entries are scanned for prompt-injection and exfiltration patterns before entering the store, and the snapshot is sanitized again before entering the system prompt — a poisoned database row cannot inject into the prompt.
 
-## Security Scanning
-
-Memory entries are scanned for injection and exfiltration patterns before being accepted, since they're injected into the system prompt. Content matching threat patterns (prompt injection, credential exfiltration, SSH backdoors) or containing invisible Unicode characters is blocked.
-
-## Session Search
-
-Beyond MEMORY.md and USER.md, the agent can search its past conversations using the `session_search` tool:
-
-- All CLI and messaging sessions are stored in SQLite (`~/.hermes/state.db`) with FTS5 full-text search
-- Search queries return actual messages from the DB — no LLM summarization, no truncation
-- The agent can find things it discussed weeks ago, even if they're not in its active memory
-- The agent can also scroll forward/backward inside any session it finds
-
-```bash
-hermes sessions list    # Browse past sessions
-```
-
-See [Session Search Tool](/user-guide/sessions#session-search-tool) for the three calling shapes (discovery / scroll / browse) and the response format.
-
-### session_search vs memory
+## Session Search vs Memory
 
 | Feature | Persistent Memory | Session Search |
 |---------|------------------|----------------|
-| **Capacity** | ~1,300 tokens total | Unlimited (all sessions) |
-| **Speed** | Instant (in system prompt) | ~20ms FTS5 query, ~1ms scroll |
-| **Cost** | Token cost in every prompt | Free — no LLM calls |
-| **Use case** | Key facts always available | Finding specific past conversations |
-| **Management** | Manually curated by agent | Automatic — all sessions stored |
-| **Token cost** | Fixed per session (~1,300 tokens) | On-demand (searched when needed) |
+| Capacity | Prompt snapshot is bounded; cold store unbounded | All sessions ever |
+| Speed | Instant (snapshot) / ~ms (recall, packs) | ~20ms FTS5 |
+| Use case | Standing facts, decisions, preferences | "Did we discuss X last week?" |
 
-**Memory** is for critical facts that should always be in context. **Session search** is for "did we discuss X last week?" queries where the agent needs to recall specifics from past conversations.
+See [Session Search](/user-guide/sessions#session-search-tool).
 
 ## Learning Journey (`/journey`)
 
@@ -226,26 +207,38 @@ Beyond viewing, the journey is also where you **prune and correct** what Hermes 
 | `hermes journey delete <node> [-y]` | Delete a node. Skills are **archived** (restorable), memory chunks are removed. `-y` skips the confirmation. |
 | `hermes journey edit <node>` | Open the node's content (a skill's `SKILL.md` or the memory chunk) in `$EDITOR`. |
 
-The same `list` / `delete <id>` / `edit <id>` subcommands work from the in-chat `/journey` command on the CLI, and the desktop panel offers edit/delete on nodes directly.
-
-## Configuration
+## Configuration Reference
 
 ```yaml
-# In ~/.hermes/config.yaml
+# ~/.hermes/config.yaml
 memory:
-  memory_enabled: true
-  user_profile_enabled: true
-  memory_char_limit: 2200   # ~800 tokens
-  user_char_limit: 1375     # ~500 tokens
-  write_approval: false     # false = write freely (default) | true = require approval
+  memory_enabled: true            # memory tool + snapshot injection
+  user_profile_enabled: true      # the 'user' target
+  store_v2: true                  # typed SQLite store (false = legacy flat files)
+  memory_char_limit: 2200         # hot-tier budget, memory target (~800 tokens)
+  user_char_limit: 1375           # hot-tier budget, user target (~500 tokens)
+  write_approval: false           # true = stage every write for your approval
+  aliases: {}                     # synonym dictionary (see above)
+  recall_log:
+    enabled: true                 # recall audit log
+    retain_days: 90
+  orchestrator:                   # per-turn context packs
+    enabled: true
+    token_budget: 2500
+    max_entries: 20
+```
+
+Other memory commands:
+
+```bash
+hermes memory report [--days N] [--prune]   # health digest (see above)
+hermes memory reset [--target memory|user]  # erase the built-in stores
+hermes memory setup / status / off          # external providers
 ```
 
 ## Controlling memory writes (`write_approval`)
 
-By default the agent saves memory freely — including from the background
-self-improvement review that runs after a turn. If you'd rather approve saves
-first, set `memory.write_approval: true`. It's a simple on/off gate applied to
-**both** foreground turns and the background review:
+By default the agent saves memory freely — including from the background self-improvement review that runs after a turn. If you'd rather approve saves first, set `memory.write_approval: true`. It's a simple on/off gate applied to **both** foreground turns and the background review:
 
 | `write_approval` | Behaviour |
 |------------------|-----------|
@@ -263,19 +256,11 @@ Review staged writes from the CLI or any messaging platform:
 /memory approval on         # turn the gate on (or 'off') and persist it
 ```
 
-This is the answer to "the agent saved a wrong assumption about me": set
-`write_approval: true`, and every save — especially the unprompted background
-ones — waits for your yes/no before it ever enters your profile.
+This is the answer to "the agent saved a wrong assumption about me": set `write_approval: true`, and every save — especially the unprompted background ones — waits for your yes/no before it ever enters your profile.
 
 ## Background review notifications (`display.memory_notifications`)
 
-After a turn, the background self-improvement review may quietly save a memory
-or update a skill. This is Hermes' consent-aware learning loop: repeated
-corrections and durable workflow lessons become compact memory entries or
-procedural skills, while `write_approval` can stage those writes for review
-before they affect future sessions. By default it surfaces a short
-`💾 Memory updated` line in chat so you know it happened. Control how chatty
-that is:
+After a turn, the background self-improvement review may quietly save a memory or update a skill. By default it surfaces a short `💾 Memory updated` line in chat so you know it happened. Control how chatty that is:
 
 ```yaml
 display:
@@ -288,16 +273,11 @@ display:
 | `on` (default) | Generic line, e.g. `💾 Memory updated`, `💾 Skill 'foo' patched`. |
 | `verbose` | Includes a compact preview of what changed, e.g. `💾 Memory ➕ User prefers terse replies` or a `"old" → "new"` skill diff snippet. |
 
-> This only governs the **gateway** chat notification. The review itself, and
-> writes to your memory/skill stores, are unaffected by this setting. Set it
-> per-platform via `display.platforms.<platform>.memory_notifications`.
+> This only governs the **gateway** chat notification. The review itself, and writes to your memory/skill stores, are unaffected. Set it per-platform via `display.platforms.<platform>.memory_notifications`.
 
 ## Running the review on a cheaper model (`auxiliary.background_review`)
 
-The review runs on your **main chat model** by default, replaying the
-conversation — which is already warm in the prompt cache, so it's cheap cache
-reads. On an expensive main model you can run the review on a cheaper model
-instead:
+The review runs on your **main chat model** by default, replaying the conversation — which is already warm in the prompt cache, so it's cheap cache reads. On an expensive main model you can run the review on a cheaper model instead:
 
 ```yaml
 auxiliary:
@@ -306,48 +286,28 @@ auxiliary:
     model: google/gemini-3-flash-preview   # auto (default) = main chat model
 ```
 
-When you point it at a model **different** from your main one, the review runs
-there for substantially lower cost (~3–5× in benchmarks). Because a different
-model can't reuse your main model's prompt cache anyway, the fork automatically
-replays a compact **digest** of the conversation (recent turns verbatim + a
-summary of older ones) rather than the full transcript — minimizing what it
-writes to the new cache. Capture holds: in testing, memory capture was
-identical and skill capture near-identical to the main-model review.
-
-Leave it at `auto` (or set it to your main model) and nothing changes — the
-review keeps running on the main model with the full warm-cache replay.
+When you point it at a model **different** from your main one, the review runs there for substantially lower cost (~3–5× in benchmarks), replaying a compact **digest** of the conversation (recent turns verbatim + a summary of older ones). Capture holds: in testing, memory capture was identical and skill capture near-identical to the main-model review.
 
 ### Disabling automatic reviews (`enabled`)
-
-The review fork can burn a meaningful share of total tokens on busy hosts.
-Operators can disable it without zeroing nudge intervals:
 
 ```yaml
 auxiliary:
   background_review:
-    enabled: true              # false = skip automatic post-turn forks
+    enabled: true              # false = skip automatic post-turn forks (manual /refine still works)
 ```
 
-With `enabled: false`, automatic post-turn forks do not spawn; manual
-`/refine` still works.
-
-Fork usage is persisted in `session_model_usage` with `task='background_review'`
-and a completion line is written to `agent.log`
-(`Background review complete: thread=bg-review calls=… in=… out=… result=…`).
+Fork usage is persisted in `session_model_usage` with `task='background_review'` and a completion line is written to `agent.log`.
 
 ## Controlling skill writes (`skills.write_approval`)
 
-Skills use the same on/off gate, but the review UX differs because a
-`SKILL.md` is far too large to read in a chat bubble:
+Skills use the same on/off gate, but the review UX differs because a `SKILL.md` is far too large to read in a chat bubble:
 
 ```yaml
 skills:
   write_approval: false     # false = write freely (default) | true = require approval
 ```
 
-When `write_approval: true`, skill writes (create / edit / patch / write_file /
-delete) always **stage** regardless of origin. You review the one-line gist
-inline, but the full diff stays out-of-band:
+When `write_approval: true`, skill writes (create / edit / patch / write_file / delete) always **stage** regardless of origin:
 
 ```
 /skills pending             # list staged skill writes + a one-line gist each
@@ -357,15 +317,11 @@ inline, but the full diff stays out-of-band:
 /skills approval on         # turn the gate on (or 'off') and persist it
 ```
 
-On a messaging platform, approve a skill from its gist + metadata, or open
-`/skills diff` on the CLI / dashboard / the staged file under
-`~/.hermes/pending/skills/<id>.json` when you want to read the whole change.
 Full details in [Gating agent skill writes](/user-guide/features/skills#gating-agent-skill-writes-skillswrite_approval).
-
 
 ## External Memory Providers
 
-For deeper, persistent memory that goes beyond MEMORY.md and USER.md, Hermes ships with 8 external memory provider plugins — including Honcho, OpenViking, Mem0, Hindsight, Holographic, RetainDB, ByteRover, and Supermemory.
+For deeper, persistent memory that goes beyond the built-in store, Hermes ships with external memory provider plugins — including Honcho, OpenViking, Mem0, Hindsight, Holographic, RetainDB, and ByteRover.
 
 External providers run **alongside** built-in memory (never replacing it) and add capabilities like knowledge graphs, semantic search, automatic fact extraction, and cross-session user modeling.
 
@@ -375,3 +331,7 @@ hermes memory status     # check what's active
 ```
 
 See the [Memory Providers](./memory-providers.md) guide for full details on each provider, setup instructions, and comparison.
+
+:::caution One agent per Hermes home
+Don't point two agent processes at the same Hermes home directory. Memory writes are automatic and load back into the system prompt at session start, so two writers sharing one home will compound each other's entries into state neither of them (nor you) authored. Memory is scoped per [profile](/user-guide/profiles) by design — give a second agent its own profile, and if they need shared memory, use an [external memory provider](/user-guide/features/memory-providers) instead.
+:::
