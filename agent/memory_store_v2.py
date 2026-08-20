@@ -110,6 +110,16 @@ CREATE TABLE IF NOT EXISTS memory_recall_log (
 );
 CREATE INDEX IF NOT EXISTS idx_memory_recall_log_ts ON memory_recall_log(ts);
 
+-- Alias cache (Phase-4 P2): query-expansion synonyms. The SOURCE OF TRUTH
+-- is `memory.aliases` in config.yaml; this table is a materialized cache
+-- (rebuilt wholesale by set_alias_cache) kept for observability and SQL
+-- access. Search-only: aliases never mutate stored entries.
+CREATE TABLE IF NOT EXISTS memory_aliases (
+    term TEXT NOT NULL,
+    alias TEXT NOT NULL,
+    PRIMARY KEY (term, alias)
+);
+
 CREATE TABLE IF NOT EXISTS meta (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
@@ -257,6 +267,12 @@ class MemoryStoreV2(MemoryStore):
         # Recall-audit gate (memory.recall_log.enabled) — single switch for
         # both channels; the store is the one place that knows it.
         self._recall_log_enabled = bool(recall_log_enabled)
+        # Query-expansion aliases (Phase-4 P2): {term: [aliases]}. In-memory
+        # working copy — config (memory.aliases) is the source of truth, the
+        # memory_aliases table is a cache; load_from_disk reads the cache so
+        # a store built without an explicit map still expands, and
+        # set_alias_cache (agent init, from config) overrides + rewrites it.
+        self._alias_map: Dict[str, Tuple[str, ...]] = {}
         # Contents of the entries currently included in the frozen prompt
         # snapshot (per target, original content strings) — the Phase-2
         # orchestrator dedupes its per-turn context pack against this set.
@@ -400,8 +416,58 @@ class MemoryStoreV2(MemoryStore):
         conn = self._connect()
         self._init_schema(conn)
         self._migrate_legacy_files()
+        self._load_alias_cache()
         self._refresh_live_state()
         self._rebuild_snapshot()
+
+    def _load_alias_cache(self) -> None:
+        """Read the alias cache table into the working map (P2).
+
+        Only used when no config-driven map has been pushed yet —
+        :meth:`set_alias_cache` remains the authority once agent init runs.
+        """
+        try:
+            rows = self._query("SELECT term, alias FROM memory_aliases")
+        except sqlite3.Error:
+            return
+        cache: Dict[str, list] = {}
+        for r in rows:
+            cache.setdefault(r["term"], []).append(r["alias"])
+        self._alias_map = {k: tuple(v) for k, v in cache.items()}
+
+    def set_alias_cache(self, alias_map: Optional[Dict[str, Any]]) -> None:
+        """Install config-provided aliases and rewrite the cache table (P2).
+
+        ``memory.aliases`` in config.yaml is the source of truth
+        ({term: [aliases]}); this wholesale-replaces both the in-memory map
+        and the ``memory_aliases`` cache. Unknown shapes are ignored, not
+        raised — a malformed config must never break memory.
+        """
+        clean: Dict[str, Tuple[str, ...]] = {}
+        if isinstance(alias_map, dict):
+            for term, aliases in alias_map.items():
+                if not isinstance(term, str) or not term.strip():
+                    continue
+                values = [
+                    str(a).strip().lower()
+                    for a in (aliases if isinstance(aliases, (list, tuple)) else [aliases])
+                    if isinstance(a, str) and a.strip()
+                ]
+                if values:
+                    clean[term.strip().lower()] = tuple(dict.fromkeys(values))
+        self._alias_map = clean
+
+        def _rewrite(conn: sqlite3.Connection) -> None:
+            conn.execute("DELETE FROM memory_aliases")
+            conn.executemany(
+                "INSERT OR REPLACE INTO memory_aliases(term, alias) VALUES (?,?)",
+                [(t, a) for t, aliases in clean.items() for a in aliases],
+            )
+
+        try:
+            self._execute_write(_rewrite)
+        except sqlite3.Error as exc:
+            logger.debug("memory v2: alias cache rewrite failed: %s", exc)
 
     def _migrate_legacy_files(self) -> None:
         """One-shot import of MEMORY.md/USER.md entries into SQLite."""
@@ -972,6 +1038,38 @@ class MemoryStoreV2(MemoryStore):
     # Phase-2 orchestrator API
     # ------------------------------------------------------------------
 
+    def _alias_expand(
+        self, query: str, stems: List[str], exact_terms: List[str],
+    ) -> Tuple[List[str], List[str]]:
+        """Expand search terms with configured aliases (P2 — search-only).
+
+        Rules (§8.4): aliases apply ONLY to the stemming path — query tokens
+        shorter than 4 chars keep the B′ exact-match path untouched, so a
+        dictionary can never degrade short-term precision. Expansion only
+        ADDS OR-terms (never removes/narrows); an alias of its own may be a
+        short term and then joins the exact list. Capped so a fat dictionary
+        cannot blow up the FTS query.
+        """
+        if not self._alias_map:
+            return stems, exact_terms
+        out_stems = list(stems)
+        out_exact = list(exact_terms)
+        for token in _TOKEN_SPLIT_RE.split(query or ""):
+            token = token.lower()
+            if len(token) < _TOKEN_MIN_STEM:
+                continue
+            for alias in self._alias_map.get(token, ()):
+                if len(alias) >= _TOKEN_MIN_STEM:
+                    stem = alias[: max(_TOKEN_MIN_STEM, len(alias) - 3)]
+                    if stem not in out_stems:
+                        out_stems.append(stem)
+                elif len(alias) == _TOKEN_EXACT_LEN and alias not in out_exact:
+                    out_exact.append(alias)
+        return (
+            out_stems[: _TOKEN_SEARCH_MAX * 2],
+            out_exact[:_TOKEN_SEARCH_MAX],
+        )
+
     def recall_candidates(
         self,
         query: str,
@@ -998,6 +1096,7 @@ class MemoryStoreV2(MemoryStore):
         exact_terms = _query_exact_terms(query)
         if not stems and not exact_terms:
             return []
+        stems, exact_terms = self._alias_expand(query, stems, exact_terms)
         rows: Optional[List[sqlite3.Row]] = self._fts_search_any(stems, exact_terms)
         if rows is None:
             rows = self._like_search_any(stems, exact_terms)
@@ -1285,10 +1384,12 @@ class MemoryStoreV2(MemoryStore):
             # rarely share one contiguous phrase with a stored entry — both
             # the phrase match and the whole-query substring miss while the
             # entries exist. Retry recall-oriented (stem/exact OR-search,
-            # the orchestrator's mechanics) before reporting an empty recall.
+            # alias-expanded, the orchestrator's mechanics) before reporting
+            # an empty recall.
             stems = _query_stems(query)
             exact_terms = _query_exact_terms(query)
             if stems or exact_terms:
+                stems, exact_terms = self._alias_expand(query, stems, exact_terms)
                 rows = self._fts_search_any(stems, exact_terms)
                 if rows is None:
                     rows = self._like_search_any(stems, exact_terms)

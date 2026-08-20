@@ -1838,6 +1838,13 @@ DEFAULT_CONFIG = {
             "enabled": True,
             "retain_days": 90,
         },
+        # Query-expansion aliases (Phase-4 P2): {term: [aliases]} — recall
+        # searches for the term ALSO match the aliases (search-only; stored
+        # entries are never rewritten). Applies to words of 4+ chars; short
+        # domain terms (vpn/vps/dns) are covered by exact-token matching and
+        # are not alias-expanded. Candidate pairs surface over time in
+        # `hermes memory report` (top empty queries); edit them in here.
+        "aliases": {},
         # External memory provider plugin (empty = built-in only).
         # Set to a provider name to activate: "openviking", "mem0",
         # "hindsight", "holographic", "retaindb", "byterover".

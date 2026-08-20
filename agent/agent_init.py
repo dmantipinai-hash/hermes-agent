@@ -1812,6 +1812,12 @@ def init_agent(
                         user_char_limit=mem_config.get("user_char_limit", 1375),
                     )
                 agent._memory_store.load_from_disk()
+                if hasattr(agent._memory_store, "set_alias_cache"):
+                    # Query-expansion aliases (Phase-4 P2): config.yaml is
+                    # the source of truth; the store caches it in the
+                    # memory_aliases table. v2-only (duck-typed for the
+                    # legacy flat-file store).
+                    agent._memory_store.set_alias_cache(mem_config.get("aliases", {}) or {})
                 # Phase-2 orchestrator: per-turn context pack over the typed
                 # store (intent-routed retrieval + scoring + token budget).
                 # Legacy flat-file store → None (factory duck-types the v2 API).

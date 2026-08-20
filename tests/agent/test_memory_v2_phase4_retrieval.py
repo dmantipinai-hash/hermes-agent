@@ -361,3 +361,128 @@ class TestRecallAuditLog:
             assert s.prune_recall_log(keep_days=1) == 3
         finally:
             s.close()
+
+
+class TestMarkerDocumentation:
+    """§8.2: the superseded-by marker must be visible to the model, or the
+    link write path stays dead and P1 reads an empty graph forever."""
+
+    def test_schema_documents_the_marker(self):
+        import json
+
+        from tools.memory_tool import MEMORY_SCHEMA
+
+        blob = json.dumps(MEMORY_SCHEMA, ensure_ascii=False)
+        assert "superseded by:" in blob
+
+    def test_marker_fragment_mismatch_degrades_softly(self, store):
+        # Hidden semantics locked as-is: the fragment after the marker is
+        # matched substring-style against active entries; a miss means the
+        # deprecate still succeeds and the link is silently not written.
+        store.add("memory", "Старое решение про хранение", entry_type="decision")
+        r = store.deprecate(
+            "memory", "хранение", reason="superseded by: несуществующий фрагмент"
+        )
+        assert r["success"]
+        assert store._query("SELECT COUNT(*) AS c FROM memory_links")[0]["c"] == 0
+
+
+class TestAliasExpansion:
+    """P2 (§8.4): search-only synonym expansion, config-driven.
+
+    Contracts а–д: synonym finds entry; empty dict = pre-P2 behaviour;
+    write path verbatim; short-term exactness intact; audit logs the RAW query.
+    """
+
+    def _store_with_aliases(self, mem_dir, aliases):
+        s = MemoryStoreV2()
+        s.load_from_disk()
+        s.set_alias_cache(aliases)
+        return s
+
+    def test_a_synonym_finds_entry_both_paths(self, mem_dir):
+        s = self._store_with_aliases(mem_dir, {"прокси": ["vpn"]})
+        s.add("memory", "Роутер держит vpn на борту для обхода блокировок")
+        try:
+            cands = s.recall_candidates("настроить прокси для телеграма")
+            assert any("Роутер" in c["content"] for c in cands)
+            assert s.recall("настроить прокси быстро")["count"] == 1
+            pack = MemoryOrchestrator(s).build_pack("как настроить прокси?")
+            assert "Роутер" in pack
+        finally:
+            s.close()
+
+    def test_b_aliases_only_expand_never_narrow(self, mem_dir):
+        s = self._store_with_aliases(mem_dir, {})
+        s.add("memory", "Записи про сервер и его обслуживание")
+        try:
+            # Empty dict = the pre-P2 store: a synonym query finds nothing...
+            assert s.recall_candidates("прокси") == []
+            # ...and installing the dictionary only ever ADDS reach.
+            s.set_alias_cache({"прокси": ["сервер"]})
+            assert any(
+                "сервер" in c["content"] for c in s.recall_candidates("прокси")
+            )
+            # Direct hits survive a non-empty dict unchanged.
+            assert any(
+                "сервер" in c["content"] for c in s.recall_candidates("сервер")
+            )
+        finally:
+            s.close()
+
+    def test_c_write_path_stores_verbatim(self, mem_dir):
+        s = self._store_with_aliases(mem_dir, {"прокси": ["vpn"]})
+        text = "Настраиваем прокси на сервере через ssh"
+        s.add("memory", text)
+        try:
+            row = s._query("SELECT content FROM memories")[0]
+            assert row["content"] == text, "aliases must never rewrite entries"
+        finally:
+            s.close()
+
+    def test_d_short_term_exactness_intact_with_dict(self, mem_dir):
+        s = self._store_with_aliases(mem_dir, {"сервер": ["vps", "dns"]})
+        s.add("memory", "Клиент vpnhub установлен на сервере")
+        try:
+            # "vpn" stays exact-token-only even with a fat dictionary — no
+            # prefix smear onto vpnhub, no alias path for <4-char terms.
+            assert s.recall_candidates("vpn") == []
+            # And a 3-char alias still helps via the exact list.
+            s.set_alias_cache({"хостинг": ["vps"]})
+            s.add("memory", "Тариф vps выбран")
+            assert any(
+                "Тариф" in c["content"] for c in s.recall_candidates("хостинг дешевле")
+            )
+        finally:
+            s.close()
+
+    def test_e_audit_logs_raw_query_not_expanded(self, mem_dir):
+        s = self._store_with_aliases(mem_dir, {"прокси": ["vpn"]})
+        s.add("memory", "Запись с vpn внутри для аудита алиасов")
+        r = s.recall("прокси туннель")
+        try:
+            assert r["count"] == 1, "found via the alias expansion"
+            rows = s._query(
+                "SELECT query_stems FROM memory_recall_log ORDER BY id DESC LIMIT 1"
+            )
+            assert rows[0]["query_stems"] == "прок тунн"
+            assert "vpn" not in rows[0]["query_stems"], (
+                "expanded terms must never pollute the audit — top_empty_queries "
+                "is the alias auto-mining source (§8.4-д)"
+            )
+        finally:
+            s.close()
+
+    def test_alias_cache_table_synced_and_reloaded(self, mem_dir):
+        s = self._store_with_aliases(mem_dir, {"прокси": ["vpn", "туннель"]})
+        s.close()
+        s2 = MemoryStoreV2()
+        s2.load_from_disk()
+        try:
+            rows = {(r["term"], r["alias"]) for r in s2._query("SELECT term, alias FROM memory_aliases")}
+            assert ("прокси", "vpn") in rows and ("прокси", "туннель") in rows
+            # The reloaded cache drives expansion without an explicit map.
+            s2.add("memory", "Ещё одна запись с vpn")
+            assert any("vpn" in c["content"] for c in s2.recall_candidates("прокси"))
+        finally:
+            s2.close()

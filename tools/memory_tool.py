@@ -1266,7 +1266,10 @@ MEMORY_SCHEMA = {
         "- 'memory': your notes -- environment facts, project conventions, tool quirks, lessons learned\n\n"
         "ACTIONS: add (new entry), replace (update existing -- old_text identifies it), "
         "remove (hard delete garbage -- old_text identifies it), "
-        "deprecate (mark a decision/constraint obsolete -- kept for audit, hidden from search), "
+        "deprecate (mark a decision/constraint obsolete -- kept for audit, hidden "
+        "from search; to link the successor entry, end reason with "
+        "`superseded by: <exact substring of the new entry>` -- provenance then "
+        "surfaces in recall), "
         "read (search memory by query before proposing ideas or making decisions).\n\n"
         "ARCHITECTURE (two tiers): the hot tier is a compact snapshot with a bounded "
         "char budget injected into the system prompt at session start; entries beyond "
@@ -1326,7 +1329,12 @@ MEMORY_SCHEMA = {
             },
             "reason": {
                 "type": "string",
-                "description": "Why the entry is deprecated (for the 'deprecate' action)."
+                "description": (
+                    "Why the entry is deprecated (for the 'deprecate' action). "
+                    "When the entry is replaced by a newer one, end the reason with "
+                    "`superseded by: <exact substring of the successor entry>` — the "
+                    "link is recorded and recall then shows what each decision replaced."
+                ),
             },
         },
         "required": ["action", "target"],
