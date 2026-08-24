@@ -12029,6 +12029,32 @@ def cmd_memory(args):
                 print("  Top accessed entries:")
                 for row in s["top_accessed"]:
                     print(f"    · [{row['access_count']}×] {row['content']}")
+            # Choice memory (tension map): which decisions changed and why,
+            # plus conflicting ACTIVE decisions that still need a deprecate.
+            try:
+                choice = store.choice_report(days=days)
+            except Exception as exc:  # pragma: no cover - reporting guard
+                print(f"  Choice memory section unavailable: {exc}")
+                choice = None
+            if choice:
+                print(f"\n  ⚖ Choice memory — decisions changed (last {choice['days']} day(s)): "
+                      f"{len(choice['changes'])}")
+                if not choice["changes"]:
+                    print("    · none — the supersedes graph is waiting for its first live link")
+                for ch in choice["changes"][:10]:
+                    print(f"    · [{(ch['linked_at'] or '')[:10]}] now: {ch['new_content'][:70]}")
+                    print(f"        was: {ch['old_content'][:70]}"
+                          f"  (decided {(ch['old_created'] or '')[:10]};"
+                          f" reason: {(ch['reason'] or '—')[:60]})")
+                if choice["active_tensions"]:
+                    print(f"  ⚠ Active tensions (overlapping active decisions/constraints): "
+                          f"{len(choice['active_tensions'])}")
+                    for t in choice["active_tensions"][:10]:
+                        a, b = t["entries"]
+                        print(f"    · '{a['content'][:60]}' ({(a['created_at'] or '')[:10]})")
+                        print(f"      ↔ '{b['content'][:60]}' ({(b['created_at'] or '')[:10]})")
+                        print("      → deprecate the stale one, reason ending "
+                              "'superseded by: <substring of the newer>'")
             if getattr(args, "prune", False):
                 keep = int(log_cfg.get("retain_days", 90) or 90)
                 removed = store.prune_recall_log(keep_days=keep)

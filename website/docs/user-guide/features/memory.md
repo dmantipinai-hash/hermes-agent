@@ -99,6 +99,16 @@ Later, any recall that surfaces the new decision also shows:
 
 so the agent can say "you changed your mind — the original objection was server load; is that factor addressed?" instead of knowing only the latest state. The fragment after the marker is matched as a substring against active entries; if it matches nothing, the deprecate still succeeds and the link is simply not written (soft degradation). Links are strictly one hop — a predecessor's own predecessor does not ride along.
 
+You rarely have to compose that deprecate call by hand: when `add` stores a new `decision`/`constraint` while a similar ACTIVE one exists, the response carries `related_active` plus **`suggested_deprecate`** — a ready-to-use call with an exact stored-text substring (uniqueness-checked under the same matching `deprecate` uses) and a `reason` that already ends with the `superseded by:` marker. Copying it verbatim links the pair; nothing is auto-deprecated. While standing decisions exist, the frozen memory snapshot also ends with a one-line rule reminding the agent to finish choice changes this way (a block suffix, never an entry — and frozen at session start, so the prompt cache is unaffected).
+
+### Tension map (active conflicts)
+
+When several ACTIVE `decision`/`constraint` entries overlap (they share significant words — the same notion the add-time contradiction hint uses), something is stale: one of them supersedes the other but the deprecate never happened. Three surfaces make that visible instead of leaving two quiet contradictions:
+
+- `memory(action=read)` returns a top-level `tensions` array — the conflicting pairs with both contents and dates, not loose individual hits.
+- The per-turn context pack carries a "Choice tension" section when a conflicting pair matches the current message (budget-capped, at most two pairs).
+- `hermes memory report` prints the **Choice memory** digest: decisions that changed in the window (`now:` / `was:` with dates and the recorded reason) plus the active tensions, each with the exact deprecate suggestion.
+
 ### No-match feedback
 
 `replace`/`remove`/`deprecate` with an `old_text` that matches nothing return the full `current_entries` list — retry from the actual stored texts. Multiple matches return previews and ask for a more specific substring.
@@ -126,7 +136,7 @@ hermes memory report --days 30   # wider window
 hermes memory report --prune     # also drop rows older than memory.recall_log.retain_days
 ```
 
-The report shows hit-rate by channel, empty recalls that *had* candidates (scored out), the **top recurring empty-recall queries** — your best candidates for new [aliases](#synonym-aliases-memoryaliases) — dead weight (active entries never accessed in 30+ days), and the most-accessed entries. A weekly cron of `hermes memory report --prune` delivered to your platform of choice is a cheap, high-signal health loop.
+The report shows hit-rate by channel, empty recalls that *had* candidates (scored out), the **top recurring empty-recall queries** — your best candidates for new [aliases](#synonym-aliases-memoryaliases) — dead weight (active entries never accessed in 30+ days), the most-accessed entries, and the **Choice memory** digest ([tension map](#tension-map-active-conflicts)): which decisions changed (`now:` / `was:` with dates and reasons) and which ACTIVE decisions still conflict. A weekly cron of `hermes memory report --prune` delivered to your platform of choice is a cheap, high-signal health loop.
 
 Gate and retention:
 

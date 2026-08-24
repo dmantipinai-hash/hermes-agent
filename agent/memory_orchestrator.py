@@ -44,6 +44,7 @@ from datetime import datetime, timezone
 from typing import Any, ClassVar, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
 from agent.model_metadata import estimate_tokens_rough
+from agent.memory_store_v2 import _tension_pairs
 
 logger = logging.getLogger(__name__)
 
@@ -501,7 +502,37 @@ class MemoryOrchestrator:
         except Exception as exc:
             logger.debug("memory orchestrator: access bump failed: %s", exc)
 
-        return render_pack(selected, intent)
+        pack = render_pack(selected, intent)
+        # Choice tension (tension map): when this query's candidates carry
+        # conflicting ACTIVE decisions/constraints, surface the pair
+        # explicitly — the trajectory ("a month of refusal and its reason")
+        # enters the answer at the moment it matters, not just the latest
+        # state. Pairs are computed over the full candidate set but emitted
+        # only when at least one side reached the pack: a pair entirely
+        # inside the frozen snapshot is already visible to the model, and a
+        # pair entirely outside the pack would be context-free noise.
+        # Duck-safe: rows without a type never pair (legacy stores).
+        try:
+            selected_ids = {str(row.get("id")) for row, _ in selected}
+            pairs = [
+                p for p in _tension_pairs([dict(r) for r in candidates.values()])
+                if any(e.get("id") in selected_ids for e in p["entries"])
+            ]
+        except Exception:
+            pairs = []
+        if pairs:
+            lines = []
+            for pair in pairs[:2]:
+                a, b = pair["entries"]
+                lines.append(
+                    f"- ⚠ '{a['content'][:80]}' ({str(a.get('created_at') or '')[:10]}) vs "
+                    f"'{b['content'][:80]}' ({str(b.get('created_at') or '')[:10]}) — "
+                    "active conflicting decisions; weigh the choice history when answering."
+                )
+            section = "\n### Choice tension (active conflicting decisions)\n" + "\n".join(lines)
+            if used + estimate_tokens_rough(section) <= self._token_budget:
+                pack += section
+        return pack
 
 
 def build_memory_orchestrator(

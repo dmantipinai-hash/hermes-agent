@@ -1286,7 +1286,9 @@ MEMORY_SCHEMA = {
         "CONTRADICTION RULE: before saving a decision or constraint, run read with the topic "
         "keywords. If an ACTIVE entry contradicts the new one, deprecate the old entry (with "
         "reason) and then add the new one. When add returns 'related_active', review those "
-        "entries for conflicts.\n\n"
+        "entries for conflicts — and when it returns 'suggested_deprecate', finish the update "
+        "by calling deprecate with exactly those arguments (the reason already ends with the "
+        "linking marker).\n\n"
         "SKIP: trivial/obvious info, things easily re-discovered, raw data dumps, and temporary task state."
     ),
     "parameters": {

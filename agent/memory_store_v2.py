@@ -265,6 +265,88 @@ def _query_stems(query: str) -> List[str]:
     return out
 
 
+# ---------------------------------------------------------------------------
+# Choice memory / tension map (Task 2, on top of P1 links)
+# ---------------------------------------------------------------------------
+
+# The binding types whose entries are "standing choices": they can contradict
+# each other, and the trajectory (what was decided before, why it changed) is
+# the valuable part (architecture-v1: «решения и причины» + «карта напряжений»).
+_TENSION_TYPES = ("decision", "constraint")
+
+# Two active standing entries count as a tension pair when they share at
+# least this many significant words (>3 chars, ё-folded) — the same word
+# notion `_find_related_active` uses for the add-time contradiction hint.
+_TENSION_MIN_SHARED_WORDS = 2
+
+# Standing rule appended to the frozen memory snapshot when the store holds
+# visible decision/constraint entries: the one-line driver for the
+# `superseded by:` marker (week1-findings §5 — the marker never fired in a
+# week of live use because nothing reminded the model at decision time).
+_SNAPSHOT_STANDING_RULE = (
+    "Memory rule: when a decision or constraint changes, finish the update with "
+    "memory(action=deprecate) on the replaced entry, with reason ending "
+    "'superseded by: <short quote of the new entry>'. The marker links the pair, "
+    "so later recall shows what was decided before and why it changed."
+)
+
+
+def _significant_words(content: str) -> set:
+    """Significant (>3 chars, ё-folded) lowercase words of an entry.
+
+    Tokenized with the search layer's splitter, so hyphenated compounds
+    («канбан-доска») contribute their parts — the same word notion a query
+    would match.
+    """
+    return {
+        _fold_yo(token) for token in _TOKEN_SPLIT_RE.split((content or "").lower())
+        if len(token) > 3
+    }
+
+
+def _tension_pairs(entries: List[Dict[str, Any]], cap: int = 4) -> List[Dict[str, Any]]:
+    """Pairwise overlapping ACTIVE decision/constraint entries — the tension map.
+
+    Deterministic word-overlap pairing (no LLM): two standing entries sharing
+    ≥2 significant words likely describe the same choice and one supersedes
+    the other. Duck-safe for rows without a ``type`` (legacy stores, facts):
+    they simply never pair. Each pair carries both sides with dates so the
+    trajectory is visible, not just the latest state.
+    """
+    standing = [
+        e for e in entries
+        if str(e.get("type") or "") in _TENSION_TYPES
+        and str(e.get("status") or "active") in ("active", "pinned")
+    ]
+    words = {id(e): _significant_words(str(e.get("content") or "")) for e in standing}
+    out: List[Dict[str, Any]] = []
+    for i in range(len(standing)):
+        for j in range(i + 1, len(standing)):
+            a, b = standing[i], standing[j]
+            if len(words[id(a)] & words[id(b)]) < _TENSION_MIN_SHARED_WORDS:
+                continue
+            out.append({
+                "entries": [
+                    {
+                        "id": a.get("id"), "type": a.get("type"), "status": a.get("status", "active"),
+                        "created_at": a.get("created_at"), "content": str(a.get("content") or "")[:160],
+                    },
+                    {
+                        "id": b.get("id"), "type": b.get("type"), "status": b.get("status", "active"),
+                        "created_at": b.get("created_at"), "content": str(b.get("content") or "")[:160],
+                    },
+                ],
+                "note": (
+                    "Two active " + str(a.get("type")) + " entries overlap — one likely supersedes "
+                    "the other. Deprecate the stale one with reason ending "
+                    "'superseded by: <substring of the newer entry>' so the choice history stays linked."
+                ),
+            })
+            if len(out) >= cap:
+                return out
+    return out
+
+
 class MemoryStoreV2(MemoryStore):
     """Typed SQLite memory store; drop-in duck-type replacement for MemoryStore.
 
@@ -599,8 +681,8 @@ class MemoryStoreV2(MemoryStore):
 
         Applies the char budget by dropping the least-important entries
         from the *prompt* only (they stay in the store). Threat-scans via
-        the inherited sanitizer so a poisoned DB row cannot inject into
-        the system prompt.
+        the inherited sanitizer so a poisoned DB row cannot inject into the
+        system prompt.
         """
         for target in ("memory", "user"):
             walk = self._budget_walk(target)
@@ -608,7 +690,25 @@ class MemoryStoreV2(MemoryStore):
             sanitized = self._sanitize_entries_for_snapshot(
                 walk.texts, "MEMORY.md" if target == "memory" else "USER.md"
             )
-            self._system_prompt_snapshot[target] = self._render_block(target, sanitized)
+            block = self._render_block(target, sanitized)
+            # Standing-choices rule (tension-map driver): one line at the
+            # end of the memory snapshot when decision/constraint entries
+            # exist. A suffix of the rendered block, NOT an entry — it never
+            # reaches recall/current_entries; and the snapshot is frozen at
+            # load time, so the prompt-cache invariant holds.
+            if target == "memory" and block and self._has_visible_standing_rows():
+                block = f"{block}\n{_SNAPSHOT_STANDING_RULE}"
+            self._system_prompt_snapshot[target] = block
+
+    def _has_visible_standing_rows(self) -> bool:
+        try:
+            return bool(self._query(
+                "SELECT 1 FROM memories WHERE target='memory'"
+                " AND type IN ('decision','constraint')"
+                " AND status IN ('active','pinned') LIMIT 1"
+            ))
+        except sqlite3.Error:
+            return False
 
     class _ProjectionWalk(NamedTuple):
         """One budget pass over the visible rows (see :meth:`_budget_walk`)."""
@@ -776,14 +876,24 @@ class MemoryStoreV2(MemoryStore):
         resp = self._success_response(target, f"Entry added (type={entry_type}).")
 
         # Contradiction hint: for standing decisions/rules, surface similar
-        # active entries so the model can decide to deprecate them.
-        if entry_type in ("decision", "constraint"):
+        # active entries so the model can decide to deprecate them. The
+        # suggested_deprecate payload carries a ready-to-use call (exact
+        # stored substring + the 'superseded by:' marker) because the bare
+        # hint alone demonstrably did not drive the model to the marker
+        # (week1-findings §5: supersedes links stayed at 0 in live use).
+        if entry_type in _TENSION_TYPES:
             related = self._find_related_active(target, entry_type, content, exclude_id=inserted_id)
             if related:
                 resp["related_active"] = related
                 resp["hint"] = (
-                    "Similar active entries exist. If the new entry supersedes or "
-                    "contradicts one of them, call memory(action=deprecate) on it."
+                    f"Similar active {entry_type} entries exist — treat this as a choice change, "
+                    "not just a new note. Finish the update by calling memory(action=deprecate) "
+                    "with the exact arguments from 'suggested_deprecate' below; its reason ends "
+                    "with the 'superseded by:' marker that links the pair, so later recall shows "
+                    "what was decided before and why it changed."
+                )
+                resp["suggested_deprecate"] = self._build_suggested_deprecate(
+                    target, related[0], content
                 )
         return resp
 
@@ -1084,12 +1194,21 @@ class MemoryStoreV2(MemoryStore):
                 item["supersedes"] = neighbors[r["id"]]
             results.append(item)
 
-        return {
+        resp = {
             "success": True,
             "query": query,
             "results": results,
             "count": len(results),
         }
+        # Tension map: when several ACTIVE decision/constraint entries match
+        # the same query, surface them as an explicit conflicting pair (with
+        # both dates) instead of loose individual hits — the choice
+        # trajectory, not just the latest state. Attached only when present,
+        # so tension-free recalls stay byte-identical.
+        tensions = _tension_pairs([dict(r) for r in rows])
+        if tensions:
+            resp["tensions"] = tensions
+        return resp
 
     # ------------------------------------------------------------------
     # Phase-2 orchestrator API
@@ -1229,6 +1348,42 @@ class MemoryStoreV2(MemoryStore):
             if len(bucket) < 3:
                 bucket.append(entry)
         return out
+
+    def choice_report(self, days: int = 7) -> Dict[str, Any]:
+        """Choice-memory digest: recent decision changes + active tensions.
+
+        Powers the `hermes memory report` "Choice memory" section — the
+        weekly "which decisions changed and why" view (Task 2c). Both parts
+        are deterministic SQL/pairing, no LLM.
+        """
+        days = max(1, int(days))
+        changes = [
+            dict(r) for r in self._query(
+                "SELECT l.created_at AS linked_at, a.content AS new_content,"
+                " a.created_at AS new_created, b.content AS old_content,"
+                " b.created_at AS old_created, b.deprecate_reason AS reason"
+                " FROM memory_links l"
+                " JOIN memories a ON a.id = l.source_id"
+                " JOIN memories b ON b.id = l.target_id"
+                " WHERE l.relation_type='supersedes'"
+                " AND datetime(l.created_at) >= datetime('now', ?)"
+                " ORDER BY datetime(l.created_at) DESC LIMIT 50",
+                (f"-{days} days",),
+            )
+        ]
+        standing = [
+            dict(r) for r in self._query(
+                "SELECT id, type, status, created_at, content FROM memories"
+                " WHERE target='memory' AND type IN ('decision','constraint')"
+                " AND status IN ('active','pinned')"
+                " ORDER BY datetime(created_at) ASC"
+            )
+        ]
+        return {
+            "days": days,
+            "changes": changes,
+            "active_tensions": _tension_pairs(standing, cap=10),
+        }
 
     def rollback_consumer(self, written_by: str, reason: str = "") -> Dict[str, Any]:
         """Scoped revert (Phase 3): deprecate every active row from one consumer.
@@ -1584,6 +1739,41 @@ class MemoryStoreV2(MemoryStore):
              "content": r["content"][:160]}
             for r in rows
         ]
+
+    def _build_suggested_deprecate(
+        self, target: str, related: Dict[str, Any], new_content: str,
+    ) -> Dict[str, Any]:
+        """Ready-to-use deprecate call linking ``related`` to the new entry.
+
+        ``old_text`` is an exact stored-text prefix (NOT model-recalled
+        wording — the 2026-08-20 thrash class), length-escalated to the full
+        content when the prefix is not unique under the same LIKE matching
+        ``deprecate`` uses. ``reason`` embeds the ``superseded by:`` marker
+        with a prefix of the new entry, which ``deprecate`` resolves back to
+        the successor row.
+        """
+        rows = self._query(
+            "SELECT content FROM memories WHERE id=?", (related.get("id"),)
+        )
+        old_content = rows[0]["content"] if rows else str(related.get("content") or "")
+        frag = old_content[:80]
+        try:
+            dupes = self._query(
+                "SELECT COUNT(*) AS c FROM memories WHERE target=?"
+                " AND ulower(content) LIKE ? AND status IN ('active','pinned','dormant')",
+                (target, f"%{frag.lower()}%"),
+            )
+            if dupes and int(dupes[0]["c"]) > 1:
+                frag = old_content
+        except sqlite3.Error:
+            pass  # best-effort uniqueness probe; deprecate re-checks anyway
+        successor_frag = new_content[:40].strip()
+        return {
+            "action": "deprecate",
+            "target": target,
+            "old_text": frag,
+            "reason": f"superseded by: {successor_frag}",
+        }
 
     def _bump_access(self, row_ids: List[str]) -> None:
         """Record retrieval usage (Phase-2 scoring input)."""
