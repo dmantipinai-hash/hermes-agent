@@ -22,4 +22,13 @@ def build_insights_parser(subparsers, *, cmd_insights: Callable) -> None:
     insights_parser.add_argument(
         "--source", help="Filter by platform (cli, telegram, discord, etc.)"
     )
+    insights_parser.add_argument(
+        "--all-profiles",
+        action="store_true",
+        help=(
+            "Report for every profile: the default home plus each "
+            "~/.hermes/profiles/<name>/state.db (agent token economy across "
+            "the whole install)"
+        ),
+    )
     insights_parser.set_defaults(func=cmd_insights)

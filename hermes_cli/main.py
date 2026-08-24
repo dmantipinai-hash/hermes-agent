@@ -12109,19 +12109,37 @@ def cmd_tools(args):
 
 
 def cmd_insights(args):
-    db = None
+    dbs = []
     try:
+        from pathlib import Path
+
         from hermes_state import SessionDB
         from agent.insights import InsightsEngine
 
-        db = SessionDB()
-        engine = InsightsEngine(db)
-        report = engine.generate(days=args.days, source=args.source)
-        print(engine.format_terminal(report))
-    except Exception as e:
-        print(f"Error generating insights: {e}")
+        if getattr(args, "all_profiles", False):
+            # Agent token economy across the whole install: the default
+            # home plus every profile's own state.db.
+            dbs.append((SessionDB(), "default"))
+            profiles_root = Path.home() / ".hermes" / "profiles"
+            for pdir in sorted(profiles_root.glob("*")):
+                db_path = pdir / "state.db"
+                if pdir.is_dir() and db_path.exists():
+                    dbs.append((SessionDB(db_path=db_path), pdir.name))
+        else:
+            dbs.append((SessionDB(), None))
+
+        for db, label in dbs:
+            try:
+                engine = InsightsEngine(db)
+                report = engine.generate(days=args.days, source=args.source)
+                if label:
+                    print(f"\n  ▸ Profile: {label}")
+                print(engine.format_terminal(report))
+            except Exception as e:
+                where = f" for profile {label!r}" if label else ""
+                print(f"Error generating insights{where}: {e}")
     finally:
-        if db is not None:
+        for db, _label in dbs:
             try:
                 db.close()
             except Exception:

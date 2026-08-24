@@ -183,6 +183,7 @@ class InsightsEngine:
                 },
                 "activity": {},
                 "top_sessions": [],
+                "delegation": {},
             }
 
         # Compute insights
@@ -206,6 +207,7 @@ class InsightsEngine:
             "skills": skills,
             "activity": activity,
             "top_sessions": top_sessions,
+            "delegation": self._compute_delegation_economy(sessions),
         }
 
     def get_usage_breakdown(self, days: int = 30, source: str = None) -> Dict[str, Any]:
@@ -233,6 +235,16 @@ class InsightsEngine:
                      "cache_read_tokens, cache_write_tokens, billing_provider, "
                      "billing_base_url, billing_mode, estimated_cost_usd, "
                      "actual_cost_usd, cost_status, cost_source, api_call_count")
+
+    # Delegation economy: the FULL lineage map, not window-filtered — a
+    # child's parent (and a root task's older children) may sit outside the
+    # report window, and tree rollups must still resolve them. Identity +
+    # token columns only; the sessions table is small.
+    _GET_LINEAGE_ALL = (
+        "SELECT id, parent_session_id, title, source, started_at, last_activity_at,"
+        " input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,"
+        " api_call_count, tool_call_count FROM sessions"
+    )
 
     # Pre-computed query strings — f-string evaluated once at class definition,
     # not at runtime, so no user-controlled value can alter the query structure.
@@ -905,6 +917,149 @@ class InsightsEngine:
             "max_streak": max_streak,
         }
 
+    # ------------------------------------------------------------------
+    # Delegation economy — tokens only (developer analytics, no costs)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _tok(row: Dict) -> int:
+        """Token footprint of one session row: in + out + cache both ways."""
+        return (
+            int(row.get("input_tokens") or 0)
+            + int(row.get("output_tokens") or 0)
+            + int(row.get("cache_read_tokens") or 0)
+            + int(row.get("cache_write_tokens") or 0)
+        )
+
+    def _compute_delegation_economy(self, window_sessions: List[Dict]) -> Dict[str, Any]:
+        """Delegation-tree economics reconstructed from session lineage.
+
+        ``delegate_task`` children are full sessions carrying their own
+        token rows and a ``parent_session_id`` edge, so the tree ALREADY
+        exists in the ledger — this is a pure read-side rollup (the
+        agent-token-economy design: measure everything, write nothing new,
+        never touch the model's context window). Tokens only, by design —
+        no cost figures in this section.
+        """
+        try:
+            rows = [dict(r) for r in self._conn.execute(self._GET_LINEAGE_ALL).fetchall()]
+        except sqlite3.Error:
+            rows = []
+        by_id = {r["id"]: r for r in rows}
+        children_of: Dict[str, List[str]] = {}
+        for r in rows:
+            p = r.get("parent_session_id")
+            if p:
+                children_of.setdefault(p, []).append(r["id"])
+
+        # Depth from the root (roots = 0, direct children = 1, …), memoized
+        # and cycle-guarded: a corrupted lineage degrades, never hangs.
+        depth_cache: Dict[str, int] = {}
+
+        def depth(sid: str) -> int:
+            seen: set = set()
+            d = 0
+            cur = sid
+            while True:
+                if cur in depth_cache:
+                    d += depth_cache[cur]
+                    break
+                if cur in seen or cur not in by_id:
+                    break
+                seen.add(cur)
+                p = by_id[cur].get("parent_session_id")
+                if not p or p not in by_id:
+                    break
+                d += 1
+                cur = p
+            depth_cache[sid] = d
+            return d
+
+        def descendants(sid: str) -> List[str]:
+            out: List[str] = []
+            stack = list(children_of.get(sid, []))
+            seen: set = set()
+            while stack:
+                cur = stack.pop()
+                if cur in seen or cur not in by_id:
+                    continue
+                seen.add(cur)
+                out.append(cur)
+                stack.extend(children_of.get(cur, []))
+            return out
+
+        def root_of(sid: str) -> str:
+            cur, seen = sid, set()
+            while cur not in seen and cur in by_id:
+                seen.add(cur)
+                p = by_id[cur].get("parent_session_id")
+                if not p or p not in by_id:
+                    return cur
+                cur = p
+            return cur
+
+        window_ids = {s["id"] for s in window_sessions}
+        child_rows = [
+            by_id[i] for i in window_ids
+            if i in by_id and by_id[i].get("parent_session_id")
+        ]
+        main_rows = [
+            by_id[i] for i in window_ids
+            if i in by_id and not by_id[i].get("parent_session_id")
+        ]
+
+        def _cache_hit(session_rows: List[Dict]):
+            cr = sum(int(r.get("cache_read_tokens") or 0) for r in session_rows)
+            inp = sum(int(r.get("input_tokens") or 0) for r in session_rows)
+            return (cr / (cr + inp) * 100) if (cr + inp) else None
+
+        children_tok = sum(self._tok(r) for r in child_rows)
+        main_tok = sum(self._tok(r) for r in main_rows)
+        total_tok = children_tok + main_tok
+
+        # Root tasks: each root whose subtree intersects the window gets ONE
+        # entry rolled up over the whole tree (root + all descendants), even
+        # when individual rows sit outside the window.
+        tree_tasks: List[Dict[str, Any]] = []
+        seen_roots: set = set()
+        for s in window_sessions:
+            root = root_of(s["id"])
+            if root in seen_roots or root not in by_id:
+                continue
+            seen_roots.add(root)
+            ids = [root] + descendants(root)
+            tree_tasks.append({
+                "title": (by_id[root].get("title") or root)[:60],
+                "tokens": sum(self._tok(by_id[i]) for i in ids),
+                "sessions": len(ids),
+                "children": len(ids) - 1,
+                "api_calls": sum(
+                    int(by_id[i].get("api_call_count") or 0) for i in ids
+                ),
+            })
+        tree_tasks.sort(key=lambda t: -t["tokens"])
+
+        child_toks = sorted((self._tok(r) for r in child_rows), reverse=True)
+        return {
+            "children": len(child_rows),
+            "main_sessions": len(main_rows),
+            "children_tokens": children_tok,
+            "main_tokens": main_tok,
+            "children_share_pct": (
+                children_tok / total_tok * 100 if total_tok else None
+            ),
+            "avg_child_tokens": children_tok // len(child_rows) if child_rows else 0,
+            "max_child_tokens": child_toks[0] if child_toks else 0,
+            "max_depth": max((depth(i) for i in window_ids), default=0),
+            "cache_hit_children_pct": _cache_hit(child_rows),
+            "cache_hit_main_pct": _cache_hit(main_rows),
+            "top_children": [
+                {"title": (r.get("title") or r["id"])[:60], "tokens": self._tok(r)}
+                for r in sorted(child_rows, key=lambda r: -self._tok(r))[:5]
+            ],
+            "top_trees": tree_tasks[:5],
+        }
+
     def _compute_top_sessions(self, sessions: List[Dict]) -> List[Dict]:
         """Find notable sessions (longest, most messages, most tokens)."""
         top = []
@@ -1033,6 +1188,43 @@ class InsightsEngine:
                     f"  Unknown:            {unknown_sessions} session(s) "
                     f"(no pricing data)"
                 )
+            lines.append("")
+
+        # Delegation economy — tokens only (the agent-token-economy view).
+        # Lineage edges come from BOTH delegate_task children AND
+        # compression continuations (hermes_state sets parent_session_id for
+        # either), so this is the conversation-tree economy: "how many
+        # tokens did the whole task cost, root and every branch" — the unit
+        # the token-economy work wants. Read-side only; the model never
+        # sees any of this at runtime.
+        d = report.get("delegation") or {}
+        if d.get("children"):
+            lines.append("  🧭 Delegation economy (tokens)")
+            lines.append("  " + "─" * 56)
+            share = d.get("children_share_pct")
+            share_s = f"{share:.0f}%" if share is not None else "—"
+            lines.append(
+                f"  Sub-sessions (delegated + compression forks): {d['children']}"
+                f" · {d['children_tokens']:,} tokens ({share_s} of all)"
+            )
+            lines.append(
+                f"  Per child: avg {d['avg_child_tokens']:,} · max {d['max_child_tokens']:,}"
+                f" · deepest depth {d['max_depth']}"
+            )
+            ch = d.get("cache_hit_children_pct")
+            mn = d.get("cache_hit_main_pct")
+            if ch is not None and mn is not None:
+                lines.append(f"  Cache hits: children {ch:.0f}% vs main {mn:.0f}%")
+            if d.get("top_children"):
+                lines.append("  Heaviest children:")
+                for c in d["top_children"]:
+                    lines.append(f"    · {c['tokens']:>12,}  {c['title']}")
+            if d.get("top_trees"):
+                lines.append("  Top tasks (root + descendants):")
+                for t in d["top_trees"]:
+                    lines.append(
+                        f"    · {t['tokens']:>12,}  {t['title']}  ({t['children']} children)"
+                    )
             lines.append("")
 
         # Model breakdown
