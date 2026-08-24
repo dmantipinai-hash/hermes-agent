@@ -22,7 +22,7 @@ import re
 import pytest
 
 import tools.memory_tool as mt
-from agent.memory_store_v2 import MemoryStoreV2
+from agent.memory_store_v2 import MemoryStoreV2, _FTS_SQL_CREATE_ONLY
 from agent.memory_orchestrator import MemoryOrchestrator
 
 
@@ -545,27 +545,80 @@ class TestYoFolding:
             s.close()
 
     def test_v3_migration_rebuilds_stale_index(self, mem_dir):
-        # Simulate a v2 database: rows indexed before the fold existed.
+        # Simulate a genuine v2 database: the index holds RAW content (what
+        # the pre-fold triggers wrote). The masked-lesson from 2026-08-24:
+        # assertions must hit the FTS index DIRECTLY — recall()'s LIKE
+        # fallback folds the column and hides a raw index, and the old
+        # version of this test passed through exactly that mask.
         s = MemoryStoreV2()
         s.load_from_disk()
         s.add("memory", "Ёлочные игрушки в кладовке")
-        s._execute_write(
-            lambda conn: conn.execute("INSERT INTO memories_fts(memories_fts) VALUES('delete-all')")
-        )
+        s.add("memory", "Приоритет: велотренажёр не купил — сначала ноутбук")
+        # Rebuild the index RAW (the pre-fold state). Plain executes under
+        # the lock — executescript would implicitly COMMIT the transaction
+        # _execute_write opened.
+        conn = s._connect()
+        with s._db_lock:
+            conn.execute("DROP TABLE memories_fts")
+            conn.execute(_FTS_SQL_CREATE_ONLY.strip())
+            conn.execute(
+                "INSERT INTO memories_fts(rowid, content)"
+                " SELECT rowid, content FROM memories"
+            )
         s._execute_write(
             lambda conn: conn.execute(
                 "INSERT OR REPLACE INTO meta(key, value) VALUES ('schema_version', '2')"
             )
         )
         s.close()
-        # Reopening with current code runs the v2→v3 migration: triggers are
-        # replaced and the FTS index is rebuilt from the content table.
+        # Reopening runs the v2→v3 migration: drop + recreate + FOLDED bulk
+        # insert ('rebuild' is unusable here — it re-reads content past the
+        # folding triggers, exactly the defect found live on 2026-08-24).
         s2 = MemoryStoreV2()
         s2.load_from_disk()
         try:
-            assert s2.recall("елочные игрушки")["count"] == 1
+            # Direct FTS phrase path — no LIKE fallback involved.
+            raw = s2._fts_search("елочные игрушки")
+            assert raw and raw[0]["content"].startswith("Ёлочные")
+            assert s2._fts_search("велотренажер")   # е-form hits the index
+            # The index itself contains no ё-spelled tokens — raw SQL, the
+            # same check used to catch the defect live on 2026-08-24.
+            # (_fts_search folds the query, so it cannot prove this.)
+            conn = s2._connect()
+            with s2._db_lock:
+                yo_hits = conn.execute(
+                    "SELECT COUNT(*) FROM memories_fts"
+                    " WHERE memories_fts MATCH '\"велотренажёр\"'"
+                ).fetchone()[0]
+            assert yo_hits == 0
+            # Orchestrator path (recall_candidates) — the surface the live
+            # defect actually broke; empty-alias store by fixture isolation.
+            cands = s2.recall_candidates("нужен ли вообще велотренажер")
+            assert any("велотренажёр" in c["content"] for c in cands)
+            # Content column stays verbatim; version stamped.
             assert s2._query(
                 "SELECT value FROM meta WHERE key='schema_version'"
             )[0]["value"] == "3"
         finally:
             s2.close()
+
+    def test_migration_defect_class_caught_by_orchestrator_fallback(self, mem_dir):
+        # Even with a RAW (out-of-sync) index and FTS5 present, the
+        # orchestrator path must degrade to the folded LIKE search instead
+        # of returning nothing — the resilience net for the 2026-08-24 class.
+        s = MemoryStoreV2()
+        s.load_from_disk()
+        s.add("memory", "Ёлочные игрушки в кладовке")
+        conn = s._connect()
+        with s._db_lock:
+            conn.execute("DROP TABLE memories_fts")
+            conn.execute(_FTS_SQL_CREATE_ONLY.strip())
+            conn.execute(
+                "INSERT INTO memories_fts(rowid, content)"
+                " SELECT rowid, content FROM memories"
+            )
+        try:
+            cands = s.recall_candidates("елочные игрушки где")
+            assert any("Ёлочные" in c["content"] for c in cands)
+        finally:
+            s.close()

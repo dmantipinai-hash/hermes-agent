@@ -133,12 +133,15 @@ CREATE TABLE IF NOT EXISTS meta (
 # at QUERY time (see _fold_yo) closes the whole class (P7). The
 # ``memories.content`` column itself stays verbatim. Triggers are
 # DROP+CREATE (not IF NOT EXISTS) so a schema update replaces old bodies.
-_FTS_SQL = """
+_FTS_SQL_CREATE_ONLY = """
 CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
     content,
     content=memories,
     content_rowid=rowid
 );
+"""
+
+_FTS_SQL = _FTS_SQL_CREATE_ONLY + """
 DROP TRIGGER IF EXISTS memories_fts_ai;
 CREATE TRIGGER memories_fts_ai AFTER INSERT ON memories BEGIN
     INSERT INTO memories_fts(rowid, content)
@@ -372,16 +375,27 @@ class MemoryStoreV2(MemoryStore):
     def _migrate_v2_to_v3(conn: sqlite3.Connection) -> None:
         """v2 → v3: rebuild the FTS index with е-folded content (P7).
 
-        The new triggers (from _FTS_SQL, already installed by the time this
-        runs) fold ё→е on writes; the rebuild applies the same fold to rows
-        indexed before the change. The ``memories.content`` column is not
-        touched — entries stay verbatim, only the search index is folded.
+        ``INSERT INTO memories_fts(memories_fts) VALUES('rebuild')`` is NOT
+        usable here: for an external-content table it re-reads
+        ``memories.content`` directly, bypassing the folding triggers — the
+        index ends up raw while the schema claims v3 (live incident
+        2026-08-24: 21 of 47 rows stayed invisible to е-form searches; the
+        explicit-recall path hid it behind its LIKE fallback). Instead, drop
+        and recreate the FTS table, then bulk-insert FOLDED content straight
+        from the content table — exactly what the triggers do per row. The
+        ``memories.content`` column is not touched: entries stay verbatim.
         """
         try:
-            conn.execute("INSERT INTO memories_fts(memories_fts) VALUES('rebuild')")
+            conn.execute("DROP TABLE IF EXISTS memories_fts")
+            conn.executescript(_FTS_SQL)  # recreate virtual table + triggers
+            conn.execute(
+                "INSERT INTO memories_fts(rowid, content)"
+                " SELECT rowid, replace(replace(content, 'ё', 'е'), 'Ё', 'Е')"
+                " FROM memories"
+            )
         except sqlite3.OperationalError as exc:
-            logger.debug("memory.db: FTS rebuild skipped (%s)", exc)
-        logger.info("memory.db: migrated schema v2 → v3 (е-folded FTS rebuild)")
+            logger.debug("memory.db: folded FTS reindex skipped (%s)", exc)
+        logger.info("memory.db: migrated schema v2 → v3 (е-folded FTS reindex)")
 
     def _execute_write(self, fn) -> Any:
         """Run ``fn(conn)`` inside a locked BEGIN IMMEDIATE transaction.
@@ -1145,6 +1159,15 @@ class MemoryStoreV2(MemoryStore):
         rows: Optional[List[sqlite3.Row]] = self._fts_search_any(stems, exact_terms)
         if rows is None:
             rows = self._like_search_any(stems, exact_terms)
+        elif not rows and stems:
+            # Empty FTS + stem terms: degrade to the folded LIKE search —
+            # the safety net for an index drifted out of sync with the
+            # folding contract (2026-08-24 defect class: raw index, folded
+            # column). STEMS ONLY though: exact short terms must stay
+            # exact-token (vpn ≠ vpnhub) — their substring would smear the
+            # B′ precision contract, so an FTS miss on an exact term is a
+            # real miss, not a fallback case.
+            rows = self._like_search_any(stems, [])
         seen: set = set()
         out: List[Dict[str, Any]] = []
         for r in rows:
