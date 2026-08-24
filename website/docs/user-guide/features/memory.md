@@ -76,6 +76,8 @@ Queries go through a recall-oriented funnel:
 2. **Whole-query substring** — bridges simple inflection (`персонаж` → `персонажа`).
 3. **Term OR-search fallback** — for natural-language queries that share no contiguous phrase with any entry: every word ≥4 chars becomes a truncated prefix stem (`зависимости`/`зависимостей` → `завис*`), and **3-character terms match exactly** (`vpn`, `vps`, `dns`, `kvm` — whole tokens, never prefixes: `vpn` will not match `vpnhub`), plus configured [aliases](#synonym-aliases-memoryaliases).
 
+Russian ё/е spelling divergence (`велотренажёр` vs `велотренажер`) is folded on **both** sides — the full-text index and every query path — so either spelling finds either. Stored entries keep their original spelling; the fold lives in the search layer only.
+
 Results carry `type`, `status`, `importance`, and — when the entry supersedes another — a `supersedes` block with the predecessor's id, date and content preview.
 
 ### Decision provenance (`supersedes` links)

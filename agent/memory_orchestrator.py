@@ -90,6 +90,17 @@ _INTENT_MARKERS: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
 _TOKEN_SPLIT_RE = re.compile(r"[^\w]+", re.UNICODE)
 
 
+def _fold_yo(text: str) -> str:
+    """е-fold for search-side scoring (P7) — twin of memory_store_v2._fold_yo.
+
+    Kept local so the orchestrator stays store-agnostic (it duck-types the
+    store and must not import the v2 module). The scorer must fold exactly
+    like the store's search paths, or a candidate found via е/ё-tolerant
+    search would be scored to zero by an intolerant relevance pass.
+    """
+    return (text or "").replace("ё", "е").replace("Ё", "Е")
+
+
 def _message_tokens(message: str) -> List[str]:
     """Lowercased word tokens of the message (unicode-aware split)."""
     return [t.lower() for t in _TOKEN_SPLIT_RE.split(message or "") if t]
@@ -183,14 +194,16 @@ def relevance_score(query_tokens: Sequence[str], content: str) -> float:
     """Fraction of query tokens whose stem appears in the entry content.
 
     Prefix matching (min 4 chars) absorbs Cyrillic morphology; shorter query
-    tokens must appear as substrings. Returns 0.0 when the query carries no
-    usable tokens.
+    tokens must appear as substrings. Both sides are е-folded (P7) so
+    ё/е-spelling divergence never zeros out a match the store's search
+    already found. Returns 0.0 when the query carries no usable tokens.
     """
     if not query_tokens:
         return 0.0
-    lowered = (content or "").lower()
+    lowered = _fold_yo((content or "").lower())
     hit = 0
     for token in query_tokens:
+        token = _fold_yo(token)
         if len(token) >= 4:
             if any(w.startswith(token) for w in lowered.split()):
                 hit += 1

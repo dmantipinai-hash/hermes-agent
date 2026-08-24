@@ -30,7 +30,7 @@ from agent.memory_bus import (
     MemoryBus,
     build_delegation_briefing,
 )
-from agent.memory_store_v2 import MemoryStoreV2
+from agent.memory_store_v2 import SCHEMA_VERSION, MemoryStoreV2
 from tools.memory_tool import memory_tool
 
 
@@ -93,7 +93,7 @@ def test_v1_database_migrates_to_v2(mem_dir):
 
     s = _fresh(mem_dir)
     version = s._query("SELECT value FROM meta WHERE key='schema_version'")[0]["value"]
-    assert version == "2"
+    assert version == str(SCHEMA_VERSION), "a v1 DB must land on the current schema"
     cols = {r["name"] for r in s._query("PRAGMA table_info(memories)")}
     assert "written_by" in cols
     hits = s.recall_candidates("Запись из Фазы")

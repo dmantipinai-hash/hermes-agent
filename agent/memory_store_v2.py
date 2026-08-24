@@ -61,7 +61,7 @@ _VISIBLE_STATUSES = ("active", "pinned")
 # a ``[type]`` prefix in the snapshot so the model treats them as binding.
 _PREFIXED_TYPES = ("decision", "constraint")
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 _SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS memories (
@@ -127,24 +127,34 @@ CREATE TABLE IF NOT EXISTS meta (
 """
 
 # FTS5 index over entry content, kept in sync by triggers (same shape as
-# plugins/memory/holographic/store.py).
+# plugins/memory/holographic/store.py). The index stores е-folded content:
+# Russian is written with both ё and е, and for FTS5 «велотренажёр» and
+# «велотренажер» are different tokens — folding at INDEX time plus folding
+# at QUERY time (see _fold_yo) closes the whole class (P7). The
+# ``memories.content`` column itself stays verbatim. Triggers are
+# DROP+CREATE (not IF NOT EXISTS) so a schema update replaces old bodies.
 _FTS_SQL = """
 CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
     content,
     content=memories,
     content_rowid=rowid
 );
-CREATE TRIGGER IF NOT EXISTS memories_fts_ai AFTER INSERT ON memories BEGIN
-    INSERT INTO memories_fts(rowid, content) VALUES (new.rowid, new.content);
+DROP TRIGGER IF EXISTS memories_fts_ai;
+CREATE TRIGGER memories_fts_ai AFTER INSERT ON memories BEGIN
+    INSERT INTO memories_fts(rowid, content)
+    VALUES (new.rowid, replace(replace(new.content, 'ё', 'е'), 'Ё', 'Е'));
 END;
-CREATE TRIGGER IF NOT EXISTS memories_fts_ad AFTER DELETE ON memories BEGIN
+DROP TRIGGER IF EXISTS memories_fts_ad;
+CREATE TRIGGER memories_fts_ad AFTER DELETE ON memories BEGIN
     INSERT INTO memories_fts(memories_fts, rowid, content)
-    VALUES ('delete', old.rowid, old.content);
+    VALUES ('delete', old.rowid, replace(replace(old.content, 'ё', 'е'), 'Ё', 'Е'));
 END;
-CREATE TRIGGER IF NOT EXISTS memories_fts_au AFTER UPDATE ON memories BEGIN
+DROP TRIGGER IF EXISTS memories_fts_au;
+CREATE TRIGGER memories_fts_au AFTER UPDATE ON memories BEGIN
     INSERT INTO memories_fts(memories_fts, rowid, content)
-    VALUES ('delete', old.rowid, old.content);
-    INSERT INTO memories_fts(rowid, content) VALUES (new.rowid, new.content);
+    VALUES ('delete', old.rowid, replace(replace(old.content, 'ё', 'е'), 'Ё', 'Е'));
+    INSERT INTO memories_fts(rowid, content)
+    VALUES (new.rowid, replace(replace(new.content, 'ё', 'е'), 'Ё', 'Е'));
 END;
 """
 
@@ -170,6 +180,20 @@ def _fts_quote(query: str) -> str:
     """
     escaped = query.replace('"', '""')
     return f'"{escaped}"'
+
+
+def _fold_yo(text: str) -> str:
+    """е-fold text for the SEARCH layer only (P7).
+
+    Russian is routinely written with ё replaced by е, and for lexical
+    search «велотренажёр»/«велотренажер» are different words. Fold ё→е on
+    BOTH sides (query terms here, indexed content via the FTS triggers) so
+    either spelling matches either. Stored entries stay verbatim — this
+    fold must never leak into ``memories.content`` or the projections.
+    Keep in sync with the twin in agent/memory_orchestrator.py (kept local
+    there so the orchestrator stays store-agnostic).
+    """
+    return (text or "").replace("ё", "е").replace("Ё", "Е")
 
 
 # Word-split + crude stemming for orchestrator token search (recall-
@@ -320,6 +344,8 @@ class MemoryStoreV2(MemoryStore):
         version = int(stored["value"]) if stored else SCHEMA_VERSION
         if version < 2:
             self._migrate_v1_to_v2(conn)
+        if version < 3:
+            self._migrate_v2_to_v3(conn)
         conn.execute(
             "INSERT OR REPLACE INTO meta(key, value) VALUES ('schema_version', ?)",
             (str(SCHEMA_VERSION),),
@@ -341,6 +367,21 @@ class MemoryStoreV2(MemoryStore):
         except sqlite3.OperationalError as exc:
             logger.debug("memory.db: FTS rebuild skipped (%s)", exc)
         logger.info("memory.db: migrated schema v1 → v2 (written_by column)")
+
+    @staticmethod
+    def _migrate_v2_to_v3(conn: sqlite3.Connection) -> None:
+        """v2 → v3: rebuild the FTS index with е-folded content (P7).
+
+        The new triggers (from _FTS_SQL, already installed by the time this
+        runs) fold ё→е on writes; the rebuild applies the same fold to rows
+        indexed before the change. The ``memories.content`` column is not
+        touched — entries stay verbatim, only the search index is folded.
+        """
+        try:
+            conn.execute("INSERT INTO memories_fts(memories_fts) VALUES('rebuild')")
+        except sqlite3.OperationalError as exc:
+            logger.debug("memory.db: FTS rebuild skipped (%s)", exc)
+        logger.info("memory.db: migrated schema v2 → v3 (е-folded FTS rebuild)")
 
     def _execute_write(self, fn) -> Any:
         """Run ``fn(conn)`` inside a locked BEGIN IMMEDIATE transaction.
@@ -449,12 +490,14 @@ class MemoryStoreV2(MemoryStore):
                 if not isinstance(term, str) or not term.strip():
                     continue
                 values = [
-                    str(a).strip().lower()
+                    _fold_yo(str(a).strip().lower())
                     for a in (aliases if isinstance(aliases, (list, tuple)) else [aliases])
                     if isinstance(a, str) and a.strip()
                 ]
                 if values:
-                    clean[term.strip().lower()] = tuple(dict.fromkeys(values))
+                    # Keys are folded too (P7): a ё-spelled config key must
+                    # fire for an е-spelled query word and vice versa.
+                    clean[_fold_yo(term.strip().lower())] = tuple(dict.fromkeys(values))
         self._alias_map = clean
 
         def _rewrite(conn: sqlite3.Connection) -> None:
@@ -1055,7 +1098,7 @@ class MemoryStoreV2(MemoryStore):
         out_stems = list(stems)
         out_exact = list(exact_terms)
         for token in _TOKEN_SPLIT_RE.split(query or ""):
-            token = token.lower()
+            token = _fold_yo(token.lower())
             if len(token) < _TOKEN_MIN_STEM:
                 continue
             for alias in self._alias_map.get(token, ()):
@@ -1097,6 +1140,8 @@ class MemoryStoreV2(MemoryStore):
         if not stems and not exact_terms:
             return []
         stems, exact_terms = self._alias_expand(query, stems, exact_terms)
+        stems = list(dict.fromkeys(_fold_yo(s) for s in stems))
+        exact_terms = list(dict.fromkeys(_fold_yo(t) for t in exact_terms))
         rows: Optional[List[sqlite3.Row]] = self._fts_search_any(stems, exact_terms)
         if rows is None:
             rows = self._like_search_any(stems, exact_terms)
@@ -1390,6 +1435,8 @@ class MemoryStoreV2(MemoryStore):
             exact_terms = _query_exact_terms(query)
             if stems or exact_terms:
                 stems, exact_terms = self._alias_expand(query, stems, exact_terms)
+                stems = list(dict.fromkeys(_fold_yo(s) for s in stems))
+                exact_terms = list(dict.fromkeys(_fold_yo(t) for t in exact_terms))
                 rows = self._fts_search_any(stems, exact_terms)
                 if rows is None:
                     rows = self._like_search_any(stems, exact_terms)
@@ -1408,14 +1455,19 @@ class MemoryStoreV2(MemoryStore):
         return out
 
     def _fts_search(self, query: str) -> Optional[List[sqlite3.Row]]:
-        """FTS5 MATCH search; ``None`` means FTS unavailable (fall back)."""
+        """FTS5 MATCH search; ``None`` means FTS unavailable (fall back).
+
+        The phrase is е-folded (P7) to match the folded index — both
+        spellings of ё-words resolve on the phrase path, same as on the
+        stem-OR fallback paths.
+        """
         conn = self._connect()
         try:
             with self._db_lock:
                 rows = conn.execute(
                     "SELECT m.* FROM memories_fts f JOIN memories m ON m.rowid = f.rowid"
                     " WHERE memories_fts MATCH ? LIMIT 60",
-                    (_fts_quote(query),),
+                    (_fts_quote(_fold_yo(query)),),
                 ).fetchall()
             return list(rows)
         except sqlite3.OperationalError as exc:
@@ -1423,10 +1475,16 @@ class MemoryStoreV2(MemoryStore):
             return None
 
     def _like_search(self, query: str) -> List[sqlite3.Row]:
-        """Substring fallback when FTS5 is unavailable or matched nothing."""
+        """Substring fallback when FTS5 is unavailable or matched nothing.
+
+        Both sides are е-folded: the column via native replace() (matching
+        the FTS triggers), the pattern via _fold_yo — a table scan either
+        way, so the extra replace costs nothing asymptotic.
+        """
         return self._query(
-            "SELECT * FROM memories WHERE ulower(content) LIKE ? LIMIT 60",
-            (f"%{query.lower()}%",),
+            "SELECT * FROM memories WHERE ulower(replace(replace(content, 'ё', 'е'), 'Ё', 'Е'))"
+            " LIKE ? LIMIT 60",
+            (f"%{_fold_yo(query).lower()}%",),
         )
 
     def _fts_search_any(
@@ -1459,12 +1517,19 @@ class MemoryStoreV2(MemoryStore):
     def _like_search_any(
         self, stems: List[str], exact_terms: Sequence[str] = (),
     ) -> List[sqlite3.Row]:
-        """Substring OR fallback for term search (FTS5 unavailable/mismatch)."""
+        """Substring OR fallback for term search (FTS5 unavailable/mismatch).
+
+        The column is е-folded via native replace() (same as the FTS
+        triggers); the patterns arrive already folded from the callers.
+        """
         patterns = [f"%{s.lower()}%" for s in stems]
         patterns.extend(f"%{t.lower()}%" for t in exact_terms)
         if not patterns:
             return []
-        clauses = " OR ".join("ulower(content) LIKE ?" for _ in patterns)
+        clauses = " OR ".join(
+            "ulower(replace(replace(content, 'ё', 'е'), 'Ё', 'Е')) LIKE ?"
+            for _ in patterns
+        )
         return self._query(
             f"SELECT * FROM memories WHERE ({clauses}) LIMIT 120", tuple(patterns),
         )
@@ -1477,10 +1542,13 @@ class MemoryStoreV2(MemoryStore):
         Used for the contradiction hint on decision/constraint writes: the
         model sees potentially superseded entries and can deprecate them.
         """
-        words = [w for w in content.lower().split() if len(w) > 3][:8]
+        words = [_fold_yo(w) for w in content.lower().split() if len(w) > 3][:8]
         if not words:
             return []
-        clauses = " OR ".join("ulower(content) LIKE ?" for _ in words)
+        clauses = " OR ".join(
+            "ulower(replace(replace(content, 'ё', 'е'), 'Ё', 'Е')) LIKE ?"
+            for _ in words
+        )
         params = [f"%{w}%" for w in words]
         rows = self._query(
             f"SELECT id, type, status, importance, content FROM memories"

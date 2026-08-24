@@ -486,3 +486,86 @@ class TestAliasExpansion:
             assert any("vpn" in c["content"] for c in s2.recall_candidates("прокси"))
         finally:
             s2.close()
+
+
+class TestYoFolding:
+    """P7: е/ё normalization in the search layer — closes the whole spelling
+    class («велотренажёр»/«велотренажер», «ёлка»/«елка»), not one alias pair.
+
+    Contracts а–д from the week-1 findings: cross-spelling recall with an
+    EMPTY alias dict; verbatim storage; alias layer composes; phrase path
+    folded too; audit logs the raw query.
+    """
+
+    ENTRY = "Приоритет трат: велотренажёр не купил — сначала ноутбук"
+
+    def test_a_e_spelled_query_finds_yo_spelled_entry(self, store):
+        store.add("memory", self.ENTRY, entry_type="decision")
+        assert store.recall("велотренажер")["count"] == 1
+        cands = store.recall_candidates("нужен ли вообще велотренажер")
+        assert any("велотренажёр" in c["content"] for c in cands)
+
+    def test_b_entries_stored_verbatim(self, store, mem_dir):
+        store.add("memory", "Ёлка выше дома")
+        row = store._query("SELECT content FROM memories")[0]
+        assert row["content"] == "Ёлка выше дома"
+        assert "Ёлка" in (mem_dir / "MEMORY.md").read_text(encoding="utf-8")
+
+    def test_c_aliases_compose_with_folding(self, mem_dir):
+        s = MemoryStoreV2()
+        s.load_from_disk()
+        s.set_alias_cache({"тренажёр": ["велотренажер"]})  # ё-spelled key, е-spelled value
+        s.add("memory", "Купил велотренажёр в кредит")
+        try:
+            # е-spelled query fires the ё-spelled key; folded alias matches.
+            cands = s.recall_candidates("тренажер какую модель")
+            assert any("велотренажёр" in c["content"] for c in cands)
+        finally:
+            s.close()
+
+    def test_d_phrase_path_folded_both_directions(self, store):
+        store.add("memory", "Планёрка по бюджету перенесена")
+        assert store.recall("планерка по бюджету")["count"] == 1   # е → ё
+        store.add("memory", "Черная кофта куплена")
+        assert store.recall("чёрная кофта")["count"] == 1          # ё → е
+
+    def test_e_audit_logs_raw_query(self, mem_dir):
+        s = MemoryStoreV2()
+        s.load_from_disk()
+        try:
+            s.recall("ёлка")  # nothing stored → empty recall, still logged
+            rows = s._query(
+                "SELECT query_stems FROM memory_recall_log ORDER BY id DESC LIMIT 1"
+            )
+            assert "ёлка" in rows[0]["query_stems"], (
+                "audit must record the RAW query — folding it would pollute "
+                "top_empty_queries, the alias auto-mining source"
+            )
+        finally:
+            s.close()
+
+    def test_v3_migration_rebuilds_stale_index(self, mem_dir):
+        # Simulate a v2 database: rows indexed before the fold existed.
+        s = MemoryStoreV2()
+        s.load_from_disk()
+        s.add("memory", "Ёлочные игрушки в кладовке")
+        s._execute_write(
+            lambda conn: conn.execute("INSERT INTO memories_fts(memories_fts) VALUES('delete-all')")
+        )
+        s._execute_write(
+            lambda conn: conn.execute(
+                "INSERT OR REPLACE INTO meta(key, value) VALUES ('schema_version', '2')"
+            )
+        )
+        s.close()
+        # Reopening with current code runs the v2→v3 migration: triggers are
+        # replaced and the FTS index is rebuilt from the content table.
+        s2 = MemoryStoreV2()
+        s2.load_from_disk()
+        try:
+            assert s2.recall("елочные игрушки")["count"] == 1
+            assert s2._query(
+                "SELECT value FROM meta WHERE key='schema_version'"
+            )[0]["value"] == "3"
+        finally:
+            s2.close()
