@@ -162,6 +162,24 @@ Rules:
 - Takes effect on the next session start (config is read at agent init).
 - To grow the dictionary: watch `top_empty_queries` in `hermes memory report` — recurring misses are alias candidates. Hermes will suggest; **you** decide what goes into config.yaml.
 
+## Metacognitive Awareness (stuck-pattern memory)
+
+When the agent keeps slamming into the same wall, awareness closes the loop over memory: **DETECT → RECALL → RECORD**, entirely deterministic (no extra LLM calls, ~0 latency).
+
+- **DETECT** reuses the tool-loop guardrail signals — a tool failing repeatedly with identical arguments, one tool failing N times in a turn, read-only calls returning identical results — plus two memory-side feeds: `No entry matched` errors from the `memory` tool, and streaks of empty `memory read` results against a store that *has* entries.
+- **RECALL**: at the moment a stuck pattern is detected, the store is searched (one FTS query) for a prior `pattern` entry about the same tool and failure. If found, a compact note rides along in the tool result: `[Awareness: stuck pattern 'search_files' seen before. Past experience: … What helped: read_file(/data). Outcome: recovered.]` — the agent reads it and can switch strategy immediately instead of retrying blindly.
+- **RECORD**: at the end of a turn where a stuck episode occurred, the honest outcome is written back as a `pattern` entry (`written_by: awareness:<session>`): *stuck pattern → what helped → outcome*. Interrupted turns record nothing — experience without a verified outcome is not growth. Recovery briefs quote only whitelisted argument kinds (command/path/query/url), never file contents.
+
+Turn the loop off (or back on) with `/awareness off|on|status` — the change applies immediately and never touches the system prompt, so the prompt cache is unaffected. On Slack the command is reachable as `/hermes awareness` (Slack's 50-slash cap). While `memory.write_approval` is on, recording is skipped — the gate applies to this writer too. Entries are ordinary `pattern`-typed rows: searchable, importance-demotable, evictable — never auto-promoted into skills.
+
+```yaml
+awareness:
+  mode: auto              # auto | off
+  record: true            # write stuck-pattern experience to the store
+  note_on_detect: true    # inject the past-experience note
+  empty_recall_streak: 3  # empty memory reads before the nudge
+```
+
 ## What to Save vs Skip
 
 **Save (proactively):** user preferences and corrections → `user`; decisions with reasons and constraints → `memory` as `type=decision`/`constraint`; environment facts, project conventions, tool quirks, stable lessons → `memory`.
@@ -228,6 +246,12 @@ memory:
     enabled: true
     token_budget: 2500
     max_entries: 20
+
+awareness:                        # stuck-pattern DETECT → RECORD (see above)
+  mode: auto                      # auto | off
+  record: true
+  note_on_detect: true
+  empty_recall_streak: 3
 ```
 
 Other memory commands:

@@ -3816,6 +3816,61 @@ class GatewaySlashCommandsMixin:
                    "reject <id>, approval <on|off>.")
         return out
 
+    async def _handle_awareness_command(self, event: MessageEvent) -> str:
+        """Handle /awareness — metacognitive stuck-pattern detection (status/toggle).
+
+        Mode changes persist to config.yaml and evict the cached agent so the
+        next message picks up the new setting (the system prompt is unchanged
+        by awareness, so the rebuild keeps the same prompt bytes — prompt
+        cache survives). Status reads the live controller when the session's
+        agent is cached.
+        """
+        from gateway.run import _hermes_home
+        from hermes_cli.config import read_user_config_raw
+
+        raw_args = event.get_command_args().strip().lower()
+        arg = raw_args.split()[0] if raw_args else "status"
+        session_key = self._session_key_for_source(event.source)
+        config_path = _hermes_home / "config.yaml"
+
+        def _set_mode(mode: str):
+            # Write-back round-trip: raw read is correct (merged defaults must
+            # not be persisted back to the user's file).
+            user_config = read_user_config_raw(config_path)
+            user_config.setdefault("awareness", {})["mode"] = mode
+            atomic_config_write(config_path, user_config)
+            self._evict_cached_agent(session_key)
+
+        if arg in ("on", "auto"):
+            _set_mode("auto")
+            return "Awareness: auto — stuck-pattern detection + experience recording active."
+        if arg == "off":
+            _set_mode("off")
+            return "Awareness: off — detection and recording stopped."
+        if arg == "deep":
+            return ("Deep mode is not implemented yet (planned next phase). "
+                    "Current mode 'auto' = deterministic detect + record.")
+        if arg == "status":
+            agent = self._agent_cache.get(session_key)
+            awareness = getattr(agent, "_awareness", None) if agent is not None else None
+            if awareness is not None:
+                s = awareness.status_summary()
+                recording = "on" if s["record"] else (
+                    "skipped (memory.write_approval is on)" if awareness.write_approval else "off"
+                )
+                return (
+                    f"Awareness: {s['mode']} (notes: {'on' if s['note_on_detect'] else 'off'}, "
+                    f"recording: {recording})\n"
+                    f"Episodes detected: {s['episodes_detected']} · notes injected: "
+                    f"{s['notes_injected']} · patterns recorded: {s['patterns_recorded']} · "
+                    f"empty-recall streaks: {s['empty_streaks_hit']}"
+                )
+            from agent.awareness import normalize_mode
+            user_config = read_user_config_raw(config_path)
+            mode = normalize_mode((user_config.get("awareness") or {}).get("mode", "auto"))
+            return f"Awareness: {mode} (config). Send a message to start a session for live stats."
+        return "Unknown /awareness argument. Use: status, on (auto), off."
+
     async def _handle_skills_command(self, event: MessageEvent) -> str:
         """Handle /skills on the gateway — pending skill-write review only.
 

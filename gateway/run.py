@@ -17267,6 +17267,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if canonical == "memory":
             return await self._handle_memory_command(event)
 
+        if canonical == "awareness":
+            return await self._handle_awareness_command(event)
+
         if canonical == "skills":
             return await self._handle_skills_command(event)
 

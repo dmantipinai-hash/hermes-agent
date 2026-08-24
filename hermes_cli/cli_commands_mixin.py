@@ -2109,6 +2109,59 @@ class CLICommandsMixin:
         from cli import save_config_value
         save_config_value(f"{subsystem}.write_approval", bool(enabled))
 
+    def _handle_awareness_command(self, cmd: str):
+        """Handle /awareness — metacognitive stuck-pattern detection (status/toggle).
+
+        Awareness appends notes to in-flight tool results and writes pattern
+        entries post-turn; nothing about the system prompt depends on it, so
+        a mode change applies immediately (live controller + config) with no
+        prompt-cache impact.
+        """
+        from cli import save_config_value
+        parts = cmd.strip().split()
+        args = parts[1:] if len(parts) > 1 else []
+        arg = args[0].lower() if args else "status"
+        awareness = (
+            getattr(self.agent, "_awareness", None)
+            if getattr(self, "agent", None) is not None
+            else None
+        )
+
+        if arg in ("on", "auto"):
+            save_config_value("awareness.mode", "auto")
+            if awareness is not None:
+                awareness.set_mode("auto")
+            print("Awareness: auto — stuck-pattern detection + experience recording active.")
+        elif arg == "off":
+            save_config_value("awareness.mode", "off")
+            if awareness is not None:
+                awareness.set_mode("off")
+            print("Awareness: off — detection and recording stopped (effective immediately).")
+        elif arg == "deep":
+            print("Deep mode is not implemented yet (planned next phase). "
+                  "Current mode 'auto' = deterministic detect + record.")
+        elif arg == "status":
+            if awareness is not None:
+                s = awareness.status_summary()
+                recording = "on" if s["record"] else (
+                    "skipped (memory.write_approval is on)" if awareness.write_approval else "off"
+                )
+                print(
+                    f"Awareness: {s['mode']} (notes: {'on' if s['note_on_detect'] else 'off'}, "
+                    f"recording: {recording})\n"
+                    f"Stuck episodes detected: {s['episodes_detected']} · "
+                    f"experience notes injected: {s['notes_injected']} · "
+                    f"patterns recorded: {s['patterns_recorded']}\n"
+                    f"Empty-recall streaks: {s['empty_streaks_hit']}"
+                )
+            else:
+                from agent.awareness import normalize_mode
+                from hermes_cli.config import load_config_readonly
+                mode = normalize_mode(load_config_readonly().get("awareness", {}).get("mode", "auto"))
+                print(f"Awareness: {mode} (config). Start a session for live stats.")
+        else:
+            print("Unknown /awareness argument. Use: status, on (auto), off.")
+
     def _handle_background_command(self, cmd: str):
         """Handle /background <prompt> — run a prompt in a separate background session.
 

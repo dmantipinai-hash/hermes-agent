@@ -235,6 +235,16 @@ def finalize_turn(
         )
     )
 
+    # Metacognitive awareness (RECORD): close the turn's stuck episodes and
+    # write "pattern → what helped" experience to the memory store.
+    # Deterministic; must never affect the turn result itself.
+    try:
+        _awareness = getattr(agent, "_awareness", None)
+        if _awareness is not None:
+            _awareness.finalize_turn(exit_reason=str(_turn_exit_reason))
+    except Exception:
+        logger.debug("awareness: finalize_turn failed", exc_info=True)
+
     # Preflight can seed the display count before the provider receives the
     # request. Roll that estimate back only when an interrupt wins the race
     # before any successful provider response. Compaction state remains owned

@@ -1778,6 +1778,7 @@ def init_agent(
     agent._memory_bus = None
     agent._memory_enabled = False
     agent._user_profile_enabled = False
+    agent._awareness = None
     agent._memory_nudge_interval = 5
     agent._turns_since_memory = 0
     agent._iters_since_skill = 0
@@ -1831,6 +1832,20 @@ def init_agent(
                     )
                 except Exception:
                     agent._memory_orchestrator = None
+                # Metacognitive awareness (DETECT → RECORD): deterministic
+                # stuck-pattern memory over the built-in store — reuses the
+                # tool-loop guardrail decisions as its detect feed. None when
+                # the store is absent; every call site guards with getattr.
+                try:
+                    from agent.awareness import AwarenessController
+                    agent._awareness = AwarenessController(
+                        agent._memory_store,
+                        _agent_cfg.get("awareness", {}),
+                        session_id=getattr(agent, "session_id", None),
+                        write_approval=bool(mem_config.get("write_approval", False)),
+                    )
+                except Exception:
+                    agent._awareness = None
         except Exception:
             pass  # Memory is optional -- don't break agent init
     

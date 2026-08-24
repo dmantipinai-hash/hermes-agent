@@ -1884,6 +1884,29 @@ DEFAULT_CONFIG = {
         },
     },
 
+    # Metacognitive awareness (minimal DETECT → RECORD version): the agent
+    # notices it is stuck (tool-loop guardrail warnings, "No entry matched"
+    # streaks, empty memory reads against a non-empty store), injects a
+    # past-experience note from the memory store into the current tool
+    # result, and after the turn records "stuck pattern → what helped" as a
+    # pattern entry. Fully deterministic — no LLM in the loop. Requires the
+    # v2 store; respects memory.write_approval (recording is skipped while
+    # the gate is on). Toggling the mode takes effect mid-session without
+    # touching the prompt cache.
+    "awareness": {
+        # "auto" — detect + recall-notes + record (default)
+        # "off"  — fully inert
+        # "deep" is a planned later phase, not a valid value yet.
+        "mode": "auto",
+        # Write stuck-pattern experience entries to the memory store.
+        "record": True,
+        # Inject the past-experience note when a stuck episode is detected.
+        "note_on_detect": True,
+        # Consecutive empty memory reads (against a non-empty store) before
+        # the "rephrase or stop querying" nudge fires.
+        "empty_recall_streak": 3,
+    },
+
     # Subagent delegation — override the provider:model used by delegate_task
     # so child agents can run on a different (cheaper/faster) provider and model.
     # Uses the same runtime provider resolution as CLI/gateway startup, so all

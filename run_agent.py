@@ -8326,14 +8326,42 @@ class AIAgent:
             function_result,
             failed=failed,
         )
+        raw_result = function_result
         if decision.action in {"warn", "halt"}:
             function_result = append_toolguard_guidance(function_result, decision)
         if decision.should_halt:
             self._set_tool_guardrail_halt(decision)
+        # Metacognitive awareness (DETECT feed): deterministic, no LLM. This
+        # method is the single choke point both executor paths share, so the
+        # awareness controller sees every executed call. It returns an
+        # optional past-experience note that rides along in this same tool
+        # result — new tokens in a new message, prompt cache untouched.
+        awareness = getattr(self, "_awareness", None)
+        if awareness is not None:
+            try:
+                note = awareness.observe_tool_result(
+                    tool_name,
+                    function_args,
+                    raw_result,
+                    failed=failed,
+                    guardrail_decision=(
+                        decision if decision.action in {"warn", "halt"} else None
+                    ),
+                )
+                if note:
+                    function_result = f"{function_result}\n\n{note}"
+            except Exception:
+                logger.debug("awareness: observe_tool_result failed", exc_info=True)
         return function_result
 
     def _guardrail_block_result(self, decision: ToolGuardrailDecision) -> str:
         self._set_tool_guardrail_halt(decision)
+        awareness = getattr(self, "_awareness", None)
+        if awareness is not None:
+            try:
+                awareness.observe_block(decision)
+            except Exception:
+                logger.debug("awareness: observe_block failed", exc_info=True)
         return toolguard_synthetic_result(decision)
 
     def _execute_tool_calls(self, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0) -> None:

@@ -316,6 +316,10 @@ COMMAND_REGISTRY: list[CommandDef] = [
                "Tools & Skills",
                args_hint="[pending|approve|reject|approval] [id|on|off]",
                subcommands=("pending", "approve", "reject", "approval")),
+    CommandDef("awareness", "Stuck-pattern detection & experience recording (/awareness status)",
+               "Tools & Skills",
+               args_hint="[status|on|off|auto]",
+               subcommands=("status", "on", "off", "auto")),
     CommandDef("bundles", "List skill bundles (aliases /<name> for multiple skills)",
                "Tools & Skills", execute="bundles"),
     CommandDef("pet", "Toggle or adopt a petdex mascot (/pet, /pet list, /pet <slug>)", "Tools & Skills",
@@ -1387,7 +1391,10 @@ _SLACK_PRIORITY_ALIASES = ("btw", "bg")
 #     (session export is an interactive surface; platform is a rare
 #     informational lookup) — without this entry /save tips the registry
 #     past the 50-cap and silently clamps /platform, breaking parity.
-_SLACK_VIA_HERMES_ONLY = frozenset({"topup", "moa", "debug", "egress", "init", "version", "diff", "update", "heartbeat", "refine", "pause", "whoami", "platform", "insights"})
+#   - awareness: metacognitive stuck-pattern status/toggle; reached via
+#     /hermes awareness on Slack. Added at the 50-cap — a native slot would
+#     clamp /usage.
+_SLACK_VIA_HERMES_ONLY = frozenset({"topup", "moa", "debug", "egress", "init", "version", "diff", "update", "heartbeat", "refine", "pause", "whoami", "platform", "insights", "awareness"})
 
 
 def _sanitize_slack_name(raw: str) -> str:
