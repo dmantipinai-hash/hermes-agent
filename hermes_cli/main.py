@@ -12030,7 +12030,8 @@ def cmd_memory(args):
                 for row in s["top_accessed"]:
                     print(f"    · [{row['access_count']}×] {row['content']}")
             # Choice memory (tension map): which decisions changed and why,
-            # plus conflicting ACTIVE decisions that still need a deprecate.
+            # plus POSSIBLE conflicting active decisions (evidence-backed,
+            # suggest-only) and the graph integrity picture.
             try:
                 choice = store.choice_report(days=days)
             except Exception as exc:  # pragma: no cover - reporting guard
@@ -12046,15 +12047,29 @@ def cmd_memory(args):
                     print(f"        was: {ch['old_content'][:70]}"
                           f"  (decided {(ch['old_created'] or '')[:10]};"
                           f" reason: {(ch['reason'] or '—')[:60]})")
-                if choice["active_tensions"]:
-                    print(f"  ⚠ Active tensions (overlapping active decisions/constraints): "
-                          f"{len(choice['active_tensions'])}")
-                    for t in choice["active_tensions"][:10]:
-                        a, b = t["entries"]
-                        print(f"    · '{a['content'][:60]}' ({(a['created_at'] or '')[:10]})")
-                        print(f"      ↔ '{b['content'][:60]}' ({(b['created_at'] or '')[:10]})")
-                        print("      → deprecate the stale one, reason ending "
-                              "'superseded by: <substring of the newer>'")
+                total = choice.get("possible_tensions_total", 0)
+                shown = choice.get("possible_tensions") or []
+                print(f"  ⚠ POSSIBLE tensions (overlapping active decisions/constraints): "
+                      f"{total}"
+                      + (f" (showing top {len(shown)})" if len(shown) < total else ""))
+                for t in shown:
+                    a, b = t["entries"]
+                    print(f"    · '{a['content'][:55]}' ({(a['created_at'] or '')[:10]})")
+                    print(f"      ↔ '{b['content'][:55]}' ({(b['created_at'] or '')[:10]})"
+                          f"  [shared: {', '.join(t.get('shared_terms', [])[:4])}]")
+            try:
+                graph = store.graph_integrity_summary()
+            except Exception as exc:  # pragma: no cover - reporting guard
+                print(f"  Graph section unavailable: {exc}")
+                graph = None
+            if graph:
+                print(f"\n  🕸 Graph — edges: {graph['total']} "
+                      f"(valid {graph['valid']}, orphan {graph['orphan']}); "
+                      f"supersedes {graph['supersedes']} · structural {graph['structural']}; "
+                      f"fk violations {graph['foreign_key_violations']}")
+                if graph.get("migration_issues"):
+                    print(f"  ⚠ migration issues recorded: {len(graph['migration_issues'])}"
+                          " (meta: memory_links_v4_migration_issues)")
             if getattr(args, "prune", False):
                 keep = int(log_cfg.get("retain_days", 90) or 90)
                 removed = store.prune_recall_log(keep_days=keep)

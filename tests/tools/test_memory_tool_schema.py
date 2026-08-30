@@ -41,10 +41,12 @@ def test_memory_schema_is_well_formed():
     assert params["type"] == "object"
     assert params["required"] == ["action", "target"]
     # Nested ``enum`` on property values is fine — only top-level is forbidden.
-    # v2 store adds deprecate/read actions plus typed-entry parameters.
-    assert params["properties"]["action"]["enum"] == [
-        "add", "replace", "remove", "deprecate", "read",
-    ]
+    # Superset contract: the core actions must stay available; new actions
+    # (supersede, 2026-08-30 graph protocol) extend the enum without
+    # invalidating this invariant.
+    enum = params["properties"]["action"]["enum"]
+    for action in ("add", "replace", "remove", "supersede", "deprecate", "read"):
+        assert action in enum, f"memory action {action!r} missing from the schema enum"
     assert params["properties"]["target"]["enum"] == ["memory", "user"]
     assert params["properties"]["type"]["enum"] == [
         "fact", "decision", "constraint", "pattern", "preference",

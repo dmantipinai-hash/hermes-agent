@@ -61,7 +61,7 @@ _VISIBLE_STATUSES = ("active", "pinned")
 # a ``[type]`` prefix in the snapshot so the model treats them as binding.
 _PREFIXED_TYPES = ("decision", "constraint")
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 _SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS memories (
@@ -86,12 +86,21 @@ CREATE INDEX IF NOT EXISTS idx_memories_target_status
 CREATE INDEX IF NOT EXISTS idx_memories_type
     ON memories(type);
 
+-- Provenance/structural graph (v4): every edge must point at two EXISTING
+-- memories by full UUID. The 2026-08-30 live audit found all 14 historical
+-- rows carrying 8-char display ids instead of UUIDs — invisible to every
+-- JOIN and unprotected (no FK) at write time. FK + CHECK now make that
+-- class of corruption unrepresentable; the v3→v4 migration restores the
+-- historical rows.
 CREATE TABLE IF NOT EXISTS memory_links (
     source_id TEXT NOT NULL,
     target_id TEXT NOT NULL,
     relation_type TEXT NOT NULL,
     created_at TEXT NOT NULL,
-    PRIMARY KEY (source_id, target_id, relation_type)
+    PRIMARY KEY (source_id, target_id, relation_type),
+    FOREIGN KEY (source_id) REFERENCES memories(id) ON DELETE CASCADE,
+    FOREIGN KEY (target_id) REFERENCES memories(id) ON DELETE CASCADE,
+    CHECK (source_id <> target_id)
 );
 
 -- Recall-audit log (Phase-4 P3): one row per memory recall, written by the
@@ -266,7 +275,7 @@ def _query_stems(query: str) -> List[str]:
 
 
 # ---------------------------------------------------------------------------
-# Choice memory / tension map (Task 2, on top of P1 links)
+# Choice memory / tension map (Task 2 + 2026-08-30 graph fix)
 # ---------------------------------------------------------------------------
 
 # The binding types whose entries are "standing choices": they can contradict
@@ -274,57 +283,118 @@ def _query_stems(query: str) -> List[str]:
 # the valuable part (architecture-v1: «решения и причины» + «карта напряжений»).
 _TENSION_TYPES = ("decision", "constraint")
 
-# Two active standing entries count as a tension pair when they share at
-# least this many significant words (>3 chars, ё-folded) — the same word
-# notion `_find_related_active` uses for the add-time contradiction hint.
+# Two standing entries count as related when they share at least this many
+# CONTENTFUL stems after stop-word and document-frequency filtering.
 _TENSION_MIN_SHARED_WORDS = 2
 
+# Stems appearing in more than this fraction of the standing pool are treated
+# as pool glue («решение» inside a decision store) and never count as overlap.
+_DF_MAX_FRACTION = 0.5
+
+# Below this pool size document frequency is statistically meaningless — with
+# 2-3 entries ANY shared stem sits in >50% of the pool, and the filter would
+# delete exactly the true pairs it exists to protect.
+_DF_MIN_POOL = 4
+
+# Glue words that survive the >3-char filter but carry no pairing signal.
+# Domain words that are semantically empty for THIS store's grammar
+# («решение» is the type-word nearly every decision contains) are here too;
+# the document-frequency filter covers the rest.
+_STANDING_STOPWORDS = frozenset({
+    "это", "этой", "этого", "этому", "чтобы", "когда", "тогда", "также",
+    "будет", "была", "было", "были", "есть", "если", "уже", "еще", "ещё",
+    "всех", "все", "всё", "там", "где", "как", "или", "при", "для", "над",
+    "решение", "решения", "решению", "решением", "запись", "записи",
+    "the", "this", "that", "with", "from", "have", "will", "when", "then",
+    "also", "entry", "decision", "memory",
+})
+
 # Standing rule appended to the frozen memory snapshot when the store holds
-# visible decision/constraint entries: the one-line driver for the
-# `superseded by:` marker (week1-findings §5 — the marker never fired in a
-# week of live use because nothing reminded the model at decision time).
+# visible decision/constraint entries — the one-line driver for the atomic
+# supersede protocol (2026-08-30 graph TZ: the two-step marker protocol never
+# fired organically; supersede makes the change one call).
 _SNAPSHOT_STANDING_RULE = (
-    "Memory rule: when a decision or constraint changes, finish the update with "
-    "memory(action=deprecate) on the replaced entry, with reason ending "
-    "'superseded by: <short quote of the new entry>'. The marker links the pair, "
-    "so later recall shows what was decided before and why it changed."
+    "Memory rule: when a decision or constraint changes, do NOT add a similar "
+    "entry beside the old one — use one call "
+    "memory(action=supersede, old_id=<id of the replaced entry>, content=<new "
+    "decision>, reason=<why changed>). It atomically adds the new entry, "
+    "deprecates the old one and writes the provenance link, so later recall "
+    "shows what was decided before and why it changed."
 )
 
 
-def _significant_words(content: str) -> set:
-    """Significant (>3 chars, ё-folded) lowercase words of an entry.
+def _standing_stems(content: str) -> set:
+    """Contentful (>3 chars, ё-folded, stop-word-free) prefix stems.
 
-    Tokenized with the search layer's splitter, so hyphenated compounds
-    («канбан-доска») contribute their parts — the same word notion a query
-    would match.
+    Same tokenizer and prefix-stem notion as the search layer, so a pairing
+    matches exactly what a query could match; digits and dates never count.
     """
-    return {
-        _fold_yo(token) for token in _TOKEN_SPLIT_RE.split((content or "").lower())
-        if len(token) > 3
-    }
+    out: set = set()
+    for token in _TOKEN_SPLIT_RE.split((content or "").lower()):
+        token = _fold_yo(token)
+        if len(token) < 4 or token.isdigit():
+            continue
+        if token in _STANDING_STOPWORDS:
+            continue
+        out.add(token[: max(4, len(token) - 3)])
+    return out
 
 
-def _tension_pairs(entries: List[Dict[str, Any]], cap: int = 4) -> List[Dict[str, Any]]:
-    """Pairwise overlapping ACTIVE decision/constraint entries — the tension map.
+def _df_excluded_stems(stem_sets: List[set]) -> set:
+    """Stems present in more than ``_DF_MAX_FRACTION`` of the pool.
 
-    Deterministic word-overlap pairing (no LLM): two standing entries sharing
-    ≥2 significant words likely describe the same choice and one supersedes
-    the other. Duck-safe for rows without a ``type`` (legacy stores, facts):
-    they simply never pair. Each pair carries both sides with dates so the
-    trajectory is visible, not just the latest state.
+    Disabled below ``_DF_MIN_POOL`` sets: tiny pools make every shared stem
+    'frequent' by construction, and the filter would remove true pairs.
+    """
+    if len(stem_sets) < _DF_MIN_POOL:
+        return set()
+    threshold = _DF_MAX_FRACTION * len(stem_sets)
+    counts: Dict[str, int] = {}
+    for stems in stem_sets:
+        for stem in stems:
+            counts[stem] = counts.get(stem, 0) + 1
+    return {stem for stem, n in counts.items() if n > threshold}
+
+
+def _overlap_score(a: set, b: set) -> float:
+    """Jaccard over the effective stem sets; 0.0 when disjoint."""
+    union = a | b
+    return (len(a & b) / len(union)) if union else 0.0
+
+
+# Single case-insensitive parser for the legacy 'superseded by:' marker.
+# The old code checked the marker case-insensitively but SPLIT the original
+# string case-sensitively — 'Superseded by: X' passed the check and crashed
+# the transaction with IndexError (2026-08-30 graph TZ).
+_SUPERSEDED_BY_RE = re.compile(r"superseded\s+by\s*:\s*([^\n]+)", re.IGNORECASE)
+
+
+def _tension_pairs(entries: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Pairwise overlapping ACTIVE decision/constraint entries — POSSIBLE
+    tensions, with evidence.
+
+    Deterministic (no LLM): stems → stop-words → document-frequency filter →
+    ≥2 shared contentful stems → Jaccard ranking. Every pair carries the
+    shared stems as evidence so a human (or the model) can reject glue-word
+    pairs at a glance; callers slice for display and report the full count
+    separately (a display cap must never masquerade as the total).
+    Duck-safe for rows without a ``type`` (legacy stores, facts).
     """
     standing = [
         e for e in entries
         if str(e.get("type") or "") in _TENSION_TYPES
         and str(e.get("status") or "active") in ("active", "pinned")
     ]
-    words = {id(e): _significant_words(str(e.get("content") or "")) for e in standing}
+    stem_sets = [_standing_stems(str(e.get("content") or "")) for e in standing]
+    excluded = _df_excluded_stems(stem_sets)
+    effective = [s - excluded for s in stem_sets]
     out: List[Dict[str, Any]] = []
     for i in range(len(standing)):
         for j in range(i + 1, len(standing)):
-            a, b = standing[i], standing[j]
-            if len(words[id(a)] & words[id(b)]) < _TENSION_MIN_SHARED_WORDS:
+            shared = effective[i] & effective[j]
+            if len(shared) < _TENSION_MIN_SHARED_WORDS:
                 continue
+            a, b = standing[i], standing[j]
             out.append({
                 "entries": [
                     {
@@ -336,14 +406,17 @@ def _tension_pairs(entries: List[Dict[str, Any]], cap: int = 4) -> List[Dict[str
                         "created_at": b.get("created_at"), "content": str(b.get("content") or "")[:160],
                     },
                 ],
+                "shared_terms": sorted(shared)[:8],
+                "score": round(_overlap_score(effective[i], effective[j]), 3),
                 "note": (
-                    "Two active " + str(a.get("type")) + " entries overlap — one likely supersedes "
-                    "the other. Deprecate the stale one with reason ending "
-                    "'superseded by: <substring of the newer entry>' so the choice history stays linked."
+                    "Two active " + str(a.get("type")) + " entries overlap on "
+                    + ", ".join(sorted(shared)[:4])
+                    + " — one may supersede the other. Review the evidence; if true, "
+                    "link them with memory(action=supersede, old_id=<stale id>, "
+                    "content=<current decision>, reason=<why>)."
                 ),
             })
-            if len(out) >= cap:
-                return out
+    out.sort(key=lambda p: (-p["score"], str(p["entries"][0].get("created_at") or "")))
     return out
 
 
@@ -431,6 +504,8 @@ class MemoryStoreV2(MemoryStore):
             self._migrate_v1_to_v2(conn)
         if version < 3:
             self._migrate_v2_to_v3(conn)
+        if version < 4:
+            self._migrate_v3_to_v4(conn)
         conn.execute(
             "INSERT OR REPLACE INTO meta(key, value) VALUES ('schema_version', ?)",
             (str(SCHEMA_VERSION),),
@@ -478,6 +553,94 @@ class MemoryStoreV2(MemoryStore):
         except sqlite3.OperationalError as exc:
             logger.debug("memory.db: folded FTS reindex skipped (%s)", exc)
         logger.info("memory.db: migrated schema v2 → v3 (е-folded FTS reindex)")
+
+    @staticmethod
+    def _migrate_v3_to_v4(conn: sqlite3.Connection) -> None:
+        """v3 → v4: rebuild ``memory_links`` with FKs and full-UUID endpoints.
+
+        The 2026-08-30 live audit: all 14 historical edges carried 8-char
+        display ids as ``source_id``/``target_id`` (a manual 21.08 backfill
+        wrote short ids as real keys) — invisible to every JOIN, and the
+        schema had no FK to catch it. Migration resolves each 8-char
+        endpoint to the unique full UUID sharing that prefix; already-full
+        ids are validated by the FK on insert. Unresolvable endpoints
+        (missing or ambiguous prefix) are NOT dropped silently: each skipped
+        row is recorded in ``meta['memory_links_v4_migration_issues']``.
+        """
+        import json as _json
+
+        rows = conn.execute(
+            "SELECT source_id, target_id, relation_type, created_at FROM memory_links"
+        ).fetchall()
+
+        def _resolve(endpoint: str):
+            ep = (endpoint or "").strip()
+            if len(ep) == 36:
+                return ep
+            if len(ep) == 8:
+                hits = conn.execute(
+                    "SELECT id FROM memories WHERE id LIKE ?", (ep + "%",)
+                ).fetchall()
+                if len(hits) == 1:
+                    return hits[0]["id"]
+                return None, ("ambiguous prefix" if hits else "no matching memory")
+            return None, "unexpected id length"
+
+        conn.execute("DROP TABLE memory_links")
+        conn.executescript(
+            "CREATE TABLE memory_links ("
+            " source_id TEXT NOT NULL, target_id TEXT NOT NULL,"
+            " relation_type TEXT NOT NULL, created_at TEXT NOT NULL,"
+            " PRIMARY KEY (source_id, target_id, relation_type),"
+            " FOREIGN KEY (source_id) REFERENCES memories(id) ON DELETE CASCADE,"
+            " FOREIGN KEY (target_id) REFERENCES memories(id) ON DELETE CASCADE,"
+            " CHECK (source_id <> target_id))"
+        )
+        issues: list = []
+        kept = 0
+        for r in rows:
+            resolved_src = _resolve(r["source_id"])
+            resolved_tgt = _resolve(r["target_id"])
+            src = resolved_src if isinstance(resolved_src, str) else None
+            tgt = resolved_tgt if isinstance(resolved_tgt, str) else None
+            if src is None or tgt is None or src == tgt:
+                why = (
+                    resolved_src[1] if src is None and isinstance(resolved_src, tuple)
+                    else resolved_tgt[1] if tgt is None and isinstance(resolved_tgt, tuple)
+                    else "self-loop"
+                )
+                issues.append({
+                    "source_id": r["source_id"], "target_id": r["target_id"],
+                    "relation_type": r["relation_type"], "created_at": r["created_at"],
+                    "reason": why,
+                })
+                continue
+            try:
+                conn.execute(
+                    "INSERT INTO memory_links(source_id, target_id, relation_type, created_at)"
+                    " VALUES (?,?,?,?)",
+                    (src, tgt, r["relation_type"], r["created_at"]),
+                )
+                kept += 1
+            except sqlite3.IntegrityError as exc:
+                issues.append({
+                    "source_id": r["source_id"], "target_id": r["target_id"],
+                    "relation_type": r["relation_type"], "created_at": r["created_at"],
+                    "reason": f"integrity: {exc}",
+                })
+        if issues:
+            conn.execute(
+                "INSERT OR REPLACE INTO meta(key, value) VALUES"
+                " ('memory_links_v4_migration_issues', ?)",
+                (_json.dumps(issues, ensure_ascii=False),),
+            )
+            logger.warning(
+                "memory.db: v4 migration kept %d/%d edges; %d unresolvable recorded in meta",
+                kept, len(rows), len(issues),
+            )
+        logger.info(
+            "memory.db: migrated schema v3 → v4 (memory_links FKs; %d edges)", kept
+        )
 
     def _execute_write(self, fn) -> Any:
         """Run ``fn(conn)`` inside a locked BEGIN IMMEDIATE transaction.
@@ -869,31 +1032,33 @@ class MemoryStoreV2(MemoryStore):
         self._execute_write(_insert)
 
         if inserted_id is None:
-            return self._success_response(target, "Entry already exists (no duplicate added).")
+            resp = self._success_response(target, "Entry already exists (no duplicate added).")
+            resp["id"] = None
+            return resp
 
         self._rewrite_projection(target)
         self._demote_evicted(target)
         resp = self._success_response(target, f"Entry added (type={entry_type}).")
+        resp["id"] = inserted_id
 
-        # Contradiction hint: for standing decisions/rules, surface similar
-        # active entries so the model can decide to deprecate them. The
-        # suggested_deprecate payload carries a ready-to-use call (exact
-        # stored substring + the 'superseded by:' marker) because the bare
-        # hint alone demonstrably did not drive the model to the marker
-        # (week1-findings §5: supersedes links stayed at 0 in live use).
+        # Contradiction hint for standing decisions/rules: ranked candidates
+        # WITH evidence (shared terms + score). Suggest-only by design — no
+        # ready mutation payload (the 2026-08-30 graph TZ: the old
+        # suggested_deprecate pushed the model to act on an arbitrary top
+        # match from a noisy matcher). The model reviews the evidence and
+        # either supersede (had it not added yet) or links by ids.
         if entry_type in _TENSION_TYPES:
             related = self._find_related_active(target, entry_type, content, exclude_id=inserted_id)
             if related:
                 resp["related_active"] = related
                 resp["hint"] = (
-                    f"Similar active {entry_type} entries exist — treat this as a choice change, "
-                    "not just a new note. Finish the update by calling memory(action=deprecate) "
-                    "with the exact arguments from 'suggested_deprecate' below; its reason ends "
-                    "with the 'superseded by:' marker that links the pair, so later recall shows "
-                    "what was decided before and why it changed."
-                )
-                resp["suggested_deprecate"] = self._build_suggested_deprecate(
-                    target, related[0], content
+                    f"Similar active {entry_type} entries exist (ranked by shared terms). "
+                    "This new entry was already added; if one of the candidates is genuinely "
+                    "superseded by it, finish the change with memory(action=deprecate, "
+                    f"old_id=<candidate id>, superseded_by_id={inserted_id}, reason=<why>). "
+                    "Next time prefer the one-call memory(action=supersede, old_id=..., "
+                    "content=..., reason=...) BEFORE adding. Ignore candidates that only "
+                    "share generic words."
                 )
         return resp
 
@@ -1079,66 +1244,147 @@ class MemoryStoreV2(MemoryStore):
     # New v2 operations
     # ------------------------------------------------------------------
 
-    def deprecate(self, target: str, old_text: str, reason: str = "") -> Dict[str, Any]:
+    def deprecate(
+        self,
+        target: str,
+        old_text: str = "",
+        reason: str = "",
+        old_id: Optional[str] = None,
+        superseded_by_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
         """Mark an entry deprecated (hidden from retrieval/snapshot, kept for audit).
 
-        Optionally links the deprecated entry to a newer one when
-        ``superseded_by`` text is embedded in the reason — Phase 1 keeps it
-        simple: status flip + recorded reason + ``memory_links`` row when a
-        successor entry is identifiable by substring.
+        Resolution of the OLD entry: exact ``old_id`` (preferred — no
+        substring guessing) or the legacy ``old_text`` LIKE match. Successor
+        linking, in priority order:
+
+        1. ``superseded_by_id`` — exact id. Validated strictly (exists,
+           same target, not the old entry itself, not deprecated); any
+           violation is an ERROR and the old entry is NOT deprecated —
+           an explicit id must never produce a half-completed operation.
+        2. Legacy ``superseded by: <fragment>`` marker in ``reason`` —
+           first-line fragment matched as a substring. A miss keeps the
+           soft-degradation contract (deprecate succeeds) but is now
+           OBSERVABLE: ``link_created: false`` + ``warning``.
         """
         if target not in ("memory", "user"):
             return {"success": False, "error": f"Unknown target '{target}'."}
+        old_id = (old_id or "").strip()
         old_text = (old_text or "").strip()
-        if not old_text:
-            return {"success": False, "error": "old_text cannot be empty."}
+        if not old_id and not old_text:
+            return {"success": False, "error": "old_id or old_text is required."}
 
         outcome: Dict[str, Any] = {}
 
         def _dep(conn: sqlite3.Connection) -> None:
-            rows = conn.execute(
-                "SELECT id, content, status FROM memories WHERE target=? AND ulower(content) LIKE ?"
-                " AND status IN ('active','pinned','dormant')",
-                (target, f"%{old_text.lower()}%"),
-            ).fetchall()
-            if not rows:
-                outcome["no_match"] = True
-                return
-            unique = {r["content"] for r in rows}
-            if len(unique) > 1:
-                previews = [r["content"][:80] + ("..." if len(r["content"]) > 80 else "") for r in rows]
-                outcome.update({
-                    "success": False,
-                    "error": f"Multiple entries matched '{old_text}'. Be more specific.",
-                    "matches": previews,
-                })
-                return
-            row = rows[0]
+            if old_id:
+                row = conn.execute(
+                    "SELECT id, content, status FROM memories WHERE id=? AND target=?",
+                    (old_id, target),
+                ).fetchone()
+                if row is None:
+                    outcome.update({
+                        "success": False,
+                        "error": f"old_id '{old_id}' not found in target '{target}'.",
+                    })
+                    return
+                if row["status"] not in ("active", "pinned", "dormant"):
+                    outcome.update({
+                        "success": False,
+                        "error": f"old_id entry is already {row['status']}; nothing to deprecate.",
+                    })
+                    return
+            else:
+                rows = conn.execute(
+                    "SELECT id, content, status FROM memories WHERE target=? AND ulower(content) LIKE ?"
+                    " AND status IN ('active','pinned','dormant')",
+                    (target, f"%{old_text.lower()}%"),
+                ).fetchall()
+                if not rows:
+                    outcome["no_match"] = True
+                    return
+                unique = {r["content"] for r in rows}
+                if len(unique) > 1:
+                    previews = [r["content"][:80] + ("..." if len(r["content"]) > 80 else "") for r in rows]
+                    outcome.update({
+                        "success": False,
+                        "error": f"Multiple entries matched '{old_text}'. Be more specific or pass old_id.",
+                        "matches": previews,
+                    })
+                    return
+                row = rows[0]
+
+            # Resolve the successor BEFORE mutating — explicit ids must fail
+            # closed, and marker misses must be visible in the response.
+            successor: Optional[str] = None
+            soft_miss = False
+            if superseded_by_id:
+                succ = conn.execute(
+                    "SELECT id, status FROM memories WHERE id=? AND target=?",
+                    ((superseded_by_id or "").strip(), target),
+                ).fetchone()
+                if succ is None:
+                    outcome.update({
+                        "success": False,
+                        "error": (
+                            f"superseded_by_id '{superseded_by_id}' not found in "
+                            f"target '{target}'. Old entry left unchanged."
+                        ),
+                    })
+                    return
+                if succ["id"] == row["id"]:
+                    outcome.update({
+                        "success": False,
+                        "error": "superseded_by_id equals old_id (self-link). Old entry left unchanged.",
+                    })
+                    return
+                if succ["status"] == "deprecated":
+                    outcome.update({
+                        "success": False,
+                        "error": "superseded_by_id entry is deprecated. Old entry left unchanged.",
+                    })
+                    return
+                successor = succ["id"]
+            else:
+                match = _SUPERSEDED_BY_RE.search(reason or "")
+                if match:
+                    frag = match.group(1).strip().strip('"').strip("'")
+                    if frag:
+                        hit = conn.execute(
+                            "SELECT id FROM memories WHERE target=? AND ulower(content) LIKE ?"
+                            " AND status!='deprecated' LIMIT 1",
+                            (target, f"%{frag.lower()}%"),
+                        ).fetchone()
+                        if hit:
+                            successor = hit["id"]
+                        else:
+                            soft_miss = True
+
             conn.execute(
                 "UPDATE memories SET status='deprecated', deprecate_reason=?, updated_at=?"
                 " WHERE id=?",
                 ((reason or "").strip() or None, _now(), row["id"]),
             )
-            # Link to a successor when the reason names one via "superseded by: <text>".
-            successor = None
-            marker = "superseded by:"
-            if marker in (reason or "").lower():
-                frag = reason.split(marker, 1)[1].strip().strip('"')
-                if frag:
-                    hit = conn.execute(
-                        "SELECT id FROM memories WHERE target=? AND ulower(content) LIKE ?"
-                        " AND status!='deprecated' LIMIT 1",
-                        (target, f"%{frag.lower()}%"),
-                    ).fetchone()
-                    if hit:
-                        successor = hit["id"]
             if successor:
                 conn.execute(
                     "INSERT OR REPLACE INTO memory_links(source_id, target_id, relation_type, created_at)"
                     " VALUES (?,?, 'supersedes', ?)",
                     (successor, row["id"], _now()),
                 )
-            outcome.update({"success": True, "deprecated_content": row["content"][:120]})
+            outcome.update({
+                "success": True,
+                "deprecated_content": row["content"][:120],
+                "old_id": row["id"],
+                "link_created": successor is not None,
+            })
+            if successor:
+                outcome["superseded_by"] = successor
+            if soft_miss:
+                outcome["warning"] = (
+                    "Link not created: the 'superseded by:' fragment matched no active "
+                    "entry. The deprecate itself succeeded. To link by id, use "
+                    "deprecate(old_id=..., superseded_by_id=<new entry id>, reason=...)."
+                )
 
         self._execute_write(_dep)
         if outcome.get("no_match"):
@@ -1147,6 +1393,130 @@ class MemoryStoreV2(MemoryStore):
             return outcome
         self._rewrite_projection(target)
         resp = self._success_response(target, "Entry deprecated (kept in history, hidden from search).")
+        resp.update({
+            "old_id": outcome.get("old_id"),
+            "link_created": outcome.get("link_created", False),
+        })
+        if outcome.get("superseded_by"):
+            resp["superseded_by"] = outcome["superseded_by"]
+        if outcome.get("warning"):
+            resp["warning"] = outcome["warning"]
+        return resp
+
+    def supersede(
+        self,
+        target: str,
+        old_id: str,
+        content: str,
+        entry_type: Optional[str] = None,
+        importance: Optional[float] = None,
+        reason: str = "",
+        written_by: Optional[str] = None,
+        project: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Atomic decision change: new entry + old deprecation + provenance
+        link in ONE transaction (2026-08-30 graph TZ, approach B).
+
+        Replaces the fragile two-step add→deprecate-marker protocol (the
+        marker never fired organically: paraphrases don't match substrings,
+        and deprecate-before-add can't find the successor). Any failure —
+        unknown/deprecated/foreign old_id, duplicate content, scan rejection
+        — leaves BOTH entries and the graph untouched.
+        """
+        if target not in ("memory", "user"):
+            return {"success": False, "error": f"Unknown target '{target}'."}
+        old_id = (old_id or "").strip()
+        content = (content or "").strip()
+        if not old_id:
+            return {"success": False, "error": "old_id is required for supersede."}
+        if not content:
+            return {"success": False, "error": "content cannot be empty."}
+
+        scan_error = self._scan_for_add(content)
+        if scan_error:
+            return {"success": False, "error": scan_error}
+
+        entry_type = self._normalize_type(entry_type, target)
+        importance = self._normalize_importance(importance)
+        outcome: Dict[str, Any] = {}
+        new_id_holder: List[str] = []
+
+        def _sup(conn: sqlite3.Connection) -> None:
+            old = conn.execute(
+                "SELECT id, content, status, type FROM memories WHERE id=? AND target=?",
+                (old_id, target),
+            ).fetchone()
+            if old is None:
+                outcome.update({
+                    "success": False,
+                    "error": f"old_id '{old_id}' not found in target '{target}'.",
+                })
+                return
+            if old["status"] not in ("active", "pinned", "dormant"):
+                outcome.update({
+                    "success": False,
+                    "error": f"old_id entry is already {old['status']}; supersede needs an active entry.",
+                })
+                return
+            dup = conn.execute(
+                "SELECT id FROM memories WHERE target=? AND content=? AND status!='deprecated' LIMIT 1",
+                (target, content),
+            ).fetchone()
+            if dup:
+                outcome.update({
+                    "success": False,
+                    "error": (
+                        "The new content already exists as an active entry "
+                        f"(id={dup['id']}). To link the already-added entry, use "
+                        "deprecate(old_id=..., superseded_by_id=..., reason=...) instead."
+                    ),
+                })
+                return
+            new_id = str(uuid.uuid4())
+            conn.execute(
+                "INSERT INTO memories(id, target, type, content, importance, confidence,"
+                " status, project, written_by, created_at, updated_at)"
+                " VALUES (?,?,?,?,?,?, 'active', ?, ?, ?, ?)",
+                (new_id, target, entry_type, content, importance, 0.7,
+                 (project or None), (written_by or None), _now(), _now()),
+            )
+            conn.execute(
+                "UPDATE memories SET status='deprecated', deprecate_reason=?, updated_at=?"
+                " WHERE id=?",
+                ((reason or "").strip() or None, _now(), old_id),
+            )
+            conn.execute(
+                "INSERT INTO memory_links(source_id, target_id, relation_type, created_at)"
+                " VALUES (?,?, 'supersedes', ?)",
+                (new_id, old_id, _now()),
+            )
+            new_id_holder.append(new_id)
+            outcome.update({
+                "success": True,
+                "old_id": old_id,
+                "new_id": new_id,
+                "deprecated_content": old["content"][:120],
+                "link_created": True,
+                "relation_type": "supersedes",
+            })
+
+        self._execute_write(_sup)
+        if not outcome.get("success"):
+            return outcome
+        self._rewrite_projection(target)
+        self._demote_evicted(target)
+        resp = self._success_response(
+            target,
+            "Decision superseded: new entry active, old entry deprecated, "
+            "provenance link written.",
+        )
+        resp.update({
+            "old_id": outcome["old_id"],
+            "new_id": outcome["new_id"],
+            "link_created": True,
+            "relation_type": "supersedes",
+            "deprecated_content": outcome["deprecated_content"],
+        })
         return resp
 
     def recall(
@@ -1200,14 +1570,16 @@ class MemoryStoreV2(MemoryStore):
             "results": results,
             "count": len(results),
         }
-        # Tension map: when several ACTIVE decision/constraint entries match
-        # the same query, surface them as an explicit conflicting pair (with
-        # both dates) instead of loose individual hits — the choice
-        # trajectory, not just the latest state. Attached only when present,
-        # so tension-free recalls stay byte-identical.
-        tensions = _tension_pairs([dict(r) for r in rows])
-        if tensions:
-            resp["tensions"] = tensions
+        # POSSIBLE tension map: when several ACTIVE decision/constraint
+        # entries match the same query, surface them as an explicit pair
+        # (both dates + shared terms as evidence) instead of loose hits.
+        # Suggest-only — evidence lets the model reject glue-word pairs;
+        # the per-turn orchestrator pack deliberately does NOT inject this.
+        # Attached only when present, so tension-free recalls stay
+        # byte-identical.
+        possible = _tension_pairs([dict(r) for r in rows])
+        if possible:
+            resp["possible_tensions"] = possible[:3]
         return resp
 
     # ------------------------------------------------------------------
@@ -1379,10 +1751,69 @@ class MemoryStoreV2(MemoryStore):
                 " ORDER BY datetime(created_at) ASC"
             )
         ]
+        pairs = _tension_pairs(standing)
         return {
             "days": days,
             "changes": changes,
-            "active_tensions": _tension_pairs(standing, cap=10),
+            # POSSIBLE tensions: full candidate count is reported separately
+            # from the top-N display list — a display cap must never
+            # masquerade as the total (the old report showed "10" only
+            # because of cap=10 over ~50 mostly-false pairs).
+            "possible_tensions": pairs[:10],
+            "possible_tensions_total": len(pairs),
+        }
+
+    def graph_integrity_summary(self) -> Dict[str, Any]:
+        """Graph health for `hermes memory report` and tests (schema v4).
+
+        total/valid/orphan over ``memory_links`` (v4 FKs make orphans
+        unrepresentable post-migration, but the summary still computes them
+        so a tampered database is visible), supersedes vs structural split,
+        ``PRAGMA foreign_key_check`` violations, and any migration issues
+        recorded in ``meta``.
+        """
+        total = self._query("SELECT COUNT(*) AS c FROM memory_links")[0]["c"]
+        orphan = self._query(
+            "SELECT COUNT(*) AS c FROM memory_links l"
+            " LEFT JOIN memories a ON a.id = l.source_id"
+            " LEFT JOIN memories b ON b.id = l.target_id"
+            " WHERE a.id IS NULL OR b.id IS NULL"
+        )[0]["c"]
+        supersedes = self._query(
+            "SELECT COUNT(*) AS c FROM memory_links WHERE relation_type='supersedes'"
+        )[0]["c"]
+        by_type = {
+            r["relation_type"]: r["c"]
+            for r in self._query(
+                "SELECT relation_type, COUNT(*) AS c FROM memory_links"
+                " GROUP BY relation_type ORDER BY c DESC"
+            )
+        }
+        try:
+            fk_violations = len(
+                self._connect().execute("PRAGMA foreign_key_check").fetchall()
+            )
+        except sqlite3.Error:
+            fk_violations = -1
+        issues_rows = self._query(
+            "SELECT value FROM meta WHERE key='memory_links_v4_migration_issues'"
+        )
+        migration_issues = []
+        if issues_rows:
+            try:
+                import json as _json
+                migration_issues = _json.loads(issues_rows[0]["value"])
+            except (ValueError, TypeError):
+                migration_issues = [{"reason": "unparseable issues report"}]
+        return {
+            "total": total,
+            "valid": total - orphan,
+            "orphan": orphan,
+            "supersedes": supersedes,
+            "structural": total - supersedes,
+            "by_type": by_type,
+            "foreign_key_violations": fk_violations,
+            "migration_issues": migration_issues,
         }
 
     def rollback_consumer(self, written_by: str, reason: str = "") -> Dict[str, Any]:
@@ -1715,65 +2146,51 @@ class MemoryStoreV2(MemoryStore):
     def _find_related_active(
         self, target: str, entry_type: str, content: str, exclude_id: str,
     ) -> List[Dict[str, Any]]:
-        """Find up to 3 active same-type entries similar to ``content``.
+        """Rank active same-type entries similar to ``content`` — suggest-only.
 
-        Used for the contradiction hint on decision/constraint writes: the
-        model sees potentially superseded entries and can deprecate them.
+        Used for the add-time contradiction hint. The 2026-08-30 graph TZ
+        killed the old OR-any-word + LIMIT-3-before-ranking shape (a new
+        Linux decision got the велотренажёр entry as its top candidate over
+        the shared word «решение»). Now: contentful stems → stop-words →
+        document-frequency filter over the pool → ≥2 shared stems → Jaccard
+        ranking; every candidate carries ``shared_terms`` + ``score`` as
+        evidence, and the caller decides — nothing here mutates.
         """
-        words = [_fold_yo(w) for w in content.lower().split() if len(w) > 3][:8]
-        if not words:
-            return []
-        clauses = " OR ".join(
-            "ulower(replace(replace(content, 'ё', 'е'), 'Ё', 'Е')) LIKE ?"
-            for _ in words
-        )
-        params = [f"%{w}%" for w in words]
-        rows = self._query(
-            f"SELECT id, type, status, importance, content FROM memories"
-            f" WHERE target=? AND type=? AND status IN ('active','pinned')"
-            f" AND id != ? AND ({clauses}) LIMIT 3",
-            (target, entry_type, exclude_id, *params),
-        )
-        return [
-            {"id": r["id"], "type": r["type"], "importance": r["importance"],
-             "content": r["content"][:160]}
-            for r in rows
-        ]
-
-    def _build_suggested_deprecate(
-        self, target: str, related: Dict[str, Any], new_content: str,
-    ) -> Dict[str, Any]:
-        """Ready-to-use deprecate call linking ``related`` to the new entry.
-
-        ``old_text`` is an exact stored-text prefix (NOT model-recalled
-        wording — the 2026-08-20 thrash class), length-escalated to the full
-        content when the prefix is not unique under the same LIKE matching
-        ``deprecate`` uses. ``reason`` embeds the ``superseded by:`` marker
-        with a prefix of the new entry, which ``deprecate`` resolves back to
-        the successor row.
-        """
-        rows = self._query(
-            "SELECT content FROM memories WHERE id=?", (related.get("id"),)
-        )
-        old_content = rows[0]["content"] if rows else str(related.get("content") or "")
-        frag = old_content[:80]
-        try:
-            dupes = self._query(
-                "SELECT COUNT(*) AS c FROM memories WHERE target=?"
-                " AND ulower(content) LIKE ? AND status IN ('active','pinned','dormant')",
-                (target, f"%{frag.lower()}%"),
+        pool = [
+            dict(r) for r in self._query(
+                "SELECT id, type, status, importance, created_at, content FROM memories"
+                " WHERE target=? AND type=? AND status IN ('active','pinned')"
+                " AND id != ?",
+                (target, entry_type, exclude_id),
             )
-            if dupes and int(dupes[0]["c"]) > 1:
-                frag = old_content
-        except sqlite3.Error:
-            pass  # best-effort uniqueness probe; deprecate re-checks anyway
-        successor_frag = new_content[:40].strip()
-        return {
-            "action": "deprecate",
-            "target": target,
-            "old_text": frag,
-            "reason": f"superseded by: {successor_frag}",
-        }
+        ]
+        if not pool:
+            return []
+        query_stems = _standing_stems(content)
+        if not query_stems:
+            return []
+        pool_stems = [_standing_stems(str(p["content"] or "")) for p in pool]
+        excluded = _df_excluded_stems(pool_stems + [query_stems])
+        query_effective = query_stems - excluded
+        if not query_effective:
+            return []
+        scored: List[Tuple[float, Dict[str, Any], List[str]]] = []
+        for p, stems in zip(pool, pool_stems):
+            effective = stems - excluded
+            shared = effective & query_effective
+            if len(shared) < _TENSION_MIN_SHARED_WORDS:
+                continue
+            scored.append((_overlap_score(effective, query_effective), p, sorted(shared)))
+        scored.sort(key=lambda item: (-item[0], str(item[1].get("created_at") or ""), item[1]["id"]))
+        return [
+            {
+                "id": p["id"], "type": p["type"], "importance": p["importance"],
+                "created_at": p.get("created_at"), "content": p["content"][:160],
+                "shared_terms": shared[:8],
+                "score": round(score, 3),
+            }
+            for score, p, shared in scored[:3]
+        ]
 
     def _bump_access(self, row_ids: List[str]) -> None:
         """Record retrieval usage (Phase-2 scoring input)."""

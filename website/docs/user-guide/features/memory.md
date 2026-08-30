@@ -45,9 +45,9 @@ If you are an agent reading this, these rules are your contract with the memory 
 
 1. **Overflow is not a problem. Never "clean" memory.** When a write response shows `evicted_to_cold`, the excess has moved to cold storage automatically — still active, still searchable. Do **not** remove, shorten, or archive-and-delete entries to "free space". The store is unbounded by design.
 2. **The `usage` number is the prompt projection, not the store size.** `"98% — 2,167/2,200 chars"` describes what the next session's prompt will contain. A store 3× larger than the limit is healthy.
-3. **A changed decision is `deprecate`, not `remove`.** Removing destroys history. Deprecate hides the old entry from retrieval but keeps it for audit — and with the `superseded by:` marker it records the lineage (below).
-4. **Read before deciding.** Before saving a decision or constraint, `memory(action="read", query=...)` on the topic. If an active entry contradicts the new one, deprecate it with the marker, then add the new one.
-5. **When `old_text` fails, the response lists `current_entries`.** Retry with a short unique substring of the *actual stored text* — not text you remember writing. After three consecutive failures the tool goes terminal for the turn: stop retrying and answer the user; save in a later turn.
+3. **A changed decision is `supersede`, not `remove` or a second `add`.** Removing destroys history; adding beside the old entry creates a quiet contradiction. `supersede` atomically adds the new decision, deprecates the old one and writes the lineage link (below).
+4. **Read before deciding.** Before saving a decision or constraint, `memory(action="read", query=...)` on the topic. If an active entry is genuinely superseded, call `supersede(old_id=<its id>, content=<new decision>, reason=...)` — one call, ids not quotes. `related_active` candidates are ranked suggestions with `shared_terms` evidence: ignore pairs that only share generic words, and never deprecate an entry you are not sure about.
+5. **When `old_text` fails, the response lists `current_entries`.** Retry with a short unique substring of the *actual stored text* — or better, address the entry by its exact `old_id`. After three consecutive failures the tool goes terminal for the turn: stop retrying and answer the user; save in a later turn.
 6. **Save what will still matter next week** — decisions with reasons, constraints, preferences, environment facts. Not task progress (that's `session_search` territory), not data dumps.
 
 ## Memory Tool Actions
@@ -56,14 +56,16 @@ If you are an agent reading this, these rules are your contract with the memory 
 memory(action="add", target="memory", content="...", type="decision", importance=0.8)
 memory(action="replace", target="memory", old_text="unique substring", content="...", ...)
 memory(action="remove", target="memory", old_text="unique substring")
-memory(action="deprecate", target="memory", old_text="...", reason="...")
+memory(action="supersede", target="memory", old_id="<uuid>", content="...", type="decision", reason="...")
+memory(action="deprecate", target="memory", old_id="...", superseded_by_id="<uuid>", reason="...")
 memory(action="read", target="memory", query="vpn сервер")
 ```
 
-- **add** — insert a typed entry. Duplicate content is rejected softly. If you add a `decision`/`constraint` that resembles an active one, the response carries `related_active` + a hint — review it for conflicts (rule 4).
+- **add** — insert a typed entry. Duplicate content is rejected softly. If you add a `decision`/`constraint` that resembles an active one, the response carries `related_active` — ranked candidates with `shared_terms` evidence (rule 4).
 - **replace** — edit-in-place of the entry matched by `old_text` (substring). Preserves `type`/`importance` unless overridden. Replacing does **not** create links — it's the same entry, reworded.
 - **remove** — hard delete. For garbage only.
-- **deprecate** — retire a decision/constraint: hidden from retrieval and snapshot, kept for audit with the reason. **To link the successor, end `reason` with `superseded by: <exact substring of the new entry>`** — recall then shows what each decision replaced (see below).
+- **supersede** — the atomic decision change: new entry active + old entry deprecated + `supersedes` link, in one transaction (see below). The preferred way to change any standing decision.
+- **deprecate** — retire an entry (`old_id` or `old_text`), or link an already-added successor via `superseded_by_id`. Hidden from retrieval and snapshot, kept for audit with the reason.
 - **read** — full-text search over the *entire* cold store, including entries not in your current prompt. This is the primary "what do I know about X" tool.
 
 Entry types: `fact` (default), `decision` (a choice made — include the reason), `constraint` (a rule to respect), `preference`, `pattern`. `decision` and `constraint` get a `[type]` prefix in the prompt snapshot so the model treats them as binding. `importance` (0..1, default 0.5) orders survival in the snapshot budget; `pinned` status beats importance.
@@ -80,34 +82,41 @@ Russian ё/е spelling divergence (`велотренажёр` vs `велотре
 
 Results carry `type`, `status`, `importance`, and — when the entry supersedes another — a `supersedes` block with the predecessor's id, date and content preview.
 
-### Decision provenance (`supersedes` links)
+### Decision provenance (`supersede` + `supersedes` links)
 
-When a decision changes, the *trajectory* matters as much as the final state:
+When a decision changes, the *trajectory* matters as much as the final state — and the change is ONE atomic call:
 
 ```python
-memory(action="add", target="memory", type="decision", importance=0.8,
-       content="Хостинг: Docker обязателен для всех сервисов")
-memory(action="deprecate", target="memory", old_text="не используем Docker",
-       reason="пересмотрели:superseded by: Docker обязателен для всех сервисов")
+memory(action="read", query="Docker")                          # find the current decision, take its id
+memory(action="supersede", target="memory", old_id="<uuid>",   # the entry being replaced
+       content="Хостинг: Docker обязателен для всех сервисов",
+       type="decision", importance=0.8,
+       reason="сервер усилен — старое ограничение снято")
 ```
 
-Later, any recall that surfaces the new decision also shows:
+`supersede` adds the new entry, deprecates the old one and writes the provenance link in a single transaction — no half-completed changes, no substring quoting (ids never mismatch). Later, any recall that surfaces the new decision also shows:
 
 ```
 [supersedes: 1f2a3b4c (2026-08-14, «Хостинг: не используем Docker — тяжело для сервера»)]
 ```
 
-so the agent can say "you changed your mind — the original objection was server load; is that factor addressed?" instead of knowing only the latest state. The fragment after the marker is matched as a substring against active entries; if it matches nothing, the deprecate still succeeds and the link is simply not written (soft degradation). Links are strictly one hop — a predecessor's own predecessor does not ride along.
+so the agent can say "you changed your mind — the original objection was server load; is that factor addressed?" instead of knowing only the latest state. Links are strictly one hop — a predecessor's own predecessor does not ride along.
 
-You rarely have to compose that deprecate call by hand: when `add` stores a new `decision`/`constraint` while a similar ACTIVE one exists, the response carries `related_active` plus **`suggested_deprecate`** — a ready-to-use call with an exact stored-text substring (uniqueness-checked under the same matching `deprecate` uses) and a `reason` that already ends with the `superseded by:` marker. Copying it verbatim links the pair; nothing is auto-deprecated. While standing decisions exist, the frozen memory snapshot also ends with a one-line rule reminding the agent to finish choice changes this way (a block suffix, never an entry — and frozen at session start, so the prompt cache is unaffected).
+If the new entry was already added separately, link it afterwards: `memory(action="deprecate", old_id=<old id>, superseded_by_id=<new id>, reason=...)`. An invalid successor id fails the whole call and changes nothing. The legacy `superseded by: <substring>` marker in `reason` still parses for compatibility, but a fragment miss is now visible: the deprecate succeeds, and the response carries `link_created: false` plus a warning — a missed link is never silent.
 
-### Tension map (active conflicts)
+When `add` stores a new `decision`/`constraint` while similar ACTIVE ones exist, the response carries `related_active` — ranked candidates, each with `shared_terms` evidence and a score. Suggest-only: nothing is auto-deprecated, and candidates that merely share generic words should be ignored. While standing decisions exist, the frozen memory snapshot ends with a one-line rule teaching the supersede protocol (a block suffix, never an entry — frozen at session start, so the prompt cache is unaffected).
 
-When several ACTIVE `decision`/`constraint` entries overlap (they share significant words — the same notion the add-time contradiction hint uses), something is stale: one of them supersedes the other but the deprecate never happened. Three surfaces make that visible instead of leaving two quiet contradictions:
+### Possible tensions (evidence-backed)
 
-- `memory(action=read)` returns a top-level `tensions` array — the conflicting pairs with both contents and dates, not loose individual hits.
-- The per-turn context pack carries a "Choice tension" section when a conflicting pair matches the current message (budget-capped, at most two pairs).
-- `hermes memory report` prints the **Choice memory** digest: decisions that changed in the window (`now:` / `was:` with dates and the recorded reason) plus the active tensions, each with the exact deprecate suggestion.
+When several ACTIVE `decision`/`constraint` entries genuinely overlap, one of them is likely stale. The matcher (stop-words + document-frequency filtering + ≥2 shared contentful stems) surfaces candidates as **possible** tensions, always with evidence:
+
+- `memory(action=read)` returns a top-level `possible_tensions` array — pairs with both contents, dates and the shared terms, so glue-word pairs can be rejected at a glance.
+- `hermes memory report` prints the full candidate count plus the top pairs (a display cap never masquerades as the total), next to the decisions-changed digest (`now:` / `was:` with dates and reasons).
+- The per-turn context pack deliberately does NOT inject tensions: the matcher is diagnostic until it proves precision on live data.
+
+### Graph integrity (schema v4)
+
+Every `memory_links` edge references two existing entries by full UUID, enforced by foreign keys (`ON DELETE CASCADE`) plus a no-self-loop check — the pre-v4 database carried 14 manually backfilled edges with 8-char display ids that no JOIN could read. The v3→v4 migration resolves short ids to full UUIDs by unique prefix; anything unresolvable is recorded in `meta` (see `migration issues` in the report), never dropped silently. `hermes memory report` shows the graph summary: total/valid/orphan edges, `supersedes` vs structural counts, and foreign-key violations.
 
 ### No-match feedback
 
@@ -136,7 +145,7 @@ hermes memory report --days 30   # wider window
 hermes memory report --prune     # also drop rows older than memory.recall_log.retain_days
 ```
 
-The report shows hit-rate by channel, empty recalls that *had* candidates (scored out), the **top recurring empty-recall queries** — your best candidates for new [aliases](#synonym-aliases-memoryaliases) — dead weight (active entries never accessed in 30+ days), the most-accessed entries, and the **Choice memory** digest ([tension map](#tension-map-active-conflicts)): which decisions changed (`now:` / `was:` with dates and reasons) and which ACTIVE decisions still conflict. A weekly cron of `hermes memory report --prune` delivered to your platform of choice is a cheap, high-signal health loop.
+The report shows hit-rate by channel, empty recalls that *had* candidates (scored out), the **top recurring empty-recall queries** — your best candidates for new [aliases](#synonym-aliases-memoryaliases) — dead weight (active entries never accessed in 30+ days), the most-accessed entries, the **Choice memory** digest ([possible tensions](#possible-tensions-evidence-backed)): which decisions changed (`now:` / `was:` with dates and reasons), the full possible-tension count with top pairs, and the [graph integrity](#graph-integrity-schema-v4) summary. A weekly cron of `hermes memory report --prune` delivered to your platform of choice is a cheap, high-signal health loop.
 
 Gate and retention:
 

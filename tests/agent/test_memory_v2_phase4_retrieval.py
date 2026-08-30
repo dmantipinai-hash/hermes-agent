@@ -367,23 +367,30 @@ class TestMarkerDocumentation:
     """§8.2: the superseded-by marker must be visible to the model, or the
     link write path stays dead and P1 reads an empty graph forever."""
 
-    def test_schema_documents_the_marker(self):
+    def test_schema_documents_the_supersede_protocol(self):
         import json
 
         from tools.memory_tool import MEMORY_SCHEMA
 
         blob = json.dumps(MEMORY_SCHEMA, ensure_ascii=False)
-        assert "superseded by:" in blob
+        # The 2026-08-30 graph protocol: one atomic action + id-based
+        # linking. The fragile `superseded by:` text marker stays parseable
+        # in the store for back-compat but must NOT be the taught protocol.
+        assert "supersede" in blob
+        assert "superseded_by_id" in blob
 
-    def test_marker_fragment_mismatch_degrades_softly(self, store):
-        # Hidden semantics locked as-is: the fragment after the marker is
-        # matched substring-style against active entries; a miss means the
-        # deprecate still succeeds and the link is silently not written.
+    def test_marker_fragment_mismatch_is_success_with_visible_warning(self, store):
+        # Soft degradation stays (the deprecate itself succeeds), but the
+        # miss is now OBSERVABLE: link_created=false + warning. The silent
+        # success hid half-completed operations from the model and operator
+        # (2026-08-30 graph TZ).
         store.add("memory", "Старое решение про хранение", entry_type="decision")
         r = store.deprecate(
             "memory", "хранение", reason="superseded by: несуществующий фрагмент"
         )
         assert r["success"]
+        assert r["link_created"] is False
+        assert r.get("warning")
         assert store._query("SELECT COUNT(*) AS c FROM memory_links")[0]["c"] == 0
 
 
@@ -595,10 +602,12 @@ class TestYoFolding:
             # defect actually broke; empty-alias store by fixture isolation.
             cands = s2.recall_candidates("нужен ли вообще велотренажер")
             assert any("велотренажёр" in c["content"] for c in cands)
-            # Content column stays verbatim; version stamped.
+            # Content column stays verbatim; version stamped to CURRENT
+            # latest (behavior contract — not a version literal).
+            from agent.memory_store_v2 import SCHEMA_VERSION
             assert s2._query(
                 "SELECT value FROM meta WHERE key='schema_version'"
-            )[0]["value"] == "3"
+            )[0]["value"] == str(SCHEMA_VERSION)
         finally:
             s2.close()
 

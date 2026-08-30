@@ -1065,17 +1065,21 @@ def memory_tool(
     query: str = None,
     reason: str = None,
     written_by: str = None,
+    old_id: str = None,
+    superseded_by_id: str = None,
     store: Optional[MemoryStore] = None,
 ) -> str:
     """
     Single entry point for the memory tool. Dispatches to MemoryStore methods.
 
-    Typed actions (deprecate/read) and the type/importance parameters require
-    the v2 store; on the legacy flat-file store they degrade with a clear
-    error instead of silently misbehaving.
+    Typed actions (supersede/deprecate/read) and the type/importance
+    parameters require the v2 store; on the legacy flat-file store they
+    degrade with a clear error instead of silently misbehaving.
 
     ``written_by`` records the caller's provenance (e.g. ``main:{session_id}``)
-    for scoped revert; ignored on the legacy store.
+    for scoped revert; ignored on the legacy store. ``old_id`` /
+    ``superseded_by_id`` address entries by exact UUID (the 2026-08-30 graph
+    protocol — ids never depend on substring quoting).
 
     Returns JSON string with results.
     """
@@ -1185,15 +1189,40 @@ def memory_tool(
     elif action == "remove":
         result = store.remove(target, old_text)
 
+    elif action == "supersede":
+        if not _is_v2:
+            return tool_error(
+                "Supersede requires the v2 store (memory.store_v2: true in config).",
+                success=False,
+            )
+        if not old_id:
+            return tool_error(
+                "old_id is required for 'supersede' (the UUID of the entry being replaced; "
+                "read first if unknown).",
+                success=False,
+            )
+        if not content:
+            return tool_error("content (the new decision) is required for 'supersede'.", success=False)
+        result = store.supersede(
+            target, old_id=old_id, content=content,
+            entry_type=entry_type, importance=importance,
+            reason=reason or "", written_by=written_by,
+        )
+
     elif action == "deprecate":
         if not _is_v2:
             return tool_error(
                 "Deprecate requires the v2 store (memory.store_v2: true in config).",
                 success=False,
             )
-        if not old_text:
-            return tool_error("old_text is required for 'deprecate' action.", success=False)
-        result = store.deprecate(target, old_text, reason=reason or "")
+        if not old_text and not old_id:
+            return tool_error(
+                "old_id or old_text is required for 'deprecate' action.", success=False
+            )
+        result = store.deprecate(
+            target, old_text=old_text or "", reason=reason or "",
+            old_id=old_id, superseded_by_id=superseded_by_id,
+        )
 
     elif action == "read":
         if not _is_v2:
@@ -1207,7 +1236,7 @@ def memory_tool(
         result = store.recall(search_query, target=target)
 
     else:
-        return tool_error(f"Unknown action '{action}'. Use: add, replace, remove, deprecate, read", success=False)
+        return tool_error(f"Unknown action '{action}'. Use: add, replace, remove, supersede, deprecate, read", success=False)
 
     return json.dumps(result, ensure_ascii=False)
 
@@ -1266,10 +1295,11 @@ MEMORY_SCHEMA = {
         "- 'memory': your notes -- environment facts, project conventions, tool quirks, lessons learned\n\n"
         "ACTIONS: add (new entry), replace (update existing -- old_text identifies it), "
         "remove (hard delete garbage -- old_text identifies it), "
-        "deprecate (mark a decision/constraint obsolete -- kept for audit, hidden "
-        "from search; to link the successor entry, end reason with "
-        "`superseded by: <exact substring of the new entry>` -- provenance then "
-        "surfaces in recall), "
+        "supersede (ATOMIC decision change -- old_id + content: adds the new entry, "
+        "deprecates the old one and writes the provenance link in one operation; "
+        "THE way to change a decision), "
+        "deprecate (retire an entry -- old_id or old_text; optional superseded_by_id "
+        "links an already-added successor by exact id), "
         "read (search memory by query before proposing ideas or making decisions).\n\n"
         "ARCHITECTURE (two tiers): the hot tier is a compact snapshot with a bounded "
         "char budget injected into the system prompt at session start; entries beyond "
@@ -1283,12 +1313,15 @@ MEMORY_SCHEMA = {
         "prompt are re-injected automatically each turn when the user's message "
         "matches them — so past decisions resurface even without an explicit read. "
         "When asked how your memory works, describe BOTH tiers.\n\n"
-        "CONTRADICTION RULE: before saving a decision or constraint, run read with the topic "
-        "keywords. If an ACTIVE entry contradicts the new one, deprecate the old entry (with "
-        "reason) and then add the new one. When add returns 'related_active', review those "
-        "entries for conflicts — and when it returns 'suggested_deprecate', finish the update "
-        "by calling deprecate with exactly those arguments (the reason already ends with the "
-        "linking marker).\n\n"
+        "CHOICE-CHANGE RULE: before saving a decision or constraint, run read with the "
+        "topic keywords. If an ACTIVE entry is genuinely superseded by the new one, do "
+        "NOT add beside it — call supersede(old_id=<that entry's id>, content=<new "
+        "decision>, reason=<why changed>) in ONE call. Prefer old_id over quoting text: "
+        "ids never mismatch. If you already added the new entry, link it afterwards "
+        "with deprecate(old_id=<old id>, superseded_by_id=<new id>, reason=...). When "
+        "add returns 'related_active', the candidates are RANKED SUGGESTIONS with "
+        "shared_terms evidence — review the evidence; ignore pairs that only share "
+        "generic words, and never deprecate an entry you are not sure about.\n\n"
         "SKIP: trivial/obvious info, things easily re-discovered, raw data dumps, and temporary task state."
     ),
     "parameters": {
@@ -1296,7 +1329,7 @@ MEMORY_SCHEMA = {
         "properties": {
             "action": {
                 "type": "string",
-                "enum": ["add", "replace", "remove", "deprecate", "read"],
+                "enum": ["add", "replace", "remove", "supersede", "deprecate", "read"],
                 "description": "The action to perform."
             },
             "target": {
@@ -1306,11 +1339,19 @@ MEMORY_SCHEMA = {
             },
             "content": {
                 "type": "string",
-                "description": "The entry content. Required for 'add' and 'replace' (single-op shape). Alias: 'new_text' is also accepted (mirrors old_text)."
+                "description": "The entry content. Required for 'add' and 'supersede' (the new decision) and 'replace'. Alias: 'new_text' is also accepted (mirrors old_text)."
             },
             "old_text": {
                 "type": "string",
-                "description": "Short unique substring identifying the entry to replace, remove, or deprecate."
+                "description": "Short unique substring identifying the entry to replace, remove, or deprecate. Prefer old_id where possible — ids never mismatch."
+            },
+            "old_id": {
+                "type": "string",
+                "description": "Exact entry id (UUID) for 'supersede' (the entry being replaced) and 'deprecate'. Ids come from read results ('id' field) or add responses."
+            },
+            "superseded_by_id": {
+                "type": "string",
+                "description": "Exact id of the successor entry for 'deprecate' — links the pair when the new entry was already added separately. Invalid or deprecated successor ids fail the whole call without changing anything."
             },
             "type": {
                 "type": "string",
@@ -1332,10 +1373,10 @@ MEMORY_SCHEMA = {
             "reason": {
                 "type": "string",
                 "description": (
-                    "Why the entry is deprecated (for the 'deprecate' action). "
-                    "When the entry is replaced by a newer one, end the reason with "
-                    "`superseded by: <exact substring of the successor entry>` — the "
-                    "link is recorded and recall then shows what each decision replaced."
+                    "Why the entry changed (for 'supersede' and 'deprecate') — "
+                    "human-readable, becomes the deprecate_reason in the audit trail. "
+                    "Linking is done by ids (supersede / superseded_by_id), not by "
+                    "reason text."
                 ),
             },
         },

@@ -3197,6 +3197,8 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
                 importance=next_args.get("importance"),
                 query=next_args.get("query"),
                 reason=next_args.get("reason"),
+                old_id=next_args.get("old_id"),
+                superseded_by_id=next_args.get("superseded_by_id"),
                 written_by=f"main:{agent.session_id}" if getattr(agent, "session_id", None) else None,
                 store=agent._memory_store,
             )

@@ -64,17 +64,24 @@ def test_scenario_3_decision_with_reason_persists_reason(mem_dir):
     s2.close()
 
 
-def test_scenario_4_reversal_flow_deprecate_then_add(mem_dir):
+def test_scenario_4_reversal_flow_atomic_supersede(mem_dir):
+    # The 2026-08-30 graph protocol: a rule reversal is ONE atomic call
+    # (supersede), not the fragile add-beside + marker-deprecate chain. The
+    # old scenario relied on the loose matcher surfacing a single-shared-word
+    # reversal — exactly the glue-word pairing the safe matcher removes.
     s = _fresh(mem_dir)
-    s.add("memory", "Отвечаем всегда кратко, одной строкой", entry_type="constraint")
-    # User reverses the rule:
-    r = s.add("memory", "Отвечаем развёрнуто с примерами", entry_type="constraint")
-    assert r.get("related_active"), "reversal must surface the old rule"
-    s.deprecate("memory", "одной строкой", reason="superseded by: развёрнуто с примерами")
+    r_old = s.add("memory", "Отвечаем всегда кратко, одной строкой", entry_type="constraint")
+    r = s.supersede(
+        "memory", old_id=r_old["id"],
+        content="Отвечаем развёрнуто с примерами",
+        entry_type="constraint", reason="пользователь просит подробные ответы",
+    )
+    assert r["success"] and r["link_created"] is True
     s.close()
     s2 = _fresh(mem_dir)
     hits = s2.recall("Отвечаем")["results"]
     assert len(hits) == 1 and "развёрнуто" in hits[0]["content"]
+    assert hits[0]["supersedes"][0]["content"].startswith("Отвечаем всегда кратко")
     s2.close()
 
 
