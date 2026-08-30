@@ -224,6 +224,85 @@ class TestAtomicSupersede:
         assert store._query("SELECT COUNT(*) AS c FROM memory_links")[0]["c"] == 0
 
 
+class TestPrefixIdResolution:
+    """Live acceptance 30.08: retrieval surfaces show 8-char id prefixes,
+    but the id parameters only took full UUIDs — the model missed twice and
+    had to dig ids out with sqlite3. The resolver closes that gap."""
+
+    def test_deprecate_accepts_unambiguous_prefix(self, store):
+        r_old = store.add("memory", "решение про мониторинг", entry_type="decision")
+        r_new = store.add("memory", "решение про observability", entry_type="decision")
+        r = store.deprecate(
+            "memory", old_id=r_old["id"][:8], superseded_by_id=r_new["id"][:8],
+            reason="переход на новый стек",
+        )
+        assert r["success"] and r["link_created"] is True
+        links = store._query("SELECT source_id, target_id FROM memory_links")
+        assert links[0]["source_id"] == r_new["id"]
+        assert links[0]["target_id"] == r_old["id"]
+
+    def test_supersede_accepts_prefix(self, store):
+        r_old = store.add("memory", "старое решение про CI", entry_type="decision")
+        r = store.supersede(
+            "memory", old_id=r_old["id"][:8],
+            content="новое решение про CI раннеры",
+            entry_type="decision", reason="переезд",
+        )
+        assert r["success"] and r["old_id"] == r_old["id"]
+
+    def test_ambiguous_prefix_fails_without_mutation(self, store):
+        a1 = _uuid_with_prefix("eeeeeeee", "1")
+        a2 = _uuid_with_prefix("eeeeeeee", "2")
+        for ident in (a1, a2):
+            store._execute_write(lambda conn, i=ident: conn.execute(
+                "INSERT INTO memories(id, target, type, content, importance, confidence,"
+                " status, created_at, updated_at) VALUES (?,?,?,?,?,?,'active',datetime('now'),datetime('now'))",
+                (i, "memory", "decision", f"решение дубль {i[:8]} сервер", 0.5, 0.7),
+            ))
+        r = store.supersede(
+            "memory", old_id="eeeeeeee",
+            content="совсем новое решение", entry_type="decision",
+        )
+        assert not r["success"] and "ambiguous" in r["error"]
+        assert store._query("SELECT COUNT(*) AS c FROM memory_links")[0]["c"] == 0
+        assert store._query(
+            "SELECT COUNT(*) AS c FROM memories WHERE status='deprecated'"
+        )[0]["c"] == 0
+
+    def test_bad_length_prefix_rejected_clearly(self, store):
+        r = store.deprecate("memory", old_id="abc", reason="короткий префикс")
+        assert not r["success"] and "8+ char" in r["error"]
+
+
+class TestWindowPairsExplainGrowth:
+    """Live acceptance 30.08: tensions 47→48 after a supersede looked like a
+    broken counter. It is honest — the NEW decision overlaps standing ones —
+    but the report must explain the delta, not just grow."""
+
+    def test_window_pairs_flagged_and_counted(self, store):
+        store.add("memory", "решение: используем Linux на сервере projects",
+                  entry_type="decision")
+        store.add("memory", "решение: переносим Linux на другой сервер",
+                  entry_type="decision")
+        rep = store.choice_report(days=7)
+        assert rep["possible_tensions_total"] >= 1
+        assert rep["window_pairs"] == rep["possible_tensions_total"]  # всё свежее
+        assert all(t.get("in_window") for t in rep["possible_tensions"])
+
+    def test_old_pairs_not_flagged(self, store):
+        r1 = store.add("memory", "решение: держим nginx на сервере", entry_type="decision")
+        store.add("memory", "решение: переносим nginx на другой сервер",
+                  entry_type="decision")
+        # Age both entries beyond the window.
+        store._execute_write(lambda conn: conn.execute(
+            "UPDATE memories SET created_at='2026-01-01T00:00:00+00:00'"
+        ))
+        rep = store.choice_report(days=7)
+        assert rep["possible_tensions_total"] >= 1
+        assert rep["window_pairs"] == 0
+        assert not any(t.get("in_window") for t in rep["possible_tensions"])
+
+
 class TestDeprecateRecoveryById:
     def test_superseded_by_id_links(self, store):
         r_old = store.add("memory", "старое решение про CI", entry_type="decision")

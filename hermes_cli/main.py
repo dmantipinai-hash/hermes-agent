@@ -12049,13 +12049,20 @@ def cmd_memory(args):
                           f" reason: {(ch['reason'] or '—')[:60]})")
                 total = choice.get("possible_tensions_total", 0)
                 shown = choice.get("possible_tensions") or []
+                window_pairs = choice.get("window_pairs", 0)
                 print(f"  ⚠ POSSIBLE tensions (overlapping active decisions/constraints): "
                       f"{total}"
                       + (f" (showing top {len(shown)})" if len(shown) < total else ""))
+                if window_pairs:
+                    print(f"    · {window_pairs} involve decisions from the last"
+                          f" {choice['days']} day(s) — a NEW decision overlapping standing"
+                          " ones grows this count until they are superseded or"
+                          " differentiated; review those first.")
                 for t in shown:
                     a, b = t["entries"]
+                    mark = " [new]" if t.get("in_window") else ""
                     print(f"    · '{a['content'][:55]}' ({(a['created_at'] or '')[:10]})")
-                    print(f"      ↔ '{b['content'][:55]}' ({(b['created_at'] or '')[:10]})"
+                    print(f"      ↔ '{b['content'][:55]}' ({(b['created_at'] or '')[:10]}){mark}"
                           f"  [shared: {', '.join(t.get('shared_terms', [])[:4])}]")
             try:
                 graph = store.graph_integrity_summary()

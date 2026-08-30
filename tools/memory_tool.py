@@ -1347,11 +1347,11 @@ MEMORY_SCHEMA = {
             },
             "old_id": {
                 "type": "string",
-                "description": "Exact entry id (UUID) for 'supersede' (the entry being replaced) and 'deprecate'. Ids come from read results ('id' field) or add responses."
+                "description": "Entry id for 'supersede' (the entry being replaced) and 'deprecate'. Accepts the full UUID or an unambiguous 8+ char prefix — the short form shown in retrieval results works directly."
             },
             "superseded_by_id": {
                 "type": "string",
-                "description": "Exact id of the successor entry for 'deprecate' — links the pair when the new entry was already added separately. Invalid or deprecated successor ids fail the whole call without changing anything."
+                "description": "Id of the successor entry for 'deprecate' — links the pair when the new entry was already added separately. Full UUID or unambiguous 8+ char prefix. Invalid, ambiguous or deprecated successor ids fail the whole call without changing anything."
             },
             "type": {
                 "type": "string",

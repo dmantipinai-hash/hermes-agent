@@ -1244,6 +1244,42 @@ class MemoryStoreV2(MemoryStore):
     # New v2 operations
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _resolve_entry_id(
+        conn: sqlite3.Connection, target: str, ident: str, *, role: str = "entry",
+    ) -> Tuple[Optional[str], Optional[str]]:
+        """Resolve an entry identifier to a FULL UUID — or explain why not.
+
+        Accepts the full 36-char UUID or an unambiguous prefix of 8+ chars
+        (the short form retrieval surfaces render — the pack bullets and the
+        recall neighbors show 8-char prefixes; before this resolver the model
+        had to reach for sqlite3 to turn them into full ids). Returns
+        ``(full_id, None)`` or ``(None, error)``; never mutates.
+        """
+        ident = (ident or "").strip()
+        if len(ident) == 36:
+            row = conn.execute(
+                "SELECT id FROM memories WHERE id=? AND target=?", (ident, target)
+            ).fetchone()
+            if row:
+                return ident, None
+            return None, f"{role} id '{ident}' not found in target '{target}'."
+        if 8 <= len(ident) < 36:
+            rows = conn.execute(
+                "SELECT id FROM memories WHERE target=? AND id LIKE ?", (target, ident + "%")
+            ).fetchall()
+            if len(rows) == 1:
+                return rows[0]["id"], None
+            if not rows:
+                return None, f"{role} id prefix '{ident}' matches no entry in target '{target}'."
+            return None, (
+                f"{role} id prefix '{ident}' is ambiguous ({len(rows)} matches) — "
+                "use the full id from memory(action=read)."
+            )
+        return None, (
+            f"{role} id must be the full UUID or an unambiguous 8+ char prefix, got '{ident}'."
+        )
+
     def deprecate(
         self,
         target: str,
@@ -1278,16 +1314,18 @@ class MemoryStoreV2(MemoryStore):
 
         def _dep(conn: sqlite3.Connection) -> None:
             if old_id:
-                row = conn.execute(
-                    "SELECT id, content, status FROM memories WHERE id=? AND target=?",
-                    (old_id, target),
-                ).fetchone()
-                if row is None:
-                    outcome.update({
-                        "success": False,
-                        "error": f"old_id '{old_id}' not found in target '{target}'.",
-                    })
+                # Full UUID or an unambiguous 8+ char prefix (the short form
+                # retrieval surfaces show) — resolved before any mutation.
+                resolved, err = self._resolve_entry_id(
+                    conn, target, old_id, role="old_id"
+                )
+                if resolved is None:
+                    outcome.update({"success": False, "error": err})
                     return
+                row = conn.execute(
+                    "SELECT id, content, status FROM memories WHERE id=?",
+                    (resolved,),
+                ).fetchone()
                 if row["status"] not in ("active", "pinned", "dormant"):
                     outcome.update({
                         "success": False,
@@ -1319,19 +1357,18 @@ class MemoryStoreV2(MemoryStore):
             successor: Optional[str] = None
             soft_miss = False
             if superseded_by_id:
-                succ = conn.execute(
-                    "SELECT id, status FROM memories WHERE id=? AND target=?",
-                    ((superseded_by_id or "").strip(), target),
-                ).fetchone()
-                if succ is None:
+                succ_id, succ_err = self._resolve_entry_id(
+                    conn, target, superseded_by_id, role="superseded_by_id"
+                )
+                if succ_id is None:
                     outcome.update({
                         "success": False,
-                        "error": (
-                            f"superseded_by_id '{superseded_by_id}' not found in "
-                            f"target '{target}'. Old entry left unchanged."
-                        ),
+                        "error": f"{succ_err} Old entry left unchanged.",
                     })
                     return
+                succ = conn.execute(
+                    "SELECT id, status FROM memories WHERE id=?", (succ_id,)
+                ).fetchone()
                 if succ["id"] == row["id"]:
                     outcome.update({
                         "success": False,
@@ -1442,16 +1479,14 @@ class MemoryStoreV2(MemoryStore):
         new_id_holder: List[str] = []
 
         def _sup(conn: sqlite3.Connection) -> None:
-            old = conn.execute(
-                "SELECT id, content, status, type FROM memories WHERE id=? AND target=?",
-                (old_id, target),
-            ).fetchone()
-            if old is None:
-                outcome.update({
-                    "success": False,
-                    "error": f"old_id '{old_id}' not found in target '{target}'.",
-                })
+            resolved, err = self._resolve_entry_id(conn, target, old_id, role="old_id")
+            if resolved is None:
+                outcome.update({"success": False, "error": err})
                 return
+            old = conn.execute(
+                "SELECT id, content, status, type FROM memories WHERE id=?",
+                (resolved,),
+            ).fetchone()
             if old["status"] not in ("active", "pinned", "dormant"):
                 outcome.update({
                     "success": False,
@@ -1483,17 +1518,17 @@ class MemoryStoreV2(MemoryStore):
             conn.execute(
                 "UPDATE memories SET status='deprecated', deprecate_reason=?, updated_at=?"
                 " WHERE id=?",
-                ((reason or "").strip() or None, _now(), old_id),
+                ((reason or "").strip() or None, _now(), old["id"]),
             )
             conn.execute(
                 "INSERT INTO memory_links(source_id, target_id, relation_type, created_at)"
                 " VALUES (?,?, 'supersedes', ?)",
-                (new_id, old_id, _now()),
+                (new_id, old["id"], _now()),
             )
             new_id_holder.append(new_id)
             outcome.update({
                 "success": True,
-                "old_id": old_id,
+                "old_id": old["id"],
                 "new_id": new_id,
                 "deprecated_content": old["content"][:120],
                 "link_created": True,
@@ -1752,6 +1787,24 @@ class MemoryStoreV2(MemoryStore):
             )
         ]
         pairs = _tension_pairs(standing)
+        # Pairs involving decisions CREATED inside the window: a fresh
+        # decision legitimately overlaps standing ones until they are
+        # superseded or differentiated, so the pair count can GROW right
+        # after a supersede (live 2026-08-30: 47→48 — the new "architecture
+        # work" decision overlapped three old ones). Flagging those pairs
+        # makes the delta readable instead of counterintuitive.
+        window_ids = {
+            r["id"] for r in self._query(
+                "SELECT id FROM memories WHERE target='memory'"
+                " AND datetime(created_at) >= datetime('now', ?)",
+                (f"-{days} days",),
+            )
+        }
+        window_pairs = 0
+        for p in pairs:
+            if any(e.get("id") in window_ids for e in p["entries"]):
+                p["in_window"] = True
+                window_pairs += 1
         return {
             "days": days,
             "changes": changes,
@@ -1761,6 +1814,7 @@ class MemoryStoreV2(MemoryStore):
             # because of cap=10 over ~50 mostly-false pairs).
             "possible_tensions": pairs[:10],
             "possible_tensions_total": len(pairs),
+            "window_pairs": window_pairs,
         }
 
     def graph_integrity_summary(self) -> Dict[str, Any]:

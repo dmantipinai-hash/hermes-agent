@@ -94,15 +94,17 @@ memory(action="supersede", target="memory", old_id="<uuid>",   # the entry being
        reason="сервер усилен — старое ограничение снято")
 ```
 
-`supersede` adds the new entry, deprecates the old one and writes the provenance link in a single transaction — no half-completed changes, no substring quoting (ids never mismatch). Later, any recall that surfaces the new decision also shows:
+`supersede` adds the new entry, deprecates the old one and writes the provenance link in a single transaction — no half-completed changes, no substring quoting. The `old_id`/`superseded_by_id` parameters accept the full UUID **or an unambiguous 8+ char prefix** — the short id form shown in retrieval results (pack bullets, recall neighbors) works directly; an ambiguous prefix fails with the match count and changes nothing.
+
+If the new entry was already added separately, link it afterwards: `memory(action="deprecate", old_id=<old id>, superseded_by_id=<new id>, reason=...)`. An invalid successor id fails the whole call and changes nothing. The legacy `superseded by: <substring>` marker in `reason` still parses for compatibility, but a fragment miss is now visible: the deprecate succeeds, and the response carries `link_created: false` plus a warning — a missed link is never silent.
+
+Later, any recall that surfaces the new decision also shows:
 
 ```
 [supersedes: 1f2a3b4c (2026-08-14, «Хостинг: не используем Docker — тяжело для сервера»)]
 ```
 
 so the agent can say "you changed your mind — the original objection was server load; is that factor addressed?" instead of knowing only the latest state. Links are strictly one hop — a predecessor's own predecessor does not ride along.
-
-If the new entry was already added separately, link it afterwards: `memory(action="deprecate", old_id=<old id>, superseded_by_id=<new id>, reason=...)`. An invalid successor id fails the whole call and changes nothing. The legacy `superseded by: <substring>` marker in `reason` still parses for compatibility, but a fragment miss is now visible: the deprecate succeeds, and the response carries `link_created: false` plus a warning — a missed link is never silent.
 
 When `add` stores a new `decision`/`constraint` while similar ACTIVE ones exist, the response carries `related_active` — ranked candidates, each with `shared_terms` evidence and a score. Suggest-only: nothing is auto-deprecated, and candidates that merely share generic words should be ignored. While standing decisions exist, the frozen memory snapshot ends with a one-line rule teaching the supersede protocol (a block suffix, never an entry — frozen at session start, so the prompt cache is unaffected).
 
