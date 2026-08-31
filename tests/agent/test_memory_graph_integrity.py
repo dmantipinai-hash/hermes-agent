@@ -192,20 +192,25 @@ class TestAtomicSupersede:
         assert store._query("SELECT COUNT(*) AS c FROM memories")[0]["c"] == before
         assert store._query("SELECT COUNT(*) AS c FROM memory_links")[0]["c"] == 0
 
-    def test_supersede_rejects_foreign_target_and_deprecated_old(self, store):
+    def test_supersede_corrects_foreign_target_and_rejects_deprecated_old(self, store):
         old_id = self._seed(store)
+        # Foreign target is no longer an error: an exact id is unambiguous,
+        # so the supersede lands in the entry's ACTUAL store with a note
+        # (cross-target contract, TestCrossTargetResolution covers details).
         r = store.supersede(
             "user", old_id=old_id, content="запись в другом таргете",
             entry_type="decision",
         )
-        assert not r["success"]
+        assert r["success"] and r["target"] == "memory"
+        assert "target corrected" in r.get("note", "")
         assert store._query(
             "SELECT status FROM memories WHERE id=?", (old_id,)
-        )[0]["status"] == "active"
-        # Deprecate the old entry, then try to supersede it again.
-        store.deprecate("memory", old_id=old_id, reason="снято")
+        )[0]["status"] == "deprecated"
+        # Deprecate the new entry, then try to supersede it again.
+        new_id = r["new_id"]
+        store.deprecate("memory", old_id=new_id, reason="снято")
         r2 = store.supersede(
-            "memory", old_id=old_id, content="повторная смена",
+            "memory", old_id=new_id, content="повторная смена",
             entry_type="decision",
         )
         assert not r2["success"]
@@ -272,6 +277,62 @@ class TestPrefixIdResolution:
     def test_bad_length_prefix_rejected_clearly(self, store):
         r = store.deprecate("memory", old_id="abc", reason="короткий префикс")
         assert not r["success"] and "8+ char" in r["error"]
+
+
+class TestCrossTargetResolution:
+    """Live incident 2026-08-31: the «План апгрейда» entry lived in
+    target='user' while every mutation addressed target='memory' — four
+    failed calls in a row (old_text LIKE found nothing, and even the exact
+    UUID pulled via sqlite3 returned 'not found in target memory'). The
+    agent's ' витрина vs холодный слой' theory was wrong; the store split
+    was the trap. Ids now resolve across stores; old_text misses point at
+    the other store."""
+
+    OLD = "План апгрейда (обновлён 26.08): M7 Pro mini 64GB, конец 2027"
+    NEW = "План апгрейда (актуализация 31.08): M7 Pro mini 64GB, старт 2027"
+
+    def test_supersede_by_id_crosses_targets(self, store):
+        r_old = store.add("user", self.OLD)
+        r = store.supersede(
+            "memory", old_id=r_old["id"], content=self.NEW, reason="актуализация",
+        )
+        assert r["success"] and r["link_created"] is True
+        assert r["target"] == "user"
+        assert "target corrected" in r.get("note", "")
+        # Both sides of the pair live in the entry's ACTUAL store.
+        rows = {row["id"]: (row["target"], row["status"]) for row in store._query(
+            "SELECT id, target, status FROM memories WHERE id IN (?, ?)",
+            (r_old["id"], r["new_id"]),
+        )}
+        assert rows[r_old["id"]] == ("user", "deprecated")
+        assert rows[r["new_id"]] == ("user", "active")
+        # The user projection changed, the memory projection did not.
+        assert any(self.NEW in c for c in store._visible_rows("user"))
+        assert not any(self.NEW in c["content"] for c in store._visible_rows("memory"))
+
+    def test_deprecate_by_id_crosses_targets(self, store):
+        r_old = store.add("user", self.OLD)
+        r_new = store.add("user", self.NEW)
+        r = store.deprecate(
+            "memory", old_id=r_old["id"], superseded_by_id=r_new["id"],
+            reason="актуализация",
+        )
+        assert r["success"] and r["link_created"] is True
+        assert r["target"] == "user" and "target corrected" in r.get("note", "")
+
+    def test_old_text_miss_points_at_the_other_store(self, store):
+        store.add("user", self.OLD)
+        r = store.replace("memory", "План апгрейда", self.NEW)
+        assert not r["success"]
+        assert "in target 'memory'" in r["error"]
+        assert "exists in target 'user'" in r.get("note", "")
+        assert any(self.OLD in c for c in r["current_entries"])
+
+    def test_genuine_miss_has_no_cross_note(self, store):
+        store.add("memory", "запись про совсем другое")
+        r = store.replace("memory", "План апгрейда", self.NEW)
+        assert not r["success"]
+        assert "note" not in r or "target 'user'" not in r.get("note", "")
 
 
 class TestWindowPairsExplainGrowth:

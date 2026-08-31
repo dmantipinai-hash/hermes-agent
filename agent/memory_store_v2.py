@@ -1228,17 +1228,39 @@ class MemoryStoreV2(MemoryStore):
         2026-08-20: two failed replaces quoting a document's wording instead
         of the stored entry text). Restore the entries list and route through
         the per-turn consolidation-failure cap like v1.
+
+        2026-08-31: when the text matches nothing in the requested store but
+        DOES exist in the other one, say so — the four-in-a-row failure loop
+        happened exactly because the entry lived in 'user' while every call
+        addressed 'memory' and each miss looked like a quoting problem.
         """
         entries = [r["content"] for r in self._visible_rows(target)]
-        return self._consolidation_failure({
+        err = {
             "success": False,
             "error": (
-                f"No entry matched '{old_text}'. Check current_entries below and "
-                f"retry with a short unique substring of the exact stored text "
-                f"(to {action})."
+                f"No entry matched '{old_text}' in target '{target}'. Check "
+                "current_entries below and retry with a short unique substring "
+                f"of the exact stored text (to {action}) — or address the entry "
+                "by its exact old_id."
             ),
             "current_entries": entries,
-        })
+        }
+        other = "user" if target == "memory" else "memory"
+        try:
+            hit = self._query(
+                "SELECT 1 FROM memories WHERE target=? AND ulower(content) LIKE ?"
+                " AND status!='deprecated' LIMIT 1",
+                (other, f"%{(old_text or '').lower()}%"),
+            )
+            if hit:
+                err["note"] = (
+                    f"An entry matching this text exists in target '{other}' — "
+                    f"retry with target='{other}'."
+                )
+                err["current_entries"] = [r["content"] for r in self._visible_rows(other)]
+        except sqlite3.Error:
+            pass
+        return self._consolidation_failure(err)
 
     # ------------------------------------------------------------------
     # New v2 operations
@@ -1253,32 +1275,53 @@ class MemoryStoreV2(MemoryStore):
         Accepts the full 36-char UUID or an unambiguous prefix of 8+ chars
         (the short form retrieval surfaces render — the pack bullets and the
         recall neighbors show 8-char prefixes; before this resolver the model
-        had to reach for sqlite3 to turn them into full ids). Returns
-        ``(full_id, None)`` or ``(None, error)``; never mutates.
+        had to reach for sqlite3 to turn them into full ids).
+
+        CROSS-TARGET correction (live 2026-08-31 incident): an exact id may
+        point at the OTHER store ('user' vs 'memory') — retrieval surfaces
+        show both without always labeling the target, so the model addresses
+        mutations to the wrong one and gets "not found". When the id resolves
+        uniquely in the other target, the resolution SUCCEEDS against that
+        target; callers read the entry's actual target from the row instead
+        of the request parameter. Returns ``(full_id, None)`` or
+        ``(None, error)``; never mutates.
         """
         ident = (ident or "").strip()
-        if len(ident) == 36:
-            row = conn.execute(
-                "SELECT id FROM memories WHERE id=? AND target=?", (ident, target)
-            ).fetchone()
-            if row:
-                return ident, None
-            return None, f"{role} id '{ident}' not found in target '{target}'."
-        if 8 <= len(ident) < 36:
-            rows = conn.execute(
-                "SELECT id FROM memories WHERE target=? AND id LIKE ?", (target, ident + "%")
-            ).fetchall()
-            if len(rows) == 1:
-                return rows[0]["id"], None
-            if not rows:
-                return None, f"{role} id prefix '{ident}' matches no entry in target '{target}'."
+        other = "user" if target == "memory" else "memory"
+
+        def _try(store: str) -> Tuple[Optional[str], Optional[str]]:
+            if len(ident) == 36:
+                row = conn.execute(
+                    "SELECT id FROM memories WHERE id=? AND target=?", (ident, store)
+                ).fetchone()
+                if row:
+                    return ident, None
+                return None, f"{role} id '{ident}' not found in target '{store}'."
+            if 8 <= len(ident) < 36:
+                rows = conn.execute(
+                    "SELECT id FROM memories WHERE target=? AND id LIKE ?",
+                    (store, ident + "%"),
+                ).fetchall()
+                if len(rows) == 1:
+                    return rows[0]["id"], None
+                if not rows:
+                    return None, f"{role} id prefix '{ident}' matches no entry in target '{store}'."
+                return None, (
+                    f"{role} id prefix '{ident}' is ambiguous ({len(rows)} matches) — "
+                    "use the full id from memory(action=read)."
+                )
             return None, (
-                f"{role} id prefix '{ident}' is ambiguous ({len(rows)} matches) — "
-                "use the full id from memory(action=read)."
+                f"{role} id must be the full UUID or an unambiguous 8+ char prefix, got '{ident}'."
             )
-        return None, (
-            f"{role} id must be the full UUID or an unambiguous 8+ char prefix, got '{ident}'."
-        )
+
+        resolved, err = _try(target)
+        if resolved is not None:
+            return resolved, None
+        # Not in the requested store — try the other one before failing.
+        cross, _ = _try(other)
+        if cross is not None:
+            return cross, None
+        return None, err
 
     def deprecate(
         self,
@@ -1316,6 +1359,9 @@ class MemoryStoreV2(MemoryStore):
             if old_id:
                 # Full UUID or an unambiguous 8+ char prefix (the short form
                 # retrieval surfaces show) — resolved before any mutation.
+                # Resolution crosses targets: an id that belongs to the other
+                # store operates on its ACTUAL store (2026-08-31 incident:
+                # the entry lived in 'user' while every call said 'memory').
                 resolved, err = self._resolve_entry_id(
                     conn, target, old_id, role="old_id"
                 )
@@ -1323,9 +1369,11 @@ class MemoryStoreV2(MemoryStore):
                     outcome.update({"success": False, "error": err})
                     return
                 row = conn.execute(
-                    "SELECT id, content, status FROM memories WHERE id=?",
+                    "SELECT id, content, status, target FROM memories WHERE id=?",
                     (resolved,),
                 ).fetchone()
+                if row["target"] != target:
+                    outcome["target_corrected"] = row["target"]
                 if row["status"] not in ("active", "pinned", "dormant"):
                     outcome.update({
                         "success": False,
@@ -1428,12 +1476,19 @@ class MemoryStoreV2(MemoryStore):
             return self._no_match_error("deprecate", target, old_text)
         if not outcome.get("success"):
             return outcome
-        self._rewrite_projection(target)
-        resp = self._success_response(target, "Entry deprecated (kept in history, hidden from search).")
+        actual_target = outcome.get("target_corrected") or target
+        self._rewrite_projection(actual_target)
+        resp = self._success_response(actual_target, "Entry deprecated (kept in history, hidden from search).")
         resp.update({
             "old_id": outcome.get("old_id"),
             "link_created": outcome.get("link_created", False),
+            "target": actual_target,
         })
+        if outcome.get("target_corrected"):
+            resp["note"] = (
+                f"target corrected: the entry lives in '{actual_target}', not "
+                f"'{target}' — the operation was applied to its actual store."
+            )
         if outcome.get("superseded_by"):
             resp["superseded_by"] = outcome["superseded_by"]
         if outcome.get("warning"):
@@ -1484,7 +1539,7 @@ class MemoryStoreV2(MemoryStore):
                 outcome.update({"success": False, "error": err})
                 return
             old = conn.execute(
-                "SELECT id, content, status, type FROM memories WHERE id=?",
+                "SELECT id, content, status, type, target FROM memories WHERE id=?",
                 (resolved,),
             ).fetchone()
             if old["status"] not in ("active", "pinned", "dormant"):
@@ -1493,9 +1548,18 @@ class MemoryStoreV2(MemoryStore):
                     "error": f"old_id entry is already {old['status']}; supersede needs an active entry.",
                 })
                 return
+            # Cross-target correction: the supersede lands in the OLD entry's
+            # actual store (2026-08-31: entries addressed to 'memory' that
+            # live in 'user' failed as "not found" four times in a row).
+            actual_target = old["target"]
+            if actual_target != target:
+                outcome["target_corrected"] = actual_target
+                eff_type = self._normalize_type(entry_type, actual_target)
+            else:
+                eff_type = entry_type
             dup = conn.execute(
                 "SELECT id FROM memories WHERE target=? AND content=? AND status!='deprecated' LIMIT 1",
-                (target, content),
+                (actual_target, content),
             ).fetchone()
             if dup:
                 outcome.update({
@@ -1512,7 +1576,7 @@ class MemoryStoreV2(MemoryStore):
                 "INSERT INTO memories(id, target, type, content, importance, confidence,"
                 " status, project, written_by, created_at, updated_at)"
                 " VALUES (?,?,?,?,?,?, 'active', ?, ?, ?, ?)",
-                (new_id, target, entry_type, content, importance, 0.7,
+                (new_id, actual_target, eff_type, content, importance, 0.7,
                  (project or None), (written_by or None), _now(), _now()),
             )
             conn.execute(
@@ -1538,20 +1602,28 @@ class MemoryStoreV2(MemoryStore):
         self._execute_write(_sup)
         if not outcome.get("success"):
             return outcome
-        self._rewrite_projection(target)
-        self._demote_evicted(target)
+        actual_target = outcome.get("target_corrected") or target
+        self._rewrite_projection(actual_target)
+        self._demote_evicted(actual_target)
         resp = self._success_response(
-            target,
+            actual_target,
             "Decision superseded: new entry active, old entry deprecated, "
             "provenance link written.",
         )
         resp.update({
+            "target": actual_target,
             "old_id": outcome["old_id"],
             "new_id": outcome["new_id"],
             "link_created": True,
             "relation_type": "supersedes",
             "deprecated_content": outcome["deprecated_content"],
         })
+        if outcome.get("target_corrected"):
+            resp["note"] = (
+                f"target corrected: the old entry lives in '{actual_target}', not "
+                f"'{target}' — both sides of the supersede were applied to its "
+                "actual store."
+            )
         return resp
 
     def recall(

@@ -328,9 +328,14 @@ def render_pack(
     by_type: Dict[str, List[str]] = {}
     for row, _score in scored:
         rtype = str(row.get("type") or "fact")
+        # Target label only for the non-default store: the pack crosses both
+        # targets, and an unlabeled 'user' entry reads as a memory note —
+        # the 2026-08-31 incident had the model mutating target='memory'
+        # four times for an entry that lived in 'user' (2026-08-31).
+        target_tag = " · user" if str(row.get("target") or "memory") == "user" else ""
         line = (
             f"- [{row.get('status', 'active')} · {str(row.get('id', ''))[:8]}"
-            f" · {str(row.get('updated_at') or '')[:10]}] "
+            f" · {str(row.get('updated_at') or '')[:10]}{target_tag}] "
             f"{row.get('content', '')}"
         )
         # P1 provenance: what this entry superseded (1-hop, store-attached).
