@@ -31,4 +31,13 @@ def build_insights_parser(subparsers, *, cmd_insights: Callable) -> None:
             "the whole install)"
         ),
     )
+    insights_parser.add_argument(
+        "--turns",
+        action="store_true",
+        help=(
+            "Per-turn usage instead of the full report: one line per prompt "
+            "(turn) with duration, tokens, and cache share (turn-level "
+            "telemetry)"
+        ),
+    )
     insights_parser.set_defaults(func=cmd_insights)

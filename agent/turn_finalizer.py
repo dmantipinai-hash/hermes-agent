@@ -29,6 +29,7 @@ from agent.codex_responses_adapter import _summarize_user_message_for_log
 from agent.message_content import flatten_message_text
 from agent.message_metadata import append_message, stamp_message_timestamp
 from agent.message_sanitization import _sanitize_surrogates
+from agent.turn_usage import count_turn_tool_calls, finalize_turn_usage
 
 
 def _is_pure_tool_call_tail(msg: dict) -> bool:
@@ -861,5 +862,24 @@ def finalize_turn(
             _session_db.mark_run_idle(agent.session_id)
         except Exception:
             pass
+
+    # Per-turn usage accounting: close the turn_usage row. Runs AFTER
+    # _persist_session (above) drained the token queue, so every queued
+    # delta of this turn is already folded into the row before we stamp
+    # ended_at/duration/status. Best-effort by contract.
+    try:
+        if interrupted:
+            _turn_status = "cancelled"
+        elif failed or not completed:
+            _turn_status = "error"
+        else:
+            _turn_status = "completed"
+        finalize_turn_usage(
+            agent,
+            status=_turn_status,
+            tool_call_count=count_turn_tool_calls(messages),
+        )
+    except Exception:
+        logger.debug("turn_usage close failed", exc_info=True)
 
     return result

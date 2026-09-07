@@ -7301,6 +7301,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
     _TOKEN_DELTA_ROUTE_FIELDS = (
         "model", "cost_status", "cost_source", "pricing_version",
         "billing_provider", "billing_base_url", "billing_mode",
+        # Turn identity must be equal for two deltas to merge: coalescing a
+        # turn-N delta into turn-N-1 would move tokens across the per-prompt
+        # boundary turn_usage exists to draw.
+        "turn_no",
     )
 
     def queue_token_counts(self, session_id: str, **kwargs) -> None:
@@ -7570,6 +7574,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         billing_mode: Optional[str] = None,
         api_call_count: int = 0,
         absolute: bool = False,
+        turn_no: Optional[int] = None,
     ) -> None:
         """Update token counters and backfill model if not already set.
 
@@ -7579,6 +7584,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         When *absolute* is True, values are **set directly** — use this when
         the caller already holds cumulative totals (gateway path, where the
         cached agent accumulates across messages).
+
+        *turn_no* attributes an incremental delta to a per-prompt turn row in
+        ``turn_usage`` (turn-level token telemetry). Absolute updates cannot
+        be split back into turns and never carry it, so the gateway's
+        cumulative overwrites stay excluded by construction.
         """
         # Ensure the session row exists so the UPDATE doesn't silently affect
         # 0 rows.  Under concurrent load (cron + kanban + delegate_task) the
@@ -7718,6 +7728,19 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     cost_source=cost_source,
                     api_call_count=api_call_count,
                 )
+            if record_model_usage and turn_no is not None:
+                self._record_turn_usage(
+                    conn,
+                    session_id,
+                    turn_no,
+                    model=model,
+                    input_tokens=input_tokens,
+                    output_tokens=output_tokens,
+                    cache_read_tokens=cache_read_tokens,
+                    cache_write_tokens=cache_write_tokens,
+                    reasoning_tokens=reasoning_tokens,
+                    api_call_count=api_call_count,
+                )
         self._execute_write(_do)
 
     def _record_model_usage(
@@ -7821,6 +7844,158 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 now,
             ),
         )
+
+    # ── Per-turn usage accounting (turn-level token telemetry) ──
+    # A "turn" is one run_conversation() call: from the user message to the
+    # final response. begin_turn_usage() opens the row ('running'), per-API-call
+    # deltas accumulate through update_token_counts(turn_no=...) in the SAME
+    # write transaction as the session/per-model rows, and finalize_turn_usage()
+    # stamps ended_at/duration_ms/status in turn_finalizer. Tokens only — no
+    # costs, no secrets; the model's context window is never touched.
+
+    def begin_turn_usage(
+        self, session_id: str, model: Optional[str] = None
+    ) -> Optional[int]:
+        """Open the ``turn_usage`` row for a new turn and return its turn_no.
+
+        Runs in one write transaction that also: closes any 'running' rows a
+        crashed/early-exited previous turn left behind (status='error'), and
+        resolves ``user_message_id`` from the session's most recent persisted
+        user message — the turn prologue (``build_turn_context``) flushes the
+        user row before this is called, so MAX(id) is this turn's prompt.
+        """
+        if not session_id:
+            return None
+        # FK guard OUTSIDE the transaction below, exactly like
+        # update_token_counts does: _insert_session_row opens its own
+        # _execute_write, and nesting it inside ours would deadlock on the
+        # non-reentrant write lock.
+        self._insert_session_row(session_id, "unknown")
+
+        def _do(conn):
+            # Close stale rows from turns that never reached their finalizer
+            # (process crash / early exit). A fresh turn on this session means
+            # the previous one is over no matter how it ended.
+            conn.execute(
+                "UPDATE turn_usage SET status = 'error',"
+                " ended_at = COALESCE(ended_at, started_at),"
+                " duration_ms = COALESCE(duration_ms, 0)"
+                " WHERE session_id = ? AND status = 'running'",
+                (session_id,),
+            )
+            row = conn.execute(
+                "SELECT COALESCE(MAX(turn_no), 0) + 1 FROM turn_usage "
+                "WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+            turn_no = int(row[0] if row is not None else 1)
+            msg_row = conn.execute(
+                "SELECT MAX(id) FROM messages "
+                "WHERE session_id = ? AND role = 'user'",
+                (session_id,),
+            ).fetchone()
+            user_message_id = msg_row[0] if msg_row is not None else None
+            conn.execute(
+                "INSERT INTO turn_usage "
+                "(session_id, turn_no, user_message_id, started_at, status, model)"
+                " VALUES (?, ?, ?, ?, 'running', ?)",
+                (session_id, turn_no, user_message_id, time.time(), model),
+            )
+            return turn_no
+
+        return self._execute_write(_do)
+
+    def _record_turn_usage(
+        self,
+        conn,
+        session_id: str,
+        turn_no: int,
+        *,
+        model: Optional[str],
+        input_tokens: int,
+        output_tokens: int,
+        cache_read_tokens: int,
+        cache_write_tokens: int,
+        reasoning_tokens: int,
+        api_call_count: int,
+    ) -> None:
+        """Accumulate a per-API-call usage delta into ``turn_usage``.
+
+        Runs inside the caller's write transaction (after the session/per-model
+        updates) so the turn row can never disagree with the ledger it is
+        derived from. The INSERT arm covers the degraded case where
+        begin_turn_usage() failed — the row is born from its first delta with
+        started_at at that moment instead of the true turn entry.
+        """
+        now = time.time()
+        conn.execute(
+            """INSERT INTO turn_usage (
+                   session_id, turn_no, started_at, status, model,
+                   api_call_count, input_tokens, output_tokens,
+                   cache_read_tokens, cache_write_tokens, reasoning_tokens
+               ) VALUES (?, ?, ?, 'running', ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(session_id, turn_no) DO UPDATE SET
+                   api_call_count = api_call_count + excluded.api_call_count,
+                   input_tokens = input_tokens + excluded.input_tokens,
+                   output_tokens = output_tokens + excluded.output_tokens,
+                   cache_read_tokens = cache_read_tokens + excluded.cache_read_tokens,
+                   cache_write_tokens = cache_write_tokens + excluded.cache_write_tokens,
+                   reasoning_tokens = reasoning_tokens + excluded.reasoning_tokens,
+                   model = COALESCE(excluded.model, turn_usage.model)""",
+            (
+                session_id,
+                turn_no,
+                now,
+                model,
+                api_call_count or 0,
+                input_tokens or 0,
+                output_tokens or 0,
+                cache_read_tokens or 0,
+                cache_write_tokens or 0,
+                reasoning_tokens or 0,
+            ),
+        )
+
+    def finalize_turn_usage(
+        self,
+        session_id: str,
+        turn_no: int,
+        *,
+        status: str,
+        tool_call_count: int = 0,
+        model: Optional[str] = None,
+    ) -> None:
+        """Close a turn row: ended_at, duration_ms, status, tool_call_count.
+
+        Called from turn_finalizer after the token queue has been drained, so
+        every queued delta of the turn is already applied. Idempotent and a
+        no-op when the row is absent (begin failed / accounting disabled).
+        """
+        if not session_id or turn_no is None:
+            return
+        ended_at = time.time()
+
+        def _do(conn):
+            conn.execute(
+                "UPDATE turn_usage SET"
+                " ended_at = ?,"
+                " duration_ms = CAST((? - started_at) * 1000 AS INTEGER),"
+                " status = ?,"
+                " tool_call_count = ?,"
+                " model = COALESCE(?, model)"
+                " WHERE session_id = ? AND turn_no = ?",
+                (ended_at, ended_at, status, tool_call_count or 0,
+                 model, session_id, int(turn_no)),
+            )
+
+        try:
+            self._execute_write(_do)
+        except Exception:
+            # Accounting must never fail a turn's finalization path.
+            logger.debug(
+                "turn_usage finalize failed (session=%s turn=%s)",
+                session_id, turn_no, exc_info=True,
+            )
 
     def ensure_session(
         self,

@@ -100,6 +100,7 @@ from agent.trajectory import has_incomplete_scratchpad
 # Bind before the turn starts so a source-tree swap cannot load a skewed
 # finalizer at turn end.
 from agent.turn_finalizer import finalize_turn
+from agent.turn_usage import begin_turn_usage, current_turn_no
 from agent.usage_pricing import estimate_usage_cost, normalize_usage
 from agent import empty_response_guard as _empty_guard
 from hermes_constants import PARTIAL_STREAM_STUB_ID
@@ -1969,6 +1970,12 @@ def run_conversation(
     _should_review_memory = _ctx.should_review_memory
     _plugin_user_context = _ctx.plugin_user_context
     _ext_prefetch_cache = _ctx.ext_prefetch_cache
+
+    # Per-turn usage accounting (state.db turn_usage): open the row now that
+    # the prologue has flushed this turn's user message (user_message_id is
+    # resolved from it inside begin_turn_usage). Best-effort; the stash on
+    # the agent is what the queue_token_counts call sites below pass along.
+    begin_turn_usage(agent)
 
     # Commentary deduplication spans all provider continuations and tool calls
     # within one user turn, but must not suppress the same phrase next turn.
@@ -4556,6 +4563,7 @@ def run_conversation(
                                 if cost_result.status == "included" else None,
                                 model=agent.model,
                                 api_call_count=1,
+                                turn_no=current_turn_no(agent),
                             )
                         except Exception as e:
                             # Log token persistence failures so they're

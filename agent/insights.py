@@ -226,6 +226,191 @@ class InsightsEngine:
         }
 
     # =========================================================================
+    # Per-turn usage (turn-level token telemetry)
+    # =========================================================================
+
+    # Newest-first; the session JOIN only pulls the source label for context.
+    _GET_TURNS_WITH_SOURCE = (
+        "SELECT t.session_id, t.turn_no, t.user_message_id, t.started_at,"
+        " t.ended_at, t.duration_ms, t.status, t.model, t.api_call_count,"
+        " t.tool_call_count, t.input_tokens, t.output_tokens,"
+        " t.cache_read_tokens, t.cache_write_tokens, t.reasoning_tokens,"
+        " s.source"
+        " FROM turn_usage t JOIN sessions s ON s.id = t.session_id"
+        " WHERE t.started_at >= ? AND s.source = ?"
+        " ORDER BY t.started_at DESC"
+    )
+    _GET_TURNS_ALL = (
+        "SELECT t.session_id, t.turn_no, t.user_message_id, t.started_at,"
+        " t.ended_at, t.duration_ms, t.status, t.model, t.api_call_count,"
+        " t.tool_call_count, t.input_tokens, t.output_tokens,"
+        " t.cache_read_tokens, t.cache_write_tokens, t.reasoning_tokens,"
+        " s.source"
+        " FROM turn_usage t JOIN sessions s ON s.id = t.session_id"
+        " WHERE t.started_at >= ?"
+        " ORDER BY t.started_at DESC"
+    )
+
+    def generate_turns(self, days: int = 30, source: str = None) -> Dict[str, Any]:
+        """Per-turn usage report: one row per ``run_conversation`` turn.
+
+        Reads ``turn_usage`` (written incrementally per API call, finalized
+        per turn). Developer analytics only — the model never sees this.
+        Degrades gracefully when the store predates the table (a read-only
+        open of an older state.db), reporting ``unavailable`` instead of
+        raising.
+        """
+        cutoff = time.time() - (days * 86400)
+        flush = getattr(self.db, "flush_token_counts", None)
+        if callable(flush):
+            flush()
+        try:
+            if source:
+                cursor = self._conn.execute(
+                    self._GET_TURNS_WITH_SOURCE, (cutoff, source)
+                )
+            else:
+                cursor = self._conn.execute(self._GET_TURNS_ALL, (cutoff,))
+            rows = cursor.fetchall()
+        except sqlite3.OperationalError as exc:
+            return {
+                "days": days,
+                "source_filter": source,
+                "unavailable": str(exc),
+                "turns": [],
+                "totals": {},
+            }
+
+        turns = []
+        for row in rows:
+            d = dict(row)
+            cache_read = d.get("cache_read_tokens") or 0
+            input_tok = d.get("input_tokens") or 0
+            d["cache_hit_pct"] = (
+                100.0 * cache_read / (cache_read + input_tok)
+                if (cache_read + input_tok)
+                else None
+            )
+            turns.append(d)
+
+        def _sum(col: str) -> int:
+            return sum(t.get(col) or 0 for t in turns)
+
+        totals = {
+            "turns": len(turns),
+            "sessions": len({t["session_id"] for t in turns}),
+            "completed": sum(1 for t in turns if t.get("status") == "completed"),
+            "cancelled": sum(1 for t in turns if t.get("status") == "cancelled"),
+            "error": sum(1 for t in turns if t.get("status") == "error"),
+            "running": sum(1 for t in turns if t.get("status") == "running"),
+            "api_calls": _sum("api_call_count"),
+            "tool_calls": _sum("tool_call_count"),
+            "input_tokens": _sum("input_tokens"),
+            "output_tokens": _sum("output_tokens"),
+            "cache_read_tokens": _sum("cache_read_tokens"),
+            "cache_write_tokens": _sum("cache_write_tokens"),
+            "reasoning_tokens": _sum("reasoning_tokens"),
+        }
+        cr = totals["cache_read_tokens"]
+        inp = totals["input_tokens"]
+        totals["cache_hit_pct"] = (100.0 * cr / (cr + inp)) if (cr + inp) else None
+        durations = [
+            t["duration_ms"] for t in turns if t.get("duration_ms") is not None
+        ]
+        totals["avg_duration_ms"] = (
+            int(sum(durations) / len(durations)) if durations else None
+        )
+        return {
+            "days": days,
+            "source_filter": source,
+            "generated_at": time.time(),
+            "turns": turns,
+            "totals": totals,
+        }
+
+    _TURN_STATUS_GLYPHS = {
+        "completed": "ok",
+        "cancelled": "stop",
+        "error": "err",
+        "running": "run",
+    }
+    _TURNS_DISPLAY_LIMIT = 200
+
+    def format_turns_terminal(self, report: Dict) -> str:
+        """Render the per-turn usage report for the terminal (developer view)."""
+        if report.get("unavailable"):
+            return (
+                f"  Per-turn usage unavailable on this store: "
+                f"{report['unavailable']}\n"
+                "  The turn_usage table appears after the first run of a build "
+                "that ships it (or a writable `hermes insights` open)."
+            )
+        turns = report.get("turns") or []
+        t = report.get("totals") or {}
+        lines = []
+        days = report.get("days", 30)
+        src = f" ({report['source_filter']})" if report.get("source_filter") else ""
+        lines.append("")
+        lines.append(f"  🔁 Turns — per-prompt usage · last {days} days{src}")
+        lines.append("  " + "─" * 56)
+        if not turns:
+            lines.append("  No turns recorded in this window.")
+            lines.append("")
+            return "\n".join(lines)
+        lines.append(
+            f"  Turns: {t.get('turns', 0)} in {t.get('sessions', 0)} session(s) · "
+            f"ok {t.get('completed', 0)} / stop {t.get('cancelled', 0)} / "
+            f"err {t.get('error', 0)} / run {t.get('running', 0)}"
+        )
+        lines.append(
+            f"  Tokens: in {t.get('input_tokens', 0):,} · "
+            f"out {t.get('output_tokens', 0):,} · "
+            f"cache_read {t.get('cache_read_tokens', 0):,}"
+            + (
+                f" ({t['cache_hit_pct']:.0f}% hit)"
+                if t.get("cache_hit_pct") is not None
+                else ""
+            )
+            + f" · api {t.get('api_calls', 0):,} · tools {t.get('tool_calls', 0):,}"
+            + (
+                f" · avg turn {format_duration_compact(t['avg_duration_ms'] / 1000)}"
+                if t.get("avg_duration_ms") is not None
+                else ""
+            )
+        )
+        lines.append("")
+        for turn in turns[: self._TURNS_DISPLAY_LIMIT]:
+            when = datetime.fromtimestamp(turn["started_at"]).strftime("%m-%d %H:%M")
+            session = str(turn["session_id"])[:8]
+            glyph = self._TURN_STATUS_GLYPHS.get(turn.get("status"), "?")
+            dur = (
+                format_duration_compact((turn["duration_ms"] or 0) / 1000)
+                if turn.get("duration_ms") is not None
+                else "…"
+            )
+            cache = (
+                f"{turn['cache_hit_pct']:.0f}%"
+                if turn.get("cache_hit_pct") is not None
+                else "—"
+            )
+            lines.append(
+                f"  {when}  {session}#{turn['turn_no']:<3} {glyph:<4} {dur:>7}"
+                f"  api {turn.get('api_call_count') or 0:>3}"
+                f"  tools {turn.get('tool_call_count') or 0:>3}"
+                f"  in {turn.get('input_tokens') or 0:>10,}"
+                f"  out {turn.get('output_tokens') or 0:>9,}"
+                f"  cache {cache:>4}"
+                f"  {(turn.get('model') or '?')}"
+            )
+        if len(turns) > self._TURNS_DISPLAY_LIMIT:
+            lines.append(
+                f"  … and {len(turns) - self._TURNS_DISPLAY_LIMIT} older turn(s)"
+                " in the window"
+            )
+        lines.append("")
+        return "\n".join(lines)
+
+    # =========================================================================
     # Data gathering (SQL queries)
     # =========================================================================
 

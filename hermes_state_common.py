@@ -376,6 +376,32 @@ CREATE TABLE IF NOT EXISTS state_meta (
     value TEXT
 );
 
+-- Per-turn usage accounting (turn-level token telemetry). One row per
+-- run_conversation() turn: begins as 'running' at turn entry, accumulates
+-- per-API-call deltas in the same transaction as update_token_counts, and
+-- finalizes (ended_at/duration/status) in turn_finalizer. user_message_id is
+-- deliberately NOT a foreign key: messages rows are pruned while their session
+-- stays alive (compaction/keyed prune), and an FK there would fail those prunes.
+-- Consumers join messages LEFT and tolerate NULL.
+CREATE TABLE IF NOT EXISTS turn_usage (
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    turn_no INTEGER NOT NULL,
+    user_message_id INTEGER,
+    started_at REAL NOT NULL,
+    ended_at REAL,
+    duration_ms INTEGER,
+    model TEXT,
+    api_call_count INTEGER NOT NULL DEFAULT 0,
+    tool_call_count INTEGER NOT NULL DEFAULT 0,
+    input_tokens INTEGER NOT NULL DEFAULT 0,
+    output_tokens INTEGER NOT NULL DEFAULT 0,
+    cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+    cache_write_tokens INTEGER NOT NULL DEFAULT 0,
+    reasoning_tokens INTEGER NOT NULL DEFAULT 0,
+    status TEXT NOT NULL DEFAULT 'running',
+    PRIMARY KEY (session_id, turn_no)
+);
+
 CREATE TABLE IF NOT EXISTS gateway_routing (
     scope TEXT NOT NULL DEFAULT '',
     session_key TEXT NOT NULL,
@@ -442,6 +468,7 @@ CREATE INDEX IF NOT EXISTS idx_compression_locks_expires ON compression_locks(ex
 CREATE INDEX IF NOT EXISTS idx_session_turn_leases_expires ON session_turn_leases(expires_at);
 CREATE INDEX IF NOT EXISTS idx_session_model_usage_session ON session_model_usage(session_id);
 CREATE INDEX IF NOT EXISTS idx_session_model_usage_model ON session_model_usage(model);
+CREATE INDEX IF NOT EXISTS idx_turn_usage_started ON turn_usage(started_at DESC);
 CREATE INDEX IF NOT EXISTS idx_async_delegations_delivery
     ON async_delegations(delivery_state, completed_at);
 """

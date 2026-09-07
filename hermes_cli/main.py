@@ -12153,6 +12153,14 @@ def cmd_insights(args):
         for db, label in dbs:
             try:
                 engine = InsightsEngine(db)
+                if getattr(args, "turns", False):
+                    # Per-prompt usage drill-down (turn-level telemetry) —
+                    # replaces the full report for this invocation.
+                    report = engine.generate_turns(days=args.days, source=args.source)
+                    if label:
+                        print(f"\n  ▸ Profile: {label}")
+                    print(engine.format_turns_terminal(report))
+                    continue
                 report = engine.generate(days=args.days, source=args.source)
                 if label:
                     print(f"\n  ▸ Profile: {label}")
