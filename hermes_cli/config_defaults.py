@@ -1829,6 +1829,18 @@ DEFAULT_CONFIG = {
         # readable projections; SQLite (memories/memory.db) is canonical.
         # Set false to roll back to the legacy flat-file store.
         "store_v2": True,
+        # Snapshot residency policy (Gate 1 of the memory repair): the frozen
+        # system-prompt snapshot is a lane-structured standing brief —
+        # pinned + constraints first, then standing decisions/preferences,
+        # then remaining context. `standing_share` is the share of the
+        # post-lane-1 remainder that starts reserved for standing rows
+        # (unused budget rolls to the other lane); `max_entry_chars` bounds
+        # one entry's rendered snippet (truncated with an explicit marker —
+        # the full text always stays in the store and in recall).
+        "snapshot": {
+            "standing_share": 0.55,
+            "max_entry_chars": 320,
+        },
         # Recall-audit log (memory roadmap Phase-4 P3): one row per memory
         # recall (orchestrator auto-pack + explicit memory read), stored in
         # memories/memory.db. Feeds `hermes memory report` — the health

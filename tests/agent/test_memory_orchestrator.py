@@ -53,6 +53,7 @@ def _crowd(
     char_limit: int = 200,
     user_char_limit: int = 1375,
     extra=(),
+    lane2_filler: int = 0,
 ) -> MemoryStoreV2:
     """Store whose snapshot budget is exhausted by high-importance filler.
 
@@ -64,8 +65,19 @@ def _crowd(
     in the store. That reload matters: mid-session writes never enter the
     frozen snapshot, so seeding then reloading is the only way to exercise
     the real eviction-dedup path.
+
+    Gate 1 lanes: ``filler`` facts crowd lane 3; a low-importance DECISION
+    extra survives them (lane 2 beats lane 3 by admission policy). Tests
+    that need a standing row evicted pass ``lane2_filler`` — high-importance
+    decisions crowding lane 2 itself.
     """
     s = _fresh(mem_dir, memory_char_limit=char_limit, user_char_limit=user_char_limit)
+    for i in range(lane2_filler):
+        s.add(
+            "memory",
+            f"Стоящее решение-наполнитель номер {i} занимает дорожку",
+            entry_type="decision", importance=0.95,
+        )
     for i in range(filler):
         s.add(
             "memory",
@@ -297,13 +309,28 @@ def test_recent_entries_orders_by_updated_at_and_filters_type(mem_dir):
 
 
 def test_snapshot_contents_reflects_budget_eviction(mem_dir):
+    # Gate 1: a standing decision survives higher-importance FACTS — lanes
+    # admit by type, so filler can no longer push a decision out of the
+    # prompt (the live defect this repairs). Eviction still happens, just
+    # across the lane boundary.
     s = _crowd(
         mem_dir,
         extra=[("memory", "Не используем Docker — тяжело для сервера", "decision", 0.4)],
     )
     snap = s.snapshot_contents()
-    assert "Не используем Docker — тяжело для сервера" not in snap, "evicted from prompt"
-    assert any("Наполнитель" in c for c in snap), "filler is in the prompt"
+    assert "Не используем Docker — тяжело для сервера" in snap, (
+        "standing decision keeps its lane even below filler importance"
+    )
+    assert not all("Наполнитель" in c for c in snap), "some filler must still be evicted"
+    # And with lane 2 itself crowded, the low-importance decision IS evicted:
+    s2 = _crowd(
+        mem_dir,
+        extra=[("memory", "Не используем Docker — тяжело для сервера", "decision", 0.4)],
+        lane2_filler=6,
+    )
+    snap2 = s2.snapshot_contents()
+    assert "Не используем Docker — тяжело для сервера" not in snap2, "evicted from prompt"
+    s2.close()
     s.close()
 
 
@@ -354,7 +381,7 @@ def test_evicted_entry_recalled_via_inflected_query(mem_dir):
     "бэкапы"); the pack must still surface the evicted entry."""
     s = _crowd(
         mem_dir,
-        extra=[("memory", "Бэкапы сервера делаем по субботам в 3 утра", "constraint", 0.35)],
+        extra=[("memory", "Бэкапы сервера делаем по субботам в 3 утра", "fact", 0.35)],
     )
     assert "Бэкапы" not in (s.format_for_system_prompt("memory") or ""), "victim evicted"
     pack = MemoryOrchestrator(s).build_pack("как у нас с расписанием бэкапов на сервере?")
@@ -368,6 +395,7 @@ def test_evicted_decision_recalled_via_pack(mem_dir):
     s = _crowd(
         mem_dir,
         extra=[("memory", "Не используем Docker — тяжело для одного сервера", "decision", 0.4)],
+        lane2_filler=6,
     )
     assert "Docker" not in (s.format_for_system_prompt("memory") or ""), "must be evicted"
     orch = MemoryOrchestrator(s)
@@ -434,6 +462,7 @@ def test_pack_respects_max_entries(mem_dir):
 def test_pack_bumps_access_only_for_included(mem_dir):
     s = _crowd(
         mem_dir,
+        lane2_filler=6,
         extra=[
             ("memory", "Не используем Docker — тяжело для сервера", "decision", 0.4),
             ("memory", "Совсем нерелевантная запись про варенье", "fact", 0.9),
@@ -465,6 +494,7 @@ def test_pack_logs_nonempty_build_for_observability(mem_dir, caplog):
 
     s = _crowd(
         mem_dir,
+        lane2_filler=6,
         extra=[("memory", "Не используем Docker — тяжело для сервера", "decision", 0.4)],
     )
     with caplog.at_level(_logging.INFO, logger="agent.memory_orchestrator"):
@@ -695,12 +725,18 @@ def e2e_env():
             os.environ["HERMES_HOME"] = prev_home
 
 
-def _seed_crowded(hermes_home: str, filler: int = 6, extra=()):
+def _seed_crowded(hermes_home: str, filler: int = 6, extra=(), lane2_filler: int = 0):
     """Fill the on-disk store before agent init (import AFTER env is set)."""
     from agent.memory_store_v2 import MemoryStoreV2
 
     s = MemoryStoreV2(memory_char_limit=200, user_char_limit=1375)
     s.load_from_disk()
+    for i in range(lane2_filler):
+        s.add(
+            "memory",
+            f"Стоящее решение-наполнитель номер {i} занимает дорожку",
+            entry_type="decision", importance=0.95,
+        )
     for i in range(filler):
         s.add(
             "memory",
@@ -726,6 +762,7 @@ def test_e2e_agent_wires_orchestrator_and_injects_pack(e2e_env):
     agent._memory_orchestrator = None
     _seed_crowded(
         home,
+        lane2_filler=6,
         extra=[("memory", "Не используем Docker — тяжело для одного сервера", "decision", 0.4)],
     )
     # Reload memory exactly as a fresh session would, then rebuild the pack source.

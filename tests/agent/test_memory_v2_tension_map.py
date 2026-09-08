@@ -166,6 +166,12 @@ class TestPackHasNoTensionInjection:
     def test_pack_carries_no_choice_tension(self, mem_dir):
         s = MemoryStoreV2(memory_char_limit=200)
         s.load_from_disk()
+        # Lane-2 filler (Gate 1): standing rows keep a reserved lane, so
+        # evicting the two decisions out of the snapshot requires crowding
+        # their own lane — fact filler no longer displaces them.
+        for i in range(6):
+            s.add("memory", f"Стоящее решение-наполнитель номер {i} занимает дорожку",
+                  entry_type="decision", importance=0.95)
         for i in range(6):
             s.add("memory", f"Наполнитель номер {i} занимает бюджет снапшота",
                   entry_type="fact", importance=0.95)

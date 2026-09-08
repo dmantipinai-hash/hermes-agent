@@ -181,6 +181,89 @@ DECISION_VALUE_BY_TYPE: Dict[str, float] = {
 RECENCY_HALF_LIFE_DAYS = 14.0
 
 
+def rank_candidates(
+    candidates: List[Dict[str, Any]], nq: "NormalizedQuery",  # type: ignore[name-defined]
+) -> List[Dict[str, Any]]:
+    """Relevance-dominant ordering for the per-turn context pack (Gate 1 §4.2).
+
+    One lexicographic comparator — type/importance NEVER cross a relevance
+    class boundary, closing the displacement defect where an irrelevant
+    decision outranked a topically-exact fact by weight alone:
+
+    ``match_class DESC (3 phrase | 2 all-concepts | 1 any) →
+    matched_term_ratio DESC → bm25 ASC (neutral 0 when absent) →
+    type_tiebreak DESC → importance DESC → updated_at DESC → id ASC``
+
+    Admission: ``match_class == 0`` (no normalized concept matched) never
+    enters the pack — a zero-relevance candidate cannot ride in on
+    importance or type bonuses.
+    """
+    from agent.memory_store_v2 import match_normalized
+
+    ranked: List[Tuple[Tuple, Dict[str, Any]]] = []
+    for cand in candidates:
+        match_class, ratio = match_normalized(nq, str(cand.get("content") or ""))
+        if match_class <= 0:
+            continue
+        type_tiebreak = DECISION_VALUE_BY_TYPE.get(str(cand.get("type") or ""), 0.2)
+        try:
+            importance = max(0.0, min(1.0, float(cand.get("importance") or 0.0)))
+        except (TypeError, ValueError):
+            importance = 0.0
+        ts = _parse_ts(cand.get("updated_at"))
+        ts_ord = ts.timestamp() if ts is not None else 0.0
+        try:
+            bm25 = float(cand.get("_bm25") or 0.0)
+        except (TypeError, ValueError):
+            bm25 = 0.0
+        key = (
+            -match_class,
+            -ratio,
+            bm25,              # ASC inside a DESC tuple: lower bm25 sorts first
+            -type_tiebreak,
+            -importance,
+            -ts_ord,
+            str(cand.get("id") or ""),
+        )
+        ranked.append((key, cand))
+    ranked.sort(key=lambda pair: pair[0])
+    return _collapse_awareness_duplicates([cand for _key, cand in ranked])
+
+
+def _awareness_signature(content: str) -> Optional[str]:
+    """Signature of an awareness episode record, for duplicate collapsing.
+
+    The RECORD path writes one ``Stuck pattern: <tool> — <trigger>`` per
+    episode with per-episode detail (counts, error snippets) — live data
+    carries 30+ near-identical rows per hot signature, and without collapsing
+    they occupy the whole top of a pack for any query that grazes them.
+    """
+    text = (content or "").strip()
+    if not text.startswith("Stuck pattern:"):
+        return None
+    # Collapse to the TOOL level: one stuck-episode representative per tool
+    # per pack — trigger variants of the same tool add noise, not coverage.
+    head = text.split("(", 1)[0]
+    parts = head.split("—", 1)
+    return " ".join(parts[0].split()) or None
+
+
+def _collapse_awareness_duplicates(
+    ranked: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Keep only the first (best-ranked) entry per awareness signature."""
+    seen: set = set()
+    out: List[Dict[str, Any]] = []
+    for cand in ranked:
+        sig = _awareness_signature(str(cand.get("content") or ""))
+        if sig is not None:
+            if sig in seen:
+                continue
+            seen.add(sig)
+        out.append(cand)
+    return out
+
+
 def _parse_ts(value: Optional[str]) -> Optional[datetime]:
     if not value:
         return None
@@ -438,7 +521,10 @@ class MemoryOrchestrator:
                 candidates.setdefault(str(row.get("id")), row)
 
         # Layer 1: lexical search (FTS5 with LIKE fallback — store-internal).
-        _collect(self._store.recall_candidates(query, limit=plan.search_limit))
+        # One NormalizedQuery feeds BOTH the candidate search and the
+        # relevance ranking — no second tokenization downstream (Gate 1 §4.2).
+        nq = self._store.normalized_query(query)
+        _collect(self._store.recall_candidates(query, limit=plan.search_limit, nq=nq))
 
         # Layer 2 (Router): recent standing decisions/constraints for
         # work/debugging intents — the anti-circular backbone.
@@ -459,12 +545,16 @@ class MemoryOrchestrator:
         # The frozen snapshot already carries these entries in the system
         # prompt — the pack is a supplement, never a duplication.
         already_prompted: Set[str] = self._store.snapshot_contents()
-        scored: List[Tuple[Dict[str, Any], float]] = []
-        now = datetime.now(timezone.utc)
-        for row in candidates.values():
-            if row.get("content") in already_prompted:
-                continue
-            scored.append((row, score_candidate(row, query_tokens, self._weights, now)))
+        deduped = [
+            row for row in candidates.values()
+            if row.get("content") not in already_prompted
+        ]
+        # Relevance-dominant ranking (Gate 1 §4.2): admission by normalized
+        # match, ordering by the lexicographic tuple — type/importance can
+        # only break ties INSIDE a relevance class, never cross it.
+        scored: List[Tuple[Dict[str, Any], float]] = [
+            (row, 0.0) for row in rank_candidates(deduped, nq)
+        ]
         if not scored:
             self._log_recall(intent=intent, query=query, before=len(candidates), after=0, nonempty=False)
             return ""
@@ -472,7 +562,6 @@ class MemoryOrchestrator:
         # Token budget cut, best score first ("big memory ≠ big prompt").
         # The reserve covers section titles + the rendered header so the
         # *rendered* pack stays within budget, not just the raw entries.
-        scored.sort(key=lambda pair: pair[1], reverse=True)
         _RENDER_OVERHEAD_TOKENS = 80
         used = estimate_tokens_rough(_PACK_HEADER) + estimate_tokens_rough(_PACK_NOTE) + _RENDER_OVERHEAD_TOKENS
         selected: List[Tuple[Dict[str, Any], float]] = []

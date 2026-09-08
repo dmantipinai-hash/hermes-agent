@@ -259,7 +259,7 @@ _MEMORY_REVIEW_PROMPT = (
     "WHY. Example: 'Not building a local AI character — too much PC load, other "
     "priorities.' This prevents re-proposing rejected ideas months later.\n"
     "- Constraints/rules → type=constraint. Preferences → type=preference.\n"
-    "- Set importance (0..1) for decisions that shape whole projects (0.8-0.95).\n\n"
+    "- Set importance (0..1) for decisions that shape whole projects (0.8-0.95).\n""- Omit importance rather than guessing low: an omitted value gets the honest type default;\n""  explicitly low values (e.g. 0.05) bury the decision out of the prompt snapshot.\n\n"
     "CONTRADICTION CHECK — before saving a decision or constraint, run "
     "memory(action=read, query=<topic keywords>). If an ACTIVE entry contradicts "
     "the new one, first memory(action=deprecate, old_text=<its unique substring>, "

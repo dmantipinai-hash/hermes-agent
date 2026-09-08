@@ -40,6 +40,7 @@ import threading
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, NamedTuple, Optional, Sequence, Tuple
 
@@ -275,6 +276,128 @@ def _query_stems(query: str) -> List[str]:
 
 
 # ---------------------------------------------------------------------------
+# NormalizedQuery (Gate 1 §4.2): ONE immutable normalization shared by
+# candidate generation and the relevance scorer. The pre-Gate-1 defect:
+# recall_candidates searched with stems/aliases while score_candidate
+# re-tokenized the raw query differently — a candidate could be FOUND by one
+# normalizer and scored relevance=0 by the other.
+# ---------------------------------------------------------------------------
+
+# Query stems that never count as concepts (ranking glue, not meaning).
+_CONCEPT_STOP_STEMS = frozenset({
+    "как", "что", "это", "для", "како", "котор", "если", "или",
+    "the", "this", "that", "with", "for", "and", "not", "but", "how",
+    "что-",
+})
+
+
+@dataclass(frozen=True)
+class NormalizedQuery:
+    """One query, normalized once: concepts, exact terms, phrases, aliases.
+
+    ``concepts`` are distinct query stems (stop-stems removed) plus short
+    domain exact terms — the denominator of ``matched_term_ratio``.
+    ``expansions`` maps a concept stem to alias-expanded stems (matching any
+    of them credits the concept). ``phrases`` are folded multi-word query
+    fragments used for the highest match class.
+    """
+
+    raw: str
+    concepts: Tuple[str, ...]
+    exact_terms: Tuple[str, ...]
+    phrases: Tuple[str, ...]
+    expansions: Tuple[Tuple[str, Tuple[str, ...]], ...] = ()
+    alias_version: str = ""
+
+    @property
+    def search_stems(self) -> List[str]:
+        """All stems for FTS/LIKE OR-matching: concepts + expansions."""
+        out = list(self.concepts)
+        for _stem, exps in self.expansions:
+            out.extend(exps)
+        return list(dict.fromkeys(out))
+
+
+def match_normalized(nq: NormalizedQuery, content: str) -> Tuple[int, float]:
+    """Relevance-dominant match of a NormalizedQuery against one content.
+
+    Returns ``(match_class, matched_term_ratio)``:
+
+    * 3 — an exact query phrase (or alias phrase) appears verbatim;
+    * 2 — every concept matched (phrase-level agreement);
+    * 1 — at least one concept matched;
+    * 0 — nothing matched (the candidate is not admitted to the pack).
+
+    A concept matches when a folded content token starts with the concept
+    stem (prefix semantics — the same contract the FTS ``stem*`` search uses),
+    the token equals an exact short term, or any alias expansion matches.
+    ``matched_term_ratio`` is matched/concepts; an empty concept set means
+    "no query recall" and returns class 0, never ratio 1.
+    """
+    folded = _fold_yo((content or "").lower())
+    tokens = [t for t in _TOKEN_SPLIT_RE.split(folded) if t]
+    token_set = set(tokens)
+
+    def concept_matched(stem: str, exps: Tuple[str, ...]) -> bool:
+        if len(stem) == _TOKEN_EXACT_LEN:
+            if stem in token_set:
+                return True
+        else:
+            for t in tokens:
+                if t.startswith(stem) or stem.startswith(t) and len(t) >= _TOKEN_MIN_STEM:
+                    return True
+        for exp in exps:
+            if len(exp) == _TOKEN_EXACT_LEN:
+                if exp in token_set:
+                    return True
+            else:
+                for t in tokens:
+                    if t.startswith(exp):
+                        return True
+        return False
+
+    if not nq.concepts:
+        return 0, 0.0
+    matched = 0
+    exact_concepts = set(nq.exact_terms)
+    for stem, exps in nq.expansions:
+        if concept_matched(stem, exps):
+            matched += 1
+    # Concepts without an expansion entry match against themselves.
+    expansion_stems = {s for s, _ in nq.expansions}
+    for stem in nq.concepts:
+        if stem in expansion_stems:
+            continue
+        if concept_matched(stem, ()):
+            matched += 1
+    ratio = matched / len(nq.concepts)
+    if any(p and p in folded for p in nq.phrases):
+        return 3, ratio
+    if matched == len(nq.concepts):
+        return 2, ratio
+    if matched:
+        return 1, ratio
+    return 0, 0.0
+
+
+def _query_phrases(query: str) -> List[str]:
+    """Folded 2-3 word fragments of the query (verbatim-match candidates)."""
+    tokens = [
+        _fold_yo(t.lower()) for t in _TOKEN_SPLIT_RE.split(query or "")
+        if len(t) >= 3
+    ]
+    phrases: List[str] = []
+    for n in (3, 2):
+        for i in range(len(tokens) - n + 1):
+            phrase = " ".join(tokens[i:i + n])
+            if phrase not in phrases:
+                phrases.append(phrase)
+        if phrases:
+            break  # longest available fragment class wins; don't stack sizes
+    return phrases[:6]
+
+
+# ---------------------------------------------------------------------------
 # Choice memory / tension map (Task 2 + 2026-08-30 graph fix)
 # ---------------------------------------------------------------------------
 
@@ -437,6 +560,8 @@ class MemoryStoreV2(MemoryStore):
         user_char_limit: int = 1375,
         db_path: Optional[Path] = None,
         recall_log_enabled: bool = True,
+        standing_share: float = 0.55,
+        max_entry_chars: int = 320,
     ):
         super().__init__(memory_char_limit, user_char_limit)
         # db_path defaults next to MEMORY.md (path via the parent helper so
@@ -449,6 +574,15 @@ class MemoryStoreV2(MemoryStore):
         # Recall-audit gate (memory.recall_log.enabled) — single switch for
         # both channels; the store is the one place that knows it.
         self._recall_log_enabled = bool(recall_log_enabled)
+        # Snapshot residency policy (Gate 1 §4.3): the share of the
+        # post-lane-1 remainder that starts reserved for standing rows
+        # (decisions/preferences), and the per-entry bounded snippet size.
+        # Frozen policy numbers — tune only with a replay on a real DB copy.
+        self._standing_share = min(0.9, max(0.1, float(standing_share)))
+        self._max_entry_chars = max(80, int(max_entry_chars))
+        # Per-target lane-overflow report (lane 1 physically cannot fit the
+        # whole budget); surfaced for reports — never mutates the DB.
+        self._snapshot_lane_overflow: Dict[str, Optional[List[str]]] = {}
         # Query-expansion aliases (Phase-4 P2): {term: [aliases]}. In-memory
         # working copy — config (memory.aliases) is the source of truth, the
         # memory_aliases table is a cache; load_from_disk reads the cache so
@@ -506,10 +640,24 @@ class MemoryStoreV2(MemoryStore):
             self._migrate_v2_to_v3(conn)
         if version < 4:
             self._migrate_v3_to_v4(conn)
-        conn.execute(
-            "INSERT OR REPLACE INTO meta(key, value) VALUES ('schema_version', ?)",
-            (str(SCHEMA_VERSION),),
-        )
+        # Monotonic schema marker (Gate 0.5 compatibility bridge): never
+        # write our version over a HIGHER stored one. A future-schema DB
+        # (say v5 from the Evidence Ledger) opened by this older wheel must
+        # keep its marker — an unconditional overwrite would turn a routine
+        # rollback into a silent version downgrade even though the v5 tables
+        # physically survive. Migrations above are gated on ``version < N``,
+        # so an unknown future version runs nothing.
+        if stored is None or version < SCHEMA_VERSION:
+            conn.execute(
+                "INSERT OR REPLACE INTO meta(key, value) VALUES ('schema_version', ?)",
+                (str(SCHEMA_VERSION),),
+            )
+        elif version > SCHEMA_VERSION:
+            logger.info(
+                "memory.db: future schema v%d > supported v%d — opened "
+                "read-compat, marker untouched",
+                version, SCHEMA_VERSION,
+            )
 
     @staticmethod
     def _migrate_v1_to_v2(conn: sqlite3.Connection) -> None:
@@ -882,73 +1030,158 @@ class MemoryStoreV2(MemoryStore):
         used: int                             # chars the projection costs
         visible: int                          # visible rows walked
         min_included_importance: Optional[float]  # lowest importance still in-prompt
+        lane_overflow_ids: List[str] = field(default_factory=list)  # lane-1 rows that physically cannot fit
 
     def _budget_walk(self, target: str) -> "_ProjectionWalk":
         """Single source of the projection ordering and cost math.
 
         Shared by :meth:`_rebuild_snapshot` (freezes the prompt block), the
         v2 write telemetry (so the usage a memory write reports is by
-        construction what the next session's snapshot will contain), and
-        :meth:`_demote_evicted` (P6 ordering hygiene). Read-only: never
-        mutates the frozen snapshot, so calling it mid-session cannot break
-        the prompt-cache invariant.
+        construction what the next session's snapshot will contain), and the
+        lane-overflow report. Read-only: never mutates the frozen snapshot or
+        the database, so calling it mid-session cannot break the
+        prompt-cache invariant.
         """
-        rows = self._visible_rows(target)
         limit = self._char_limit(target)
+        lanes = self._lane_rows(target)
+        lane_overflow: List[str] = []
+
+        def render_bounded(row: sqlite3.Row) -> str:
+            text = self._render_entry_for_prompt(row)
+            if len(text) > self._max_entry_chars:
+                text = text[: self._max_entry_chars - 1].rstrip() + "…"
+            return text
+
+        def cost_of(text: str, first: bool) -> int:
+            return len(text) + (0 if first else len(ENTRY_DELIMITER))
+
         texts: List[str] = []
         included_contents: set = set()
-        evicted_ids: List[str] = []
+        included_ids: set = set()
         used = 0
+
+        def admit(
+            rows: List[sqlite3.Row], ceiling: Optional[int], *, stop_on_misfit: bool,
+        ) -> int:
+            """Admit rows in lane order under ``ceiling`` (full ``limit``
+            when None). Returns the resume index for a later pass.
+
+            First pass (capped, ``stop_on_misfit=True``) stops at the first
+            row that does not fit the lane's starting ceiling — a smaller
+            lower-priority row must never overtake a bigger higher-priority
+            one by squeezing under the ceiling. The second pass
+            (``stop_on_misfit=False``) skip-and-continues to the full limit,
+            matching the long-standing single-walk utilization semantics
+            (a huge mid-priority entry leaves room for smaller tail rows)."""
+            nonlocal used
+            for i, row in enumerate(rows):
+                if row["id"] in included_ids:
+                    continue
+                text = render_bounded(row)
+                cost = cost_of(text, not texts)
+                cap = limit if ceiling is None else ceiling
+                if used + cost > cap:
+                    if stop_on_misfit:
+                        return i
+                    continue
+                texts.append(text)
+                included_contents.add(row["content"])
+                included_ids.add(row["id"])
+                used += cost
+            return len(rows)
+
+        # Lane 1 (pinned + constraints) has admission priority over the whole
+        # budget. If it alone cannot fit, take pinned first, then constraints
+        # in lane order, and record the ids that physically cannot make it —
+        # "all standing rows are always in the prompt" is not promised.
+        lane1 = lanes[1]
+        lane1_used = sum(
+            cost_of(render_bounded(r), i == 0) for i, r in enumerate(lane1)
+        )
+        if lane1_used > limit:
+            lane1_sorted = sorted(
+                lane1,
+                key=lambda r: (r["status"] != "pinned",),
+            )
+            admit(lane1_sorted, None, stop_on_misfit=False)
+            lane_overflow = [r["id"] for r in lane1 if r["id"] not in included_ids]
+        else:
+            admit(lane1, None, stop_on_misfit=False)
+
+        # Lanes 2/3 split the remainder by the frozen standing share —
+        # starting ceilings, not promised minimums: whatever one lane leaves
+        # unused the other picks up, each lane resuming exactly where its
+        # capped pass stopped (lane order is never reordered).
+        remaining = limit - used
+        lane2_cap = used + round(remaining * self._standing_share)
+        lane3_cap = used + (remaining - (lane2_cap - used))
+        stop2 = admit(lanes[2], lane2_cap, stop_on_misfit=True)
+        stop3 = admit(lanes[3], lane3_cap, stop_on_misfit=True)
+        admit(lanes[2][stop2:], None, stop_on_misfit=False)
+        admit(lanes[3][stop3:], None, stop_on_misfit=False)
+
+        excluded_telemetry = lanes.get(None, [])
+        evicted_ids = [
+            r["id"]
+            for lane in (1, 2, 3)
+            for r in lanes[lane]
+            if r["id"] not in included_ids
+        ]
         min_importance: Optional[float] = None
-        for row in rows:
-            text = self._render_entry_for_prompt(row)
-            cost = len(text) + (len(ENTRY_DELIMITER) if texts else 0)
-            if texts and used + cost > limit:
-                evicted_ids.append(row["id"])  # stays in store, drops out of prompt
-                continue
-            texts.append(text)
-            included_contents.add(row["content"])
-            used += cost
-            imp = row["importance"]
+        included_rows = {
+            r["id"]: r
+            for lane in (1, 2, 3)
+            for r in lanes[lane]
+            if r["id"] in included_ids
+        }
+        for rid in included_ids:
+            imp = included_rows[rid]["importance"]
             min_importance = imp if min_importance is None else min(min_importance, imp)
+        self._snapshot_lane_overflow[target] = lane_overflow or None
         return self._ProjectionWalk(
-            texts, included_contents, evicted_ids, used, len(rows), min_importance,
+            texts,
+            included_contents,
+            evicted_ids,
+            used,
+            len(lanes[1]) + len(lanes[2]) + len(lanes[3]) + len(excluded_telemetry),
+            min_importance,
+            lane_overflow,
         )
 
-    def _demote_evicted(self, target: str) -> int:
-        """Demote entries the prompt budget just evicted (P6 remainder).
+    # Snapshot admission policy (Gate 1 §4.3): one lane per row, by type and
+    # status — never by the importance number, so standing decisions stay
+    # visible even at historical 0.05 (their values are not backfilled).
+    _LANE1_TYPES = ("constraint",)
+    _LANE2_TYPES = ("decision", "preference")
 
-        One UPDATE over the evicted ids: importance drops to at most half
-        the minimum importance still inside the prompt (floor 0.05). This
-        keeps future snapshot orderings stable — an evicted entry can no
-        longer out-rank an in-prompt entry and flip back in when a
-        same-importance entry arrives. ``MIN(importance, ceiling)`` makes
-        it monotonic: already-demoted rows are never raised, and repeated
-        overflows converge instead of compounding. Status, searchability
-        and ``updated_at`` are untouched — this is ordering hygiene, not
-        degradation. Returns the number of rows actually lowered.
+    def _lane_rows(self, target: str) -> Dict[Optional[int], List[sqlite3.Row]]:
+        """Visible rows grouped into snapshot lanes, each deterministically
+        ordered (``pinned DESC, importance DESC, updated_at DESC, id ASC``).
+
+        Lane ``None`` marks awareness telemetry (``written_by`` starting with
+        ``awareness``): excluded from the static snapshot by policy — the
+        per-turn orchestrator pack and tool recall still serve it.
         """
-        walk = self._budget_walk(target)
-        if not walk.evicted_ids or walk.min_included_importance is None:
-            return 0
-        ceiling = max(0.05, round(walk.min_included_importance / 2, 3))
-        changed = {"n": 0}
-
-        def _demote(conn: sqlite3.Connection) -> None:
-            placeholders = ",".join("?" * len(walk.evicted_ids))
-            cur = conn.execute(
-                f"UPDATE memories SET importance = MIN(importance, ?)"
-                f" WHERE id IN ({placeholders}) AND importance > ?",
-                (ceiling, *walk.evicted_ids, ceiling),
-            )
-            changed["n"] = cur.rowcount
-
-        try:
-            self._execute_write(_demote)
-        except sqlite3.Error as exc:  # best-effort — never fail a write on demotion
-            logger.debug("memory v2: eviction demotion failed: %s", exc)
-            return 0
-        return int(changed["n"])
+        rows = self._query(
+            "SELECT * FROM memories WHERE target=? AND status IN ('active','pinned')"
+            " ORDER BY (status='pinned') DESC, importance DESC,"
+            " datetime(updated_at) DESC, id ASC",
+            (target,),
+        )
+        lanes: Dict[Optional[int], List[sqlite3.Row]] = {1: [], 2: [], 3: [], None: []}
+        for row in rows:
+            written_by = str(row["written_by"] or "")
+            if row["status"] == "pinned":
+                lanes[1].append(row)  # explicit user pin outranks everything
+            elif written_by.startswith("awareness"):
+                lanes[None].append(row)  # raw telemetry never sits in the prompt
+            elif row["type"] in self._LANE1_TYPES:
+                lanes[1].append(row)
+            elif row["type"] in self._LANE2_TYPES:
+                lanes[2].append(row)
+            else:
+                lanes[3].append(row)
+        return lanes
 
     @staticmethod
     def _render_entry_for_prompt(row: sqlite3.Row) -> str:
@@ -1007,7 +1240,8 @@ class MemoryStoreV2(MemoryStore):
             return {"success": False, "error": scan_error}
 
         entry_type = self._normalize_type(entry_type, target)
-        importance = self._normalize_importance(importance)
+        requested_importance = importance
+        importance = self._normalize_importance(importance, entry_type)
 
         inserted_id: Optional[str] = None
 
@@ -1037,9 +1271,16 @@ class MemoryStoreV2(MemoryStore):
             return resp
 
         self._rewrite_projection(target)
-        self._demote_evicted(target)
         resp = self._success_response(target, f"Entry added (type={entry_type}).")
         resp["id"] = inserted_id
+        if requested_importance is None:
+            # Transparency (Gate 1 §4.1): a type default was applied — say
+            # so instead of silently storing a number the caller never sent.
+            resp["importance_applied"] = {
+                "requested": None,
+                "stored": importance,
+                "rule": f"type-default({entry_type})={importance}",
+            }
 
         # Contradiction hint for standing decisions/rules: ranked candidates
         # WITH evidence (shared terms + score). Suggest-only by design — no
@@ -1086,6 +1327,10 @@ class MemoryStoreV2(MemoryStore):
 
         new_type = self._normalize_type(entry_type, target) if entry_type else None
         new_importance = self._normalize_importance(importance) if importance is not None else None
+        clamped = (
+            importance is not None and new_importance is not None
+            and abs(new_importance - float(importance)) > 1e-9
+        )
 
         outcome: Dict[str, Any] = {}
 
@@ -1128,8 +1373,14 @@ class MemoryStoreV2(MemoryStore):
         if not outcome.get("success"):
             return outcome
         self._rewrite_projection(target)
-        self._demote_evicted(target)
-        return self._success_response(target, "Entry replaced.")
+        resp = self._success_response(target, "Entry replaced.")
+        if clamped:
+            resp["importance_applied"] = {
+                "requested": importance,
+                "stored": new_importance,
+                "rule": "clamped to [0, 1]",
+            }
+        return resp
 
     def remove(self, target: str, old_text: str) -> Dict[str, Any]:
         """Hard-delete the entry containing ``old_text`` (parent contract).
@@ -1604,7 +1855,6 @@ class MemoryStoreV2(MemoryStore):
             return outcome
         actual_target = outcome.get("target_corrected") or target
         self._rewrite_projection(actual_target)
-        self._demote_evicted(actual_target)
         resp = self._success_response(
             actual_target,
             "Decision superseded: new entry active, old entry deprecated, "
@@ -1725,11 +1975,86 @@ class MemoryStoreV2(MemoryStore):
             out_exact[:_TOKEN_SEARCH_MAX],
         )
 
+    def normalized_query(self, query: str) -> "NormalizedQuery":
+        """Build the one shared NormalizedQuery for a raw query string.
+
+        Both the candidate generator (:meth:`recall_candidates`) and the
+        orchestrator's relevance ranking consume THIS object — no second
+        tokenization anywhere downstream (Gate 1 §4.2).
+        """
+        q = (query or "").strip()
+        raw_stems = _query_stems(q)
+        exact_terms = _query_exact_terms(q)
+        extra_exact: List[str] = []
+        expansions: Dict[str, Tuple[str, ...]] = {}
+        if self._alias_map:
+            for token in _TOKEN_SPLIT_RE.split(q):
+                token = _fold_yo(token.lower())
+                if len(token) < _TOKEN_MIN_STEM:
+                    continue
+                stem = token[: max(_TOKEN_MIN_STEM, len(token) - 3)]
+                for alias in self._alias_map.get(token, ()):
+                    if len(alias) >= _TOKEN_MIN_STEM:
+                        alias_stem = alias[: max(_TOKEN_MIN_STEM, len(alias) - 3)]
+                        if alias_stem != stem:
+                            expansions.setdefault(stem, tuple())
+                            if alias_stem not in expansions[stem]:
+                                expansions[stem] = expansions[stem] + (alias_stem,)
+                    elif (
+                        len(alias) == _TOKEN_EXACT_LEN
+                        and _fold_yo(alias) not in exact_terms
+                        and _fold_yo(alias) not in extra_exact
+                    ):
+                        # Short domain aliases (vpn/dns) ride the exact-term
+                        # path — the same contract the legacy _alias_expand
+                        # applied (P2 §8.4: exactness for short terms).
+                        extra_exact.append(_fold_yo(alias))
+        exact_terms = [_fold_yo(t) for t in exact_terms] + extra_exact
+        concepts = tuple(s for s in map(_fold_yo, raw_stems) if s not in _CONCEPT_STOP_STEMS)
+        # Short domain terms (and short aliases) are first-class concepts
+        # with exact-token semantics.
+        for term in exact_terms:
+            if term not in concepts and term not in _CONCEPT_STOP_STEMS:
+                concepts = concepts + (term,)
+        folded_expansions = tuple(
+            (_fold_yo(stem), exps) for stem, exps in expansions.items()
+        )
+        return NormalizedQuery(
+            raw=q,
+            concepts=concepts,
+            exact_terms=tuple(dict.fromkeys(exact_terms)),
+            phrases=tuple(_query_phrases(q)),
+            expansions=folded_expansions,
+            alias_version=str(len(self._alias_map)),
+        )
+
+    def _fts_bm25(
+        self, stems: Sequence[str], exact_terms: Sequence[str],
+    ) -> Optional[Dict[int, float]]:
+        """bm25(rank) per rowid for the same OR-match the candidate search
+        uses; ``None`` when FTS5 is unavailable (LIKE path has no bm25 —
+        the ranker treats missing bm25 as a neutral 0.0)."""
+        terms = [f"{s}*" for s in stems] + [_fts_quote(t) for t in exact_terms]
+        if not terms:
+            return None
+        conn = self._connect()
+        try:
+            with self._db_lock:
+                rows = conn.execute(
+                    "SELECT rowid, bm25(memories_fts) AS rank"
+                    " FROM memories_fts WHERE memories_fts MATCH ? LIMIT 400",
+                    (" OR ".join(terms),),
+                ).fetchall()
+            return {r["rowid"]: float(r["rank"]) for r in rows}
+        except sqlite3.Error:
+            return None
+
     def recall_candidates(
         self,
         query: str,
         limit: int = 30,
         project: Optional[str] = None,
+        nq: Optional["NormalizedQuery"] = None,
     ) -> List[Dict[str, Any]]:
         """Full-metadata search candidates for the memory orchestrator.
 
@@ -1747,14 +2072,32 @@ class MemoryStoreV2(MemoryStore):
         when set, only rows bound to that project **or unbound** (global)
         pass. ``None`` sees everything.
         """
-        stems = _query_stems(query)
-        exact_terms = _query_exact_terms(query)
+        if nq is not None:
+            stems = nq.search_stems
+            exact_terms = list(nq.exact_terms)
+        else:
+            stems = _query_stems(query)
+            exact_terms = _query_exact_terms(query)
         if not stems and not exact_terms:
             return []
-        stems, exact_terms = self._alias_expand(query, stems, exact_terms)
-        stems = list(dict.fromkeys(_fold_yo(s) for s in stems))
-        exact_terms = list(dict.fromkeys(_fold_yo(t) for t in exact_terms))
+        if nq is None:
+            stems, exact_terms = self._alias_expand(query, stems, exact_terms)
+            stems = list(dict.fromkeys(_fold_yo(s) for s in stems))
+            exact_terms = list(dict.fromkeys(_fold_yo(t) for t in exact_terms))
         rows: Optional[List[sqlite3.Row]] = self._fts_search_any(stems, exact_terms)
+        bm25_by_id: Optional[Dict[str, float]] = None
+        if rows is not None:
+            bm25_map = self._fts_bm25(stems, exact_terms)
+            if bm25_map is not None:
+                conn = self._connect()
+                with self._db_lock:
+                    id_rows = conn.execute(
+                        "SELECT id, rowid FROM memories"
+                    ).fetchall()
+                bm25_by_id = {
+                    r["id"]: bm25_map.get(r["rowid"], 0.0) for r in id_rows
+                    if r["rowid"] in bm25_map
+                }
         if rows is None:
             rows = self._like_search_any(stems, exact_terms)
         elif not rows and stems:
@@ -1777,7 +2120,12 @@ class MemoryStoreV2(MemoryStore):
                 continue  # deprecated/archived never reach the prompt
             if project is not None and r["project"] not in (None, project):
                 continue  # realm: foreign-project rows stay invisible
-            out.append(dict(r))
+            cand = dict(r)
+            if bm25_by_id is not None:
+                # Missing id = the row reached us via the LIKE fallback —
+                # no bm25 exists for it, the ranker treats that as neutral 0.
+                cand["_bm25"] = bm25_by_id.get(rid, 0.0)
+            out.append(cand)
             if len(out) >= max(1, int(limit)):
                 break
         # 1-hop supersedes provenance (P1): the recalled trajectory, not just
@@ -2131,10 +2479,24 @@ class MemoryStoreV2(MemoryStore):
             return "fact"
         return entry_type
 
-    @staticmethod
-    def _normalize_importance(importance: Optional[float]) -> float:
+    # Intrinsic-importance defaults (Gate 1 §4.1): applied ONLY when the
+    # caller did not pass a value — an explicit number is never rewritten.
+    # Standing records (decisions/constraints) default high because they are
+    # exactly the rows the snapshot lanes exist to keep visible.
+    _DEFAULT_IMPORTANCE_BY_TYPE: Dict[str, float] = {
+        "constraint": 0.9,
+        "decision": 0.85,
+        "preference": 0.6,
+        "pattern": 0.5,
+        "fact": 0.5,
+        "legacy": 0.3,
+    }
+
+    def _normalize_importance(
+        self, importance: Optional[float], entry_type: Optional[str] = None,
+    ) -> float:
         if importance is None:
-            return 0.5
+            return self._DEFAULT_IMPORTANCE_BY_TYPE.get(entry_type or "", 0.5)
         try:
             value = float(importance)
         except (TypeError, ValueError):

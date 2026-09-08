@@ -251,10 +251,14 @@ class TestSupersedesProvenance:
         assert store._query("SELECT COUNT(*) AS c FROM memory_links")[0]["c"] == 0
 
 
-class TestEvictionDemotion:
-    """P6 remainder: evicted entries demote importance, stay active + findable."""
+class TestEvictionNeverMutatesImportance:
+    """Gate 1 §4.1: prompt eviction is residency, not value. The old P6
+    demotion (evicted → importance floor 0.05) permanently destroyed the
+    intrinsic importance of standing decisions — a live-data defect removed
+    with the lane allocator. What survives from the old contract: evicted
+    entries stay active and searchable."""
 
-    def test_evicted_demoted_below_in_prompt_minimum(self, mem_dir):
+    def test_evicted_importance_unchanged_and_findable(self, mem_dir):
         s = MemoryStoreV2(memory_char_limit=200)
         s.load_from_disk()
         s.add("memory", "Важное правило один " + "а" * 80, importance=0.9)
@@ -262,23 +266,28 @@ class TestEvictionDemotion:
         r = s.add("memory", "Хвостовая запись " + "в" * 80, importance=0.5)
         try:
             assert r["success"] and r.get("evicted_to_cold") == 1
-            rows = s._query("SELECT content, importance, status FROM memories")
             walk = s._budget_walk("memory")
-            in_prompt = [row for row in rows if row["content"] in walk.included_contents]
+            rows = s._query("SELECT content, importance, status FROM memories")
             evicted = [row for row in rows if row["content"] not in walk.included_contents]
-            assert len(evicted) == 1 and len(in_prompt) == 2
-            # The evicted entry ranks below everything still in the prompt...
-            assert evicted[0]["importance"] < min(
-                row["importance"] for row in in_prompt
+            assert evicted, "overflow must still evict from the prompt"
+            # Intrinsic importance is EXACTLY what the writer sent — eviction
+            # changed it before (0.5 → 0.05); it must not anymore.
+            assert all(
+                abs(row["importance"] - {
+                    "Важное правило один": 0.9,
+                    "Второй факт средний": 0.6,
+                    "Хвостовая запись": 0.5,
+                }[row["content"].split(" а")[0].split(" б")[0].split(" в")[0]]) < 1e-9
+                for row in rows
             )
             # ...stays active and remains searchable (cold tier, not garbage).
-            assert evicted[0]["status"] == "active"
+            assert all(row["status"] == "active" for row in evicted)
             probe = evicted[0]["content"][:12]
             assert s.recall(probe)["count"] == 1
         finally:
             s.close()
 
-    def test_demotion_is_monotonic_never_raises(self, mem_dir):
+    def test_repeated_overflow_writes_never_touch_importance(self, mem_dir):
         s = MemoryStoreV2(memory_char_limit=200)
         s.load_from_disk()
         s.add("memory", "Опорное правило один " + "а" * 80, importance=0.9)
@@ -292,10 +301,8 @@ class TestEvictionDemotion:
 
         try:
             first = imp_of("Хвостовая запись")
-            # A second overflow write recomputes the ceiling — MIN() must
-            # never raise the already-demoted entry back up.
             s.add("memory", "Ещё одна хвостовая " + "г" * 80, importance=0.4)
-            assert imp_of("Хвостовая запись") <= first
+            assert imp_of("Хвостовая запись") == first
         finally:
             s.close()
 

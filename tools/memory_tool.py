@@ -1368,7 +1368,7 @@ MEMORY_SCHEMA = {
             },
             "importance": {
                 "type": "number",
-                "description": "Entry importance 0..1 (default 0.5). Higher importance survives prompt-budget trimming."
+                "description": "Intrinsic long-term value 0..1. Omit it and a type default applies (decision 0.85, constraint 0.9, preference 0.6, fact/pattern 0.5); an explicit value is stored as-is, never rewritten. Prompt eviction never changes importance."
             },
             "query": {
                 "type": "string",
