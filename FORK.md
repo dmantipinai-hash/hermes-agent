@@ -11,6 +11,12 @@ upstream release**.
 
 ## Version lineage — read this before touching versions
 
+- **The fork has its own release line: `v1.1` and onward** (GitHub Releases
+  of this repository). `v1.1` (2026-08-31) is the released snapshot carrying
+  Architecture 2.0 — memory v2, soft message delivery, orchestration,
+  awareness (DETECT→RECORD + tension map), and token-economy insights.
+  Future releases continue this line; users update **from this repository
+  only**.
 - The architecture was built on the **v0.16.0** line of this fork and is
   carried forward **only on this fork's `main`**.
 - Upstream releases **0.17 / 0.18 / 0.19 / 0.20** (the PyPI package, the
