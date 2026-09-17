@@ -1309,6 +1309,19 @@ class Comment:
     author: str
     body: str
     created_at: int
+    # Typed-comment fields (2026-09-17). Defaults keep every existing
+    # constructor call site and pre-migration row reading as plain info.
+    kind: str = "info"
+    superseded_by: Optional[int] = None
+    in_reply_to: Optional[int] = None
+
+
+# Comment kinds that participate in the mailbox wake circuit when the caller
+# explicitly asks for wake. ``info`` is deliberately absent: informational
+# notes must never interrupt a running worker (anti-noise rule of the
+# typed-comments ТЗ §4.2).
+WAKEABLE_COMMENT_KINDS = frozenset({"guidance", "question", "correction"})
+COMMENT_KINDS = frozenset({"info", "guidance", "question", "correction"})
 
 
 @dataclass(frozen=True)
@@ -1363,6 +1376,27 @@ class MailboxCompletionBlockedError(ValueError):
             "completion blocked by unresolved mailbox messages "
             f"{self.message_ids} for current run {run_label}"
         )
+
+
+class OpenQuestionsBlockedError(ValueError):
+    """Completion was rejected while typed ``question`` comments stay open.
+
+    A question is open when it is alive (``superseded_by IS NULL``) and no
+    alive comment answers it (``in_reply_to`` = the question's id). The
+    completing worker must answer via ``in_reply_to`` or supersede the
+    question (e.g. it was withdrawn), then retry completion.
+    """
+
+    def __init__(self, questions: Iterable["tuple[int, str, int]"]) -> None:
+        # (comment id, author, created_at epoch seconds)
+        self.questions = [
+            (int(qid), str(author), int(created_at))
+            for qid, author, created_at in questions
+        ]
+        rendered = ", ".join(
+            f"#{qid} (by {author})" for qid, author, _ in self.questions
+        )
+        super().__init__(f"completion blocked by open questions: {rendered}")
 
 
 @dataclass
@@ -1495,12 +1529,21 @@ CREATE TABLE IF NOT EXISTS task_links (
     PRIMARY KEY (parent_id, child_id)
 );
 
+-- Typed comments (2026-09-17, typed-comments ТЗ): ``kind`` is the machine
+-- contract for the thread (the complete-gate blocks on open questions),
+-- ``in_reply_to`` links an answer to the comment it answers, ``superseded_by``
+-- marks a stale fact as replaced without deleting it (audit stays intact).
+-- Pre-migration rows and legacy callers keep kind='info' semantics.
 CREATE TABLE IF NOT EXISTS task_comments (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     task_id    TEXT NOT NULL,
     author     TEXT NOT NULL,
     body       TEXT NOT NULL,
-    created_at INTEGER NOT NULL
+    created_at INTEGER NOT NULL,
+    kind       TEXT NOT NULL DEFAULT 'info'
+               CHECK (kind IN ('info', 'guidance', 'question', 'correction')),
+    superseded_by INTEGER REFERENCES task_comments(id),
+    in_reply_to   INTEGER REFERENCES task_comments(id)
 );
 
 CREATE TABLE IF NOT EXISTS task_events (
@@ -2906,6 +2949,39 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         "CREATE INDEX IF NOT EXISTS idx_events_run "
         "ON task_events(run_id, id)"
     )
+
+    # Typed comments (2026-09-17): kind/superseded_by/in_reply_to on legacy
+    # boards. Existing rows read as kind='info' (the column default), which
+    # is exactly the untyped semantics they had before — the complete-gate
+    # sees zero questions on pre-migration data. Index goes here, not in
+    # SCHEMA_SQL, per the additive-column ordering rule above.
+    tc_exists = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'task_comments'"
+    ).fetchone() is not None
+    if tc_exists:
+        tc_cols = {
+            row["name"] for row in conn.execute("PRAGMA table_info(task_comments)")
+        }
+        if "kind" not in tc_cols:
+            _add_column_if_missing(
+                conn,
+                "task_comments",
+                "kind",
+                "kind TEXT NOT NULL DEFAULT 'info' "
+                "CHECK (kind IN ('info', 'guidance', 'question', 'correction'))",
+            )
+        if "superseded_by" not in tc_cols:
+            _add_column_if_missing(
+                conn, "task_comments", "superseded_by", "superseded_by INTEGER"
+            )
+        if "in_reply_to" not in tc_cols:
+            _add_column_if_missing(
+                conn, "task_comments", "in_reply_to", "in_reply_to INTEGER"
+            )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_comments_task_kind "
+            "ON task_comments(task_id, kind, superseded_by)"
+        )
 
     # Active-mailbox ownership is deliberately closed for every legacy row,
     # including runs that happen to be live during migration. Only creation of
@@ -4319,27 +4395,145 @@ def parent_results(conn: sqlite3.Connection, task_id: str) -> list[tuple[str, Op
 # ---------------------------------------------------------------------------
 
 def add_comment(
-    conn: sqlite3.Connection, task_id: str, author: str, body: str
+    conn: sqlite3.Connection,
+    task_id: str,
+    author: str,
+    body: str,
+    *,
+    kind: str = "info",
+    in_reply_to: Optional[int] = None,
 ) -> int:
     if not body or not body.strip():
         raise ValueError("comment body is required")
     if not author or not author.strip():
         raise ValueError("comment author is required")
+    kind = str(kind or "info").strip().lower()
+    if kind not in COMMENT_KINDS:
+        raise ValueError(
+            "comment kind must be one of info, guidance, question, correction"
+        )
     now = int(time.time())
     # ``allow_nested=True``: graph builders (kanban_swarm blackboard seeding)
-    # compose comment writes under one outer commit.
+    # compose comment writes under one outer commit. The kanban_comment tool
+    # also wraps insert + supersede + mailbox send in one outer txn.
     with write_txn(conn, allow_nested=True):
         if not conn.execute(
             "SELECT 1 FROM tasks WHERE id = ?", (task_id,)
         ).fetchone():
             raise ValueError(f"unknown task {task_id}")
+        if in_reply_to is not None:
+            parent = conn.execute(
+                "SELECT task_id FROM task_comments WHERE id = ?",
+                (int(in_reply_to),),
+            ).fetchone()
+            if parent is None:
+                raise ValueError(
+                    f"in_reply_to comment {int(in_reply_to)} does not exist"
+                )
+            if parent["task_id"] != task_id:
+                raise ValueError(
+                    "in_reply_to comment belongs to a different task"
+                )
         cur = conn.execute(
-            "INSERT INTO task_comments (task_id, author, body, created_at) "
-            "VALUES (?, ?, ?, ?)",
-            (task_id, author.strip(), body.strip(), now),
+            "INSERT INTO task_comments "
+            "(task_id, author, body, created_at, kind, in_reply_to) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                task_id,
+                author.strip(),
+                body.strip(),
+                now,
+                kind,
+                int(in_reply_to) if in_reply_to is not None else None,
+            ),
         )
         _append_event(conn, task_id, "commented", {"author": author, "len": len(body)})
         return int(cur.lastrowid or 0)
+
+
+def supersede_comment(
+    conn: sqlite3.Connection,
+    *,
+    old_comment_id: int,
+    new_comment_id: int,
+    task_id: str,
+) -> None:
+    """Mark ``old_comment_id`` superseded by ``new_comment_id`` in-txn.
+
+    Atomic with the caller's outer write txn: on any validation failure the
+    whole insertion + supersede rolls back together, so a half-applied
+    replacement can never land. The old row's body/author stay untouched —
+    supersede is a forward pointer, not an edit (audit stays honest).
+    """
+    cur = conn.execute(
+        "UPDATE task_comments SET superseded_by = ? "
+        "WHERE id = ? AND task_id = ? AND superseded_by IS NULL",
+        (int(new_comment_id), int(old_comment_id), task_id),
+    )
+    if cur.rowcount != 1:
+        existing = conn.execute(
+            "SELECT task_id, superseded_by FROM task_comments WHERE id = ?",
+            (int(old_comment_id),),
+        ).fetchone()
+        if existing is None or existing["task_id"] != task_id:
+            raise ValueError(
+                f"supersedes comment {int(old_comment_id)} does not exist "
+                f"on task {task_id}"
+            )
+        raise ValueError(
+            f"comment {int(old_comment_id)} is already superseded "
+            f"(by #{existing['superseded_by']})"
+        )
+
+
+def list_open_questions(
+    conn: sqlite3.Connection, task_id: str
+) -> list[tuple[int, str, int]]:
+    """Alive ``question`` comments with no alive answer, oldest first.
+
+    A question is answered when a live (not itself superseded) comment on the
+    same task carries ``in_reply_to`` = the question's id. Any author counts:
+    the gate's job is to force an explicit recorded answer, not to police who
+    answered (assignee discipline stays a soft rule in the tool description).
+    Legacy pre-typing rows are all ``info`` and never match.
+    """
+    rows = conn.execute(
+        """
+        SELECT q.id, q.author, q.created_at
+          FROM task_comments q
+         WHERE q.task_id = ?
+           AND q.kind = 'question'
+           AND q.superseded_by IS NULL
+           AND NOT EXISTS (
+                SELECT 1 FROM task_comments a
+                 WHERE a.task_id = q.task_id
+                   AND a.in_reply_to = q.id
+                   AND a.superseded_by IS NULL
+           )
+         ORDER BY q.id ASC
+        """,
+        (task_id,),
+    ).fetchall()
+    return [
+        (int(r["id"]), str(r["author"]), int(r["created_at"])) for r in rows
+    ]
+
+
+def _comment_from_row(row: sqlite3.Row) -> Comment:
+    return Comment(
+        id=int(row["id"]),
+        task_id=row["task_id"],
+        author=row["author"],
+        body=row["body"],
+        created_at=int(row["created_at"]),
+        kind=str(row["kind"] or "info"),
+        superseded_by=(
+            int(row["superseded_by"]) if row["superseded_by"] is not None else None
+        ),
+        in_reply_to=(
+            int(row["in_reply_to"]) if row["in_reply_to"] is not None else None
+        ),
+    )
 
 
 def list_comments(conn: sqlite3.Connection, task_id: str) -> list[Comment]:
@@ -4347,16 +4541,7 @@ def list_comments(conn: sqlite3.Connection, task_id: str) -> list[Comment]:
         "SELECT * FROM task_comments WHERE task_id = ? ORDER BY created_at ASC",
         (task_id,),
     ).fetchall()
-    return [
-        Comment(
-            id=r["id"],
-            task_id=r["task_id"],
-            author=r["author"],
-            body=r["body"],
-            created_at=r["created_at"],
-        )
-        for r in rows
-    ]
+    return [_comment_from_row(r) for r in rows]
 
 
 def list_comments_since(
@@ -4375,16 +4560,7 @@ def list_comments_since(
         "ORDER BY id ASC",
         (task_id, int(since_id)),
     ).fetchall()
-    return [
-        Comment(
-            id=r["id"],
-            task_id=r["task_id"],
-            author=r["author"],
-            body=r["body"],
-            created_at=r["created_at"],
-        )
-        for r in rows
-    ]
+    return [_comment_from_row(r) for r in rows]
 
 
 def list_worker_comments_since(
@@ -4412,13 +4588,7 @@ def list_worker_comments_since(
     ).fetchall()
     cursor = int(rows[-1]["id"]) if rows else int(since_id)
     comments = [
-        Comment(
-            id=int(row["id"]),
-            task_id=row["task_id"],
-            author=row["author"],
-            body=row["body"],
-            created_at=int(row["created_at"]),
-        )
+        _comment_from_row(row)
         for row in rows
         if row["mailbox_message_id"] is None
     ]
@@ -4520,12 +4690,19 @@ def _send_mailbox_message_in_txn(
     idempotency_key: str,
     now: Optional[int] = None,
     max_body_bytes: int = DEFAULT_MAILBOX_BODY_MAX_BYTES,
+    comment_id: Optional[int] = None,
 ) -> MailboxSendResult:
     """Persist one trusted mailbox message inside the caller's write txn.
 
     Authorization belongs to the caller.  It never claims or spawns work. Secret
     redaction is forced before validation or durable writes, regardless of
     the operator's display-redaction setting.
+
+    ``comment_id`` links the message to an ALREADY-INSERTED task_comments row
+    (the ``kanban_comment(wake=true)`` path) instead of creating its own
+    comment row. The comment's body must be the same canonical text — callers
+    pass the comment they just wrote, so the thread and the mailbox copy never
+    diverge.
     """
     values = {
         "task_id": task_id,
@@ -4626,17 +4803,36 @@ def _send_mailbox_message_in_txn(
                 delivery_state=_mailbox_delivery_state_in_txn(conn, message_id),
             )
 
-        comment_cur = conn.execute(
-            "INSERT INTO task_comments (task_id, author, body, created_at) "
-            "VALUES (?, ?, ?, ?)",
-            (
-                normalized["task_id"],
-                normalized["sender_profile"],
-                canonical_body,
-                created_at,
-            ),
-        )
-        comment_id = int(comment_cur.lastrowid or 0)
+        if comment_id is not None:
+            # kanban_comment(wake=true) path: the comment row already exists
+            # in this txn with the same canonical body; only link it.
+            existing_comment = conn.execute(
+                "SELECT task_id, body FROM task_comments WHERE id = ?",
+                (int(comment_id),),
+            ).fetchone()
+            if existing_comment is None:
+                raise ValueError(
+                    f"comment_id {int(comment_id)} does not exist on this board"
+                )
+            if existing_comment["task_id"] != normalized["task_id"]:
+                raise ValueError("comment_id belongs to a different task")
+            if existing_comment["body"] != canonical_body:
+                raise ValueError(
+                    "comment body diverged from the mailbox body before send"
+                )
+            linked_comment_id = int(comment_id)
+        else:
+            comment_cur = conn.execute(
+                "INSERT INTO task_comments (task_id, author, body, created_at) "
+                "VALUES (?, ?, ?, ?)",
+                (
+                    normalized["task_id"],
+                    normalized["sender_profile"],
+                    canonical_body,
+                    created_at,
+                ),
+            )
+            linked_comment_id = int(comment_cur.lastrowid or 0)
         message_cur = conn.execute(
             """
             INSERT INTO task_mailbox_messages (
@@ -4654,7 +4850,7 @@ def _send_mailbox_message_in_txn(
                 kind,
                 canonical_body,
                 int(wake_requested),
-                comment_id,
+                linked_comment_id,
                 normalized["idempotency_key"],
                 created_at,
             ),
@@ -4663,7 +4859,7 @@ def _send_mailbox_message_in_txn(
         payload = json.dumps(
             {
                 "message_id": message_id,
-                "comment_id": comment_id,
+                "comment_id": linked_comment_id,
                 "sender_profile": normalized["sender_profile"],
                 "recipient_profile": normalized["recipient_profile"],
                 "kind": kind,
@@ -5305,20 +5501,11 @@ def list_comments_after(
     ``tools.kanban_tools.inject_new_comments_from_env``).
     """
     rows = conn.execute(
-        "SELECT id, task_id, author, body, created_at FROM task_comments "
+        "SELECT * FROM task_comments "
         "WHERE task_id = ? AND id > ? ORDER BY id ASC",
         (task_id, int(after_id)),
     ).fetchall()
-    return [
-        Comment(
-            id=r["id"],
-            task_id=r["task_id"],
-            author=r["author"],
-            body=r["body"],
-            created_at=r["created_at"],
-        )
-        for r in rows
-    ]
+    return [_comment_from_row(r) for r in rows]
 # ---------------------------------------------------------------------------
 # Attachments
 # ---------------------------------------------------------------------------
@@ -6631,7 +6818,7 @@ def _complete_task(
     created_cards: Optional[Iterable[str]] = None,
     expected_run_id: Optional[int] = None,
     fire_lifecycle_hook: bool = True,
-) -> bool | MailboxCompletionBlockedError:
+) -> bool | MailboxCompletionBlockedError | OpenQuestionsBlockedError:
     """Transition ``running|ready|blocked|review -> done`` and record ``result``.
 
     Accepts a task that is merely ``ready`` too, so a manual CLI
@@ -6740,6 +6927,36 @@ def _complete_task(
                 pending_message_ids,
                 current_run_id,
             )
+
+        # Typed-question gate (2026-09-17 ТЗ §4.5): an unanswered question
+        # comment blocks completion by machine, not by model discipline.
+        # Same escape hatches as the protocol text: answer it (a live comment
+        # with in_reply_to = the question id) or supersede it (question
+        # withdrawn / moot). Pre-typing rows are all kind='info', so legacy
+        # boards pass through this gate untouched.
+        open_questions = list_open_questions(conn, task_id)
+        if open_questions:
+            now_epoch = int(time.time())
+            _append_event(
+                conn,
+                task_id,
+                "completion_blocked_open_question",
+                {
+                    "open_questions": [
+                        {
+                            "comment_id": qid,
+                            "author": author,
+                            "age_seconds": max(0, now_epoch - created_at),
+                        }
+                        for qid, author, created_at in open_questions
+                    ]
+                },
+                run_id=current_run_id,
+            )
+            # Return (not raise): the audit event above must commit with the
+            # enclosing txn; the public complete_task wrapper re-raises after
+            # commit, mirroring the mailbox gate above.
+            return OpenQuestionsBlockedError(open_questions)
 
         # Parent completion is a hard invariant even for direct human review
         # approval. A parent may have been reopened after this task entered
@@ -6915,7 +7132,7 @@ def complete_task(
     expected_run_id: Optional[int] = None,
     fire_lifecycle_hook: bool = True,
 ) -> bool:
-    """Complete a task, raising mailbox rejection only after audit commit."""
+    """Complete a task, raising mailbox/question rejection only after audit commit."""
     outcome = _complete_task(
         conn,
         task_id,
@@ -6927,6 +7144,8 @@ def complete_task(
         fire_lifecycle_hook=fire_lifecycle_hook,
     )
     if isinstance(outcome, MailboxCompletionBlockedError):
+        raise outcome
+    if isinstance(outcome, OpenQuestionsBlockedError):
         raise outcome
     return outcome
 
@@ -12617,6 +12836,15 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
                 f"_({omitted_c} earlier comment{'s' if omitted_c != 1 else ''} "
                 f"omitted; showing most recent {len(shown_c)})_"
             )
+        # Typed-comment overlays (2026-09-17 ТЗ §4.3): kind badge first on the
+        # line so the worker sees priority before reading the body, explicit
+        # supersede pointers so stale facts can't silently compete with their
+        # replacement, and an OPEN marker on unanswered questions. All of it
+        # derives only from DB state — the render stays deterministic for a
+        # given board snapshot (prompt-cache friendly, A8).
+        open_question_ids = {
+            qid for qid, _author, _ts in list_open_questions(conn, task_id)
+        }
         for c in shown_c:
             ts = time.strftime("%Y-%m-%d %H:%M", time.localtime(c.created_at))
             age = _relative_age(c.created_at, _now)
@@ -12628,8 +12856,33 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
             # Defense-in-depth — the LLM-controlled author-forgery surface
             # was already closed in #22435. See #22452.
             safe_author = (c.author or "").replace("`", "")
-            lines.append(f"comment from worker `{safe_author}` at {ts_disp}:")
+            badge = f"[{c.kind}]" if c.kind and c.kind != "info" else ""
+            markers = []
+            if c.in_reply_to is not None:
+                markers.append(f"↩#{c.in_reply_to}")
+            if c.superseded_by is not None:
+                markers.append(f"⚠️superseded→#{c.superseded_by}")
+            if c.id in open_question_ids:
+                markers.append(
+                    f"❓OPEN — answer with kanban_comment(in_reply_to={c.id}) "
+                    f"before kanban_complete"
+                )
+            marker_str = (" " + " ".join(markers)) if markers else ""
+            badge_str = f"{badge} " if badge else ""
+            lines.append(
+                f"{badge_str}comment from worker `{safe_author}` "
+                f"at {ts_disp}{marker_str}:"
+            )
             lines.append(_cap(c.body, _CTX_MAX_COMMENT_BYTES))
+            lines.append("")
+        still_open_shown = sorted(open_question_ids)
+        if still_open_shown:
+            lines.append(
+                f"_Open questions on this task: "
+                f"{', '.join(f'#{qid}' for qid in still_open_shown)} — they "
+                f"block kanban_complete until answered (in_reply_to) or "
+                f"superseded._"
+            )
             lines.append("")
 
     return "\n".join(lines).rstrip() + "\n"

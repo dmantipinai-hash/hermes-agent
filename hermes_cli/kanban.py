@@ -569,6 +569,15 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_comment.add_argument("text", nargs="+", help="Comment body")
     p_comment.add_argument("--author", default=None,
                            help="Author name (default: $HERMES_PROFILE or 'user')")
+    p_comment.add_argument("--kind", default=None, choices=[
+        "info", "guidance", "question", "correction"],
+        help="Typed comment kind (default: info). 'question' blocks complete "
+             "until answered (--in-reply-to); 'correction' requires --supersedes")
+    p_comment.add_argument("--in-reply-to", type=int, default=None, metavar="COMMENT_ID",
+                           help="Answer the given comment (closes an open question)")
+    p_comment.add_argument("--supersedes", type=int, default=None, metavar="COMMENT_ID",
+                           help="Mark the given comment superseded by this one "
+                                "(required for --kind correction)")
     p_comment.add_argument("--max-len", type=int, default=None,
                            help="Trim the stored comment body to this many characters")
 
@@ -1716,7 +1725,15 @@ def _cmd_show(args: argparse.Namespace) -> int:
             "parents": parents,
             "children": children,
             "comments": [
-                {"author": c.author, "body": c.body, "created_at": c.created_at}
+                {
+                    "id": c.id,
+                    "author": c.author,
+                    "body": c.body,
+                    "created_at": c.created_at,
+                    "kind": getattr(c, "kind", "info"),
+                    "superseded_by": getattr(c, "superseded_by", None),
+                    "in_reply_to": getattr(c, "in_reply_to", None),
+                }
                 for c in comments
             ],
             "events": [
@@ -1832,7 +1849,13 @@ def _cmd_show(args: argparse.Namespace) -> int:
         print()
         print(f"Comments ({len(comments)}):")
         for c in comments:
-            print(f"  [{_fmt_ts(c.created_at)}] {c.author}: {c.body}")
+            kind_tag = f"[{c.kind}] " if getattr(c, "kind", "info") not in (None, "info") else ""
+            markers = ""
+            if getattr(c, "superseded_by", None):
+                markers += f" ⚠️superseded→#{c.superseded_by}"
+            if getattr(c, "in_reply_to", None):
+                markers += f" ↩#{c.in_reply_to}"
+            print(f"  [{_fmt_ts(c.created_at)}] {kind_tag}{c.author}{markers}: {c.body}")
     if events:
         print()
         print(f"Events ({len(events)}):")
@@ -2115,9 +2138,42 @@ def _cmd_comment(args: argparse.Namespace) -> int:
             suffix = f"\n\n[trimmed to {args.max_len} chars by --max-len]"
             body = body[: max(0, args.max_len - len(suffix))].rstrip() + suffix
     author = args.author or _profile_author()
-    with kb.connect_closing() as conn:
-        kb.add_comment(conn, args.task_id, author, body)
-    print(f"Comment added to {args.task_id}")
+    kind = (args.kind or "info").strip().lower()
+    if kind not in ("info", "guidance", "question", "correction"):
+        print(
+            "kanban: --kind must be info, guidance, question, or correction",
+            file=sys.stderr,
+        )
+        return 2
+    if kind == "correction" and not args.supersedes:
+        print("kanban: --kind correction requires --supersedes <comment id>", file=sys.stderr)
+        return 2
+    try:
+        with kb.connect_closing() as conn:
+            cid = kb.add_comment(
+                conn,
+                args.task_id,
+                author,
+                body,
+                kind=kind,
+                in_reply_to=args.in_reply_to,
+            )
+            if args.supersedes:
+                kb.supersede_comment(
+                    conn,
+                    old_comment_id=int(args.supersedes),
+                    new_comment_id=cid,
+                    task_id=args.task_id,
+                )
+    except ValueError as exc:
+        print(f"kanban: {exc}", file=sys.stderr)
+        return 1
+    suffix = f" [{kind}]" if kind != "info" else ""
+    if args.supersedes:
+        suffix += f" (supersedes #{args.supersedes})"
+    if args.in_reply_to:
+        suffix += f" (reply to #{args.in_reply_to})"
+    print(f"Comment {cid} added to {args.task_id}{suffix}")
     return 0
 
 

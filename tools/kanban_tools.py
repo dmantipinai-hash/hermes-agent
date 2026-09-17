@@ -28,6 +28,7 @@ through the board.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -421,7 +422,12 @@ def inject_new_comments_from_env(agent: Any) -> bool:
     if not fresh:
         return False
 
-    lines = [f"- {c.author or 'operator'}: {c.body.strip()}" for c in fresh]
+    def _badge(c) -> str:
+        return f"[{c.kind}] " if getattr(c, "kind", "info") not in (None, "info") else ""
+
+    lines = [
+        f"- {_badge(c)}{c.author or 'operator'}: {c.body.strip()}" for c in fresh
+    ]
     note = (
         "New note"
         + ("s" if len(fresh) > 1 else "")
@@ -462,6 +468,27 @@ def _parse_bool_arg(args: dict, name: str, *, default: bool = False):
     if text in {"false", "0", "no"}:
         return False, None
     return default, f"{name} must be a boolean or 'true'/'false'"
+
+
+def _current_author_label() -> str:
+    """Best runtime identity of the calling profile for thread attribution.
+
+    Dispatcher-spawned workers always carry ``HERMES_PROFILE``; a root
+    orchestrator on the default profile does not, which used to collapse
+    every one of its comments into an anonymous "worker" (ТЗ §1.3 — in a
+    mixed thread the orchestrator and the worker were indistinguishable).
+    Resolve, in order: explicit env → the active profile inferred from
+    HERMES_HOME → "default".
+    """
+    profile = (os.environ.get("HERMES_PROFILE") or "").strip()
+    if profile:
+        return profile
+    try:
+        from hermes_cli.profiles import get_active_profile_name
+
+        return get_active_profile_name() or "default"
+    except Exception:
+        return "default"
 
 
 def _require_orchestrator_tool(tool_name: str) -> Optional[str]:
@@ -788,6 +815,23 @@ def _handle_complete(args: dict, **kw) -> str:
                     f"listener deliver them, respond in a model turn, then "
                     f"retry kanban_complete with the same handoff."
                 )
+            except kb.OpenQuestionsBlockedError as questions_err:
+                import time as _time
+
+                now_epoch = int(_time.time())
+                listing = "; ".join(
+                    f"#{qid} by {qauthor} "
+                    f"({max(0, now_epoch - qts) // 60} min old)"
+                    for qid, qauthor, qts in questions_err.questions
+                )
+                return tool_error(
+                    f"kanban_complete blocked by open question(s): {listing}. "
+                    f"Your task is still in-flight (no state change). Answer "
+                    f"each with kanban_comment(in_reply_to=<question id>) — "
+                    f"or, if a question was withdrawn, supersede it with "
+                    f"kanban_comment(kind='correction', supersedes=<id>) — "
+                    f"then retry kanban_complete with the same handoff."
+                )
 
             except kb.ArtifactPreservationError as artifact_err:
                 return tool_error(
@@ -1093,7 +1137,15 @@ def _handle_heartbeat(args: dict, **kw) -> str:
 
 
 def _handle_comment(args: dict, **kw) -> str:
-    """Append a comment to a task's thread."""
+    """Append a (optionally typed) comment to a task's thread.
+
+    v2 (2026-09-17 typed-comments ТЗ): ``kind`` / ``wake`` / ``supersedes`` /
+    ``in_reply_to`` are all optional — a plain call keeps the exact legacy
+    behaviour. With ``wake=true`` the comment also rides the A1 mailbox
+    circuit (the same evaluator ``message_agent`` uses), so a course
+    correction reaches a RUNNING worker mid-turn instead of at its next
+    checkpoint.
+    """
     delegated_err = _reject_delegated_child_mutation("kanban_comment")
     if delegated_err:
         return delegated_err
@@ -1106,7 +1158,49 @@ def _handle_comment(args: dict, **kw) -> str:
     body = args.get("body")
     if not body or not str(body).strip():
         return tool_error("body is required")
-    body = redact_sensitive_text(str(body), force=True)
+    # Redact AND strip once: add_comment stores the stripped form and the
+    # mailbox core compares its own canonical copy against the stored row,
+    # so both must see the exact same text.
+    body = redact_sensitive_text(str(body), force=True).strip()
+    if not body:
+        return tool_error("body is required")
+
+    kind = str(args.get("kind") or "info").strip().lower()
+    if kind not in {"info", "guidance", "question", "correction"}:
+        return tool_error(
+            "kind must be one of: info, guidance, question, correction"
+        )
+    wake, wake_err = _parse_bool_arg(args, "wake", default=False)
+    if wake_err:
+        return tool_error(wake_err)
+    if wake and kind == "info":
+        return tool_error(
+            "info comments never wake (anti-noise rule). If the assignee "
+            "must see this mid-run, use kind guidance/question/correction "
+            "with wake=true."
+        )
+    supersedes = args.get("supersedes")
+    if supersedes is not None:
+        try:
+            supersedes = int(supersedes)
+        except (TypeError, ValueError):
+            return tool_error("supersedes must be an integer comment id")
+        if supersedes <= 0:
+            return tool_error("supersedes must be a positive comment id")
+    if kind == "correction" and supersedes is None:
+        return tool_error(
+            "kind=correction requires supersedes=<comment id> — a correction "
+            "replaces a specific outdated comment"
+        )
+    in_reply_to = args.get("in_reply_to")
+    if in_reply_to is not None:
+        try:
+            in_reply_to = int(in_reply_to)
+        except (TypeError, ValueError):
+            return tool_error("in_reply_to must be an integer comment id")
+        if in_reply_to <= 0:
+            return tool_error("in_reply_to must be a positive comment id")
+
     # Author is intentionally derived from the worker's own runtime
     # identity, NOT from caller-supplied args. Comments are injected
     # into the next worker's system prompt by ``build_worker_context``
@@ -1116,13 +1210,102 @@ def _handle_comment(args: dict, **kw) -> str:
     # the future-worker context with what reads as a system directive.
     # Cross-task commenting itself remains unrestricted (see #19713) —
     # comments are the deliberate handoff channel between tasks.
-    author = os.environ.get("HERMES_PROFILE") or "worker"
+    author = _current_author_label()
     board = args.get("board")
     try:
         kb, conn = _connect(board=board)
         try:
-            cid = kb.add_comment(conn, tid, author=author, body=str(body))
-            return _ok(task_id=tid, comment_id=cid)
+            task = kb.get_task(conn, tid)
+            if task is None:
+                return tool_error(f"kanban_comment: unknown task {tid}")
+
+            # Wake prerequisites resolve BEFORE any write: a task with no
+            # assignee (or a terminal task) can't be woken, and failing
+            # loud beats silently dropping the wake half of the call.
+            recipient = None
+            if wake:
+                recipient = kb._canonical_assignee(task.assignee)
+                if not recipient:
+                    return tool_error(
+                        "kanban_comment: cannot wake — task has no assignee"
+                    )
+                if task.status in {"done", "archived"}:
+                    return tool_error(
+                        f"kanban_comment: cannot wake — task is {task.status}"
+                    )
+                try:
+                    from hermes_cli import profiles as _profiles
+
+                    normalized_recipient = _profiles.normalize_profile_name(
+                        recipient
+                    )
+                    _profiles.validate_profile_name(normalized_recipient)
+                    if not _profiles.profile_exists(normalized_recipient):
+                        return tool_error(
+                            f"kanban_comment: cannot wake — assignee "
+                            f"'{recipient}' is not an existing profile"
+                        )
+                except Exception:
+                    return tool_error(
+                        f"kanban_comment: cannot wake — assignee '{recipient}' "
+                        f"is not a valid profile name"
+                    )
+
+            with kb.write_txn(conn):
+                cid = kb.add_comment(
+                    conn,
+                    tid,
+                    author=author,
+                    body=str(body),
+                    kind=kind,
+                    in_reply_to=in_reply_to,
+                )
+                superseded_old = None
+                if supersedes is not None:
+                    kb.supersede_comment(
+                        conn,
+                        old_comment_id=supersedes,
+                        new_comment_id=cid,
+                        task_id=tid,
+                    )
+                    superseded_old = supersedes
+
+                wake_payload = {"requested": bool(wake), "effect": None}
+                if wake:
+                    # Same mailbox core as message_agent (ТЗ §4.4): the
+                    # evaluator, wake-evaluation history and delivery lease
+                    # are shared, so wake outcomes are identical from both
+                    # tools. ``correction`` maps to the mailbox's guidance
+                    # kind (delivery mechanics; the typed view lives on the
+                    # comment row). The idempotency key is derived from the
+                    # fresh comment id, unique by construction.
+                    mailbox_kind = "guidance" if kind == "correction" else kind
+                    sent = kb._send_mailbox_message_in_txn(
+                        conn,
+                        task_id=tid,
+                        actor_identity=f"kanban_comment:{author}",
+                        actor_kind="commenter",
+                        sender_profile=author,
+                        recipient_profile=recipient,
+                        kind=mailbox_kind,
+                        body=str(body),
+                        wake_requested=True,
+                        idempotency_key=f"kanban-comment:{cid}",
+                        comment_id=cid,
+                    )
+                    wake_payload["effect"] = sent.wake_effect
+
+            response: dict[str, Any] = {
+                "task_id": tid,
+                "comment_id": cid,
+                "kind": kind,
+                "wake": wake_payload,
+            }
+            if superseded_old is not None:
+                response["superseded"] = superseded_old
+            if in_reply_to is not None:
+                response["in_reply_to"] = in_reply_to
+            return _ok(**response)
         finally:
             conn.close()
     except ValueError as e:
@@ -1156,6 +1339,25 @@ def _handle_read_thread(args: dict, **kw) -> str:
         kb, conn = _connect(board=board)
         try:
             comments = kb.list_comments_since(conn, tid, since_id=since)
+            # Wake effect per comment, when the comment rode the mailbox
+            # circuit (kanban_comment(wake=true) or message_agent): the
+            # durable evaluation is the single source of truth.
+            wake_effects: dict[int, str] = {}
+            if comments:
+                rows = conn.execute(
+                    "SELECT m.comment_id AS cid, e.effect AS effect "
+                    "FROM task_mailbox_messages m "
+                    "JOIN task_mailbox_wake_evaluations e "
+                    "  ON e.message_id = m.id "
+                    "WHERE m.task_id = ?",
+                    (tid,),
+                ).fetchall()
+                wake_effects = {
+                    int(r["cid"]): str(r["effect"]) for r in rows
+                }
+            open_questions = [
+                qid for qid, _author, _ts in kb.list_open_questions(conn, tid)
+            ]
         finally:
             conn.close()
         last_id = comments[-1].id if comments else since
@@ -1170,9 +1372,14 @@ def _handle_read_thread(args: dict, **kw) -> str:
                     "author": c.author,
                     "body": c.body,
                     "created_at": c.created_at,
+                    "kind": c.kind,
+                    "superseded_by": c.superseded_by,
+                    "in_reply_to": c.in_reply_to,
+                    "wake_effect": wake_effects.get(c.id),
                 }
                 for c in comments
             ],
+            open_questions=open_questions,
         )
     except ValueError as e:
         return tool_error(f"read_task_thread: {e}")
@@ -1522,11 +1729,19 @@ def _handle_create(args: dict, **kw) -> str:
                     int(goal_max_turns) if goal_max_turns is not None else None
                 ),
                 initial_status=str(initial_status),
-                created_by=os.environ.get("HERMES_PROFILE") or "worker",
+                created_by=_current_author_label(),
                 session_id=session_id,
             )
             new_task = kb.get_task(conn, new_tid)
             subscribed = _maybe_auto_subscribe(conn, new_tid)
+            # §7 readback: a corrupted body has been observed surviving
+            # kanban_create (t_38de468d, 17.09 — foreign text spliced into
+            # the stored card while the model's own args looked clean).
+            # Hash the STORED body so the caller can cheaply verify delivery
+            # end-to-end: sha256 mismatch ⇒ write again / correct via
+            # comment; match ⇒ the corruption, if any, happened on the
+            # caller's side of the tool boundary.
+            stored_body = (new_task.body or "") if new_task else None
             return _ok(
                 task_id=new_tid,
                 status=new_task.status if new_task else None,
@@ -1534,6 +1749,11 @@ def _handle_create(args: dict, **kw) -> str:
                 workspace_path=new_task.workspace_path if new_task else None,
                 project_id=new_task.project_id if new_task else None,
                 subscribed=subscribed,
+                body_sha256=(
+                    hashlib.sha256(stored_body.encode("utf-8")).hexdigest()
+                    if stored_body is not None
+                    else None
+                ),
             )
         finally:
             conn.close()
@@ -2074,7 +2294,15 @@ KANBAN_COMMENT_SCHEMA = {
         "Append a comment to a task's thread. Use for durable notes "
         "that should outlive this run (questions for the next worker, "
         "partial findings, rationale). Ephemeral reasoning doesn't "
-        "belong here — use your normal response instead."
+        "belong here — use your normal response instead. Typed "
+        "comments: kind='question' blocks kanban_complete until someone "
+        "answers it (answer with in_reply_to=<question id>); "
+        "kind='correction' replaces a stale comment (supersedes=<id>, "
+        "old one is marked ⚠️superseded, audit preserved); "
+        "kind='guidance' is a directive. wake=true (not for info) also "
+        "delivers the comment to a RUNNING assignee mid-run via the "
+        "same circuit message_agent uses — one call instead of two; "
+        "the response reports the wake effect."
     ),
     "parameters": {
         "type": "object",
@@ -2090,6 +2318,47 @@ KANBAN_COMMENT_SCHEMA = {
                 "type": "string",
                 "description": "Markdown-supported comment body.",
             },
+            "kind": {
+                "type": "string",
+                "enum": ["info", "guidance", "question", "correction"],
+                "description": (
+                    "info = plain note (default, never wakes); guidance "
+                    "= directive/course correction; question = requires "
+                    "an answer before the task can complete (answers go "
+                    "via in_reply_to); correction = replaces an outdated "
+                    "comment (supersedes required)."
+                ),
+                "default": "info",
+            },
+            "wake": {
+                "type": "boolean",
+                "description": (
+                    "Also deliver to the RUNNING assignee mid-run via the "
+                    "mailbox wake circuit (same as message_agent). Only "
+                    "for guidance/question/correction — info never wakes. "
+                    "The response's wake.effect says what happened: "
+                    "wake_pending / promoted / none_running / "
+                    "status_ineligible / dependency_blocked."
+                ),
+                "default": False,
+            },
+            "supersedes": {
+                "type": "integer",
+                "description": (
+                    "Comment id this one replaces. The old comment is "
+                    "marked superseded (kept for audit, never edited). "
+                    "Required for kind=correction. Must be alive and on "
+                    "the same task."
+                ),
+            },
+            "in_reply_to": {
+                "type": "integer",
+                "description": (
+                    "Comment id this answers — normally the id of a "
+                    "kind='question' comment. An answered question stops "
+                    "blocking kanban_complete."
+                ),
+            },
             "board": _board_schema_prop(),
         },
         "required": ["task_id", "body"],
@@ -2102,10 +2371,14 @@ READ_TASK_THREAD_SCHEMA = {
         "Read a task's comment thread incrementally. Pass ``since`` = the "
         "``last_comment_id`` from your previous call to get only NEW "
         "comments (your startup context already contains the thread as it "
-        "was at spawn time). Call this BEFORE kanban_block and BEFORE "
-        "kanban_complete: if the manager asked you something mid-run "
-        "(a comment with [question] from another profile), answer it via "
-        "kanban_comment and keep working instead of finishing past it."
+        "was at spawn time). Each comment carries kind / superseded_by / "
+        "in_reply_to / wake_effect, and the response's ``open_questions`` "
+        "lists ids of unanswered kind='question' comments — they block "
+        "kanban_complete until answered (kanban_comment with "
+        "in_reply_to=<id>) or superseded. Call this BEFORE kanban_block "
+        "and BEFORE kanban_complete: if the manager asked you something "
+        "mid-run, answer it via kanban_comment(in_reply_to=...) and keep "
+        "working instead of finishing past it."
     ),
     "parameters": {
         "type": "object",
@@ -2255,7 +2528,11 @@ KANBAN_CREATE_SCHEMA = {
                 "description": (
                     "Opening post: full spec, acceptance criteria, "
                     "links. The assigned worker reads this as part of "
-                    "its context."
+                    "its context. The response includes body_sha256 of "
+                    "the STORED body — verify it against your own "
+                    "sha256(body) if the body is long/critical; a "
+                    "mismatch means the card must be corrected via a "
+                    "comment."
                 ),
             },
             "parents": {

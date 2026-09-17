@@ -288,6 +288,43 @@ parent, missing input, unmet capability) before unblocking, or raise
 `BLOCK_RECURRENCE_LIMIT` if the loop is expected.
 :::
 
+## Typed comments {#typed-comments}
+
+Comment threads are the orchestrator↔worker channel, so comments carry a
+machine-readable type (all parameters optional — a plain `kanban_comment`
+behaves exactly as before):
+
+- **`kind`** — `info` (default, plain note), `guidance` (directive / course
+  correction), `question` (requires an answer), `correction` (replaces a
+  stale comment; requires `supersedes=<comment id>`).
+- **`wake=true`** — also deliver the comment to a **running** assignee
+  mid-run through the same wake circuit `message_agent` uses, instead of
+  waiting for its next checkpoint. Not allowed for `info` (anti-noise). The
+  response reports the wake effect (`wake_pending`, `promoted`,
+  `none_running`, `status_ineligible`, `dependency_blocked`).
+- **`in_reply_to=<comment id>`** — answer a specific comment. An answered
+  question stops blocking completion.
+- **`supersedes=<comment id>`** — mark the old comment as outdated. The old
+  row is never edited or deleted (audit stays intact); readers see a
+  `⚠️superseded→#N` pointer to the replacement.
+
+**Completion gate:** a task with an unanswered `question` comment cannot be
+completed — `kanban_complete` returns a tool error listing the open question
+ids (with authors and age). Answer each with `kanban_comment(in_reply_to=…)`
+or supersede a withdrawn question with
+`kanban_comment(kind="correction", supersedes=…)`, then retry. The CLI
+mirrors this: `hermes kanban comment <id> <text> --kind question
+--in-reply-to N --supersedes M`.
+
+`read_task_thread` returns `kind` / `superseded_by` / `in_reply_to` /
+`wake_effect` per comment plus an `open_questions` aggregate, and the
+spawn-time worker context renders kind badges, reply/supersede pointers and
+`❓OPEN` markers so a fresh worker sees the state of the thread at a glance.
+
+`kanban_create` returns `body_sha256` — the SHA-256 of the stored body. If a
+long or critical card body matters, verify it against your own hash of what
+you sent; a mismatch means the stored card needs a correcting comment.
+
 ## How workers interact with the board
 
 **Workers do not shell out to `hermes kanban`.** When the dispatcher spawns a worker it sets `HERMES_KANBAN_TASK=t_abcd` in the child's env, and that env var flips on a dedicated **kanban toolset** in the model's schema. The same toolset is also available to orchestrator profiles that enable `kanban` in their toolsets config. These tools read and mutate the board directly via the Python `kanban_db` layer, same as the CLI does. A running worker calls these like any other tool; it never sees or needs the `hermes kanban` CLI.
@@ -301,7 +338,7 @@ parent, missing input, unmet capability) before unblocking, or raise
 | `kanban_request_changes` | Reviewer verdict from an active review run. Closes that run, reapplies parent gating, and routes the task to its original implementer without block-loop accounting. | `reason` |
 | `kanban_block` | Stop work and route by why: `kind=dependency` (waits in `todo`, auto-resumes), `needs_input`/`capability`/`transient` (surface to a human). Repeated same-kind re-blocks auto-escalate to `triage`. | `reason` |
 | `kanban_heartbeat` | Signal liveness during long operations. Pure side-effect. | — |
-| `kanban_comment` | Append a durable note to the task thread. | `task_id`, `body` |
+| `kanban_comment` | Append a durable note to the task thread. Optional `kind` (`info` / `guidance` / `question` / `correction`), `wake`, `supersedes`, `in_reply_to` — see [Typed comments](#typed-comments). | `task_id`, `body` |
 | `kanban_attach` | Attach a file to a task by passing its bytes inline (base64); stored under the task's attachments dir (25 MB cap). | file bytes + name |
 | `kanban_attach_url` | Attach a file to a task by URL. | `url` |
 | `kanban_attachments` | List a task's attachments. | — |

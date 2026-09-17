@@ -1588,7 +1588,10 @@ _MESSAGE_AGENT_SCHEMA = {
     "name": "message_agent",
     "description": (
         "Soft-deliver a durable message to an assigned agent's Kanban task. "
-        "Guidance and questions request wake by default; info does not."
+        "Guidance and questions request wake by default; info does not. "
+        "kanban_comment(kind, wake) runs the same delivery + wake circuit "
+        "in one call — prefer it when the message belongs in the visible "
+        "thread with typed semantics (question gate, supersede, replies)."
     ),
     "parameters": {
         "type": "object",
