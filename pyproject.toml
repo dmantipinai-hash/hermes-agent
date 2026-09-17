@@ -442,9 +442,16 @@ py-modules = [
 ]
 
 [tool.setuptools.packages.find]
-include = ["agent", "agent.*", "tools", "tools.*", "hermes_cli", "hermes_cli.*", "gateway", "gateway.*", "tui_gateway", "tui_gateway.*", "cron", "cron.*", "acp_adapter", "plugins", "plugins.*", "providers", "providers.*"]
+include = ["agent", "agent.*", "tools", "tools.*", "hermes_cli", "hermes_cli.*", "gateway", "gateway.*", "tui_gateway", "tui_gateway.*", "cron", "cron.*", "acp_adapter", "plugins", "plugins.*", "providers", "providers.*", "locales"]
 
 [tool.setuptools.package-data]
+# agent/i18n.py resolves catalogs as <parent-of-agent>/locales: repo root for
+# checkouts, site-packages for wheel installs. The empty locales/__init__.py
+# (see its docstring) makes the dir packageable so wheels ship the catalogs;
+# without them t() returns raw dotted keys and localized runtime messages —
+# e.g. kanban notifier wake notes — lose their entire payload
+# (BUG-kanban-wake-empty-payload, 2026-09-17).
+locales = ["*.yaml"]
 hermes_cli = ["observability/schemas/*.json", "data/*.json"]
 # gateway/assets/ ships status_phrases.yaml and the Telegram BotFather
 # screenshot. Without this, sealed venvs (uv2nix) silently lose both —

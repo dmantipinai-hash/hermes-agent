@@ -140,3 +140,63 @@ def test_locales_dir_env_override_ignored_when_missing(tmp_path, monkeypatch):
     assert result.name == "locales"
 
 
+# ---------------------------------------------------------------------------
+# Wheel-packaging contract (BUG-kanban-wake-empty-payload, 2026-09-17).
+#
+# agent/i18n.py resolves catalogs as <parent-of-agent>/locales. In a wheel
+# install that is site-packages/locales — a top-level data dir that setuptools
+# only ships when it is declared as a package. When the declaration (or the
+# __init__.py marker) is lost, wheels install with NO catalogs: t() then
+# returns raw dotted keys, and the kanban notifier's wake notes arrive as
+# `gateway.kanban.wake.message ...` with the task id, title, status and
+# handoff payload silently dropped — the woken agent cannot tell what woke
+# it. These tests pin the two halves of that contract.
+# ---------------------------------------------------------------------------
+
+
+def test_locales_dir_is_a_declared_package():
+    """The catalog dir must carry the packaging marker.
+
+    Deleting the marker re-breaks wheel builds (catalogs vanish) while every
+    source-checkout test keeps passing — exactly how the bug shipped.
+    """
+    assert (LOCALES_DIR / "__init__.py").is_file()
+
+
+def test_kanban_wake_keys_render_with_payload():
+    """Every wake-note key the kanban notifier references must resolve and
+    interpolate its payload — the woken agent's ONLY cue about what happened
+    (raw-key output means an information-free wake turn)."""
+    cases = {
+        "gateway.kanban.wake.message": dict(
+            task_id="t_deadbeef",
+            status="completed",
+            title="Fix the thing",
+            assignee="brokk",
+            board="main",
+        ),
+        "gateway.kanban.wake.handoff": dict(summary="did the work"),
+    }
+    plain_keys = [
+        "gateway.kanban.wake.guidance",
+        "gateway.kanban.wake.completed",
+        "gateway.kanban.wake.gave_up",
+        "gateway.kanban.wake.crashed",
+        "gateway.kanban.wake.timed_out",
+        "gateway.kanban.wake.blocked",
+        "gateway.kanban.wake.status_joiner",
+        "gateway.kanban.wake.status_default",
+    ]
+    rendered = i18n.t("gateway.kanban.wake.message", **cases["gateway.kanban.wake.message"])
+    # Resolved template, not a bare key, and the payload survived formatting.
+    assert "t_deadbeef" in rendered
+    assert "Fix the thing" in rendered
+    assert rendered != "gateway.kanban.wake.message"
+    handoff = i18n.t("gateway.kanban.wake.handoff", summary="did the work")
+    assert "did the work" in handoff
+    assert handoff != "gateway.kanban.wake.handoff"
+    for key in plain_keys:
+        value = i18n.t(key)
+        assert value and value != key, f"missing translation for {key}"
+
+
