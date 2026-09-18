@@ -475,7 +475,7 @@ def _current_author_label() -> str:
 
     Dispatcher-spawned workers always carry ``HERMES_PROFILE``; a root
     orchestrator on the default profile does not, which used to collapse
-    every one of its comments into an anonymous "worker" (ТЗ §1.3 — in a
+    every one of his comments into an anonymous "worker" (ТЗ §1.3 — in a
     mixed thread the orchestrator and the worker were indistinguishable).
     Resolve, in order: explicit env → the active profile inferred from
     HERMES_HOME → "default".
@@ -489,6 +489,30 @@ def _current_author_label() -> str:
         return get_active_profile_name() or "default"
     except Exception:
         return "default"
+
+
+def _unknown_assignee_warning(assignee: str) -> Optional[str]:
+    """Warning text when ``assignee`` names no existing profile, else None.
+
+    Shared by the tool and the CLI create paths so both surfaces warn
+    identically. Profile introspection failures return None (no warning):
+    a missing profiles module must never block card creation.
+    """
+    try:
+        from hermes_cli import profiles as _profiles
+
+        canonical = _profiles.normalize_profile_name(assignee)
+        if _profiles.profile_exists(canonical):
+            return None
+        known = ", ".join(sorted(p.name for p in _profiles.list_profiles()))
+        return (
+            f"assignee '{assignee}' is not an existing profile "
+            f"(known: {known}). The dispatcher only spawns tasks for "
+            f"existing profiles — this card will sit unclaimed until the "
+            f"profile is created or the assignee is corrected."
+        )
+    except Exception:
+        return None
 
 
 def _require_orchestrator_tool(tool_name: str) -> Optional[str]:
@@ -1628,6 +1652,12 @@ def _handle_create(args: dict, **kw) -> str:
             "assignee is required — name the profile that should execute this "
             "task (the dispatcher will only spawn tasks with an assignee)"
         )
+    # Diagnostics П1 (2026-09-19): a card pointed at a non-existent profile
+    # is silently unspawnable — the dispatcher filters by profile_exists and
+    # never tells the author (t_a5b0cfb8/assignee=loki idled until noticed
+    # manually). Warn loudly at creation; deliberately NOT an error, because
+    # creating cards before their profiles exist is a legitimate workflow.
+    assignee_warning = _unknown_assignee_warning(str(assignee))
     body = args.get("body")
     parents = args.get("parents") or []
     tenant = args.get("tenant") or os.environ.get("HERMES_TENANT")
@@ -1749,6 +1779,7 @@ def _handle_create(args: dict, **kw) -> str:
                 workspace_path=new_task.workspace_path if new_task else None,
                 project_id=new_task.project_id if new_task else None,
                 subscribed=subscribed,
+                assignee_warning=assignee_warning,
                 body_sha256=(
                     hashlib.sha256(stored_body.encode("utf-8")).hexdigest()
                     if stored_body is not None
@@ -1947,6 +1978,49 @@ def _handle_link(args: dict, **kw) -> str:
     except Exception as e:
         logger.exception("kanban_link failed")
         return tool_error(f"kanban_link: {e}")
+
+
+def _handle_unlink(args: dict, **kw) -> str:
+    """Remove a parent→child dependency edge after the fact.
+
+    Diagnostics П2 (2026-09-19): the CLI could remove an edge but the agent
+    surface could only add one — an orchestrator that mis-linked cards
+    (semantic parent/child deadlock, 18.09) had no way to un-link and had
+    to work around the topology semantically. The mistake must be
+    reversible by the same actor who made it.
+    """
+    delegated_err = _reject_delegated_child_mutation("kanban_unlink")
+    if delegated_err:
+        return delegated_err
+    parent_id = args.get("parent_id")
+    child_id = args.get("child_id")
+    if not parent_id or not child_id:
+        return tool_error("both parent_id and child_id are required")
+    board = args.get("board")
+    try:
+        kb, conn = _connect(board=board)
+        try:
+            removed = kb.unlink_tasks(
+                conn, parent_id=parent_id, child_id=child_id
+            )
+            if not removed:
+                return tool_error(
+                    f"kanban_unlink: no dependency edge {parent_id} -> "
+                    f"{child_id} exists"
+                )
+            child = kb.get_task(conn, child_id)
+            return _ok(
+                parent_id=parent_id,
+                child_id=child_id,
+                child_status=child.status if child else None,
+            )
+        finally:
+            conn.close()
+    except ValueError as e:
+        return tool_error(f"kanban_unlink: {e}")
+    except Exception as e:
+        logger.exception("kanban_unlink failed")
+        return tool_error(f"kanban_unlink: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -2520,7 +2594,9 @@ KANBAN_CREATE_SCHEMA = {
                     "Profile name that should execute this task "
                     "(e.g. 'researcher-a', 'reviewer', 'writer'). "
                     "Required — tasks without an assignee are never "
-                    "dispatched."
+                    "dispatched. Must name an EXISTING profile: the "
+                    "response carries assignee_warning (and the card "
+                    "sits unclaimed) when it doesn't."
                 ),
             },
             "body": {
@@ -2720,6 +2796,26 @@ KANBAN_LINK_SCHEMA = {
     },
 }
 
+KANBAN_UNLINK_SCHEMA = {
+    "name": "kanban_unlink",
+    "description": (
+        "Remove a parent→child dependency edge — the inverse of "
+        "kanban_link. Use it to undo a mis-link (e.g. a child that was "
+        "supposed to be a parallel input, not a dependency). The child's "
+        "promotion eligibility is re-evaluated immediately: with no "
+        "remaining unfinished parents it promotes to 'ready'."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "parent_id": {"type": "string", "description": "Parent task id of the edge to remove."},
+            "child_id":  {"type": "string", "description": "Child task id of the edge to remove."},
+            "board": _board_schema_prop(),
+        },
+        "required": ["parent_id", "child_id"],
+    },
+}
+
 
 # ---------------------------------------------------------------------------
 # Registration
@@ -2859,4 +2955,13 @@ registry.register(
     handler=_handle_link,
     check_fn=_check_kanban_mode,
     emoji="🔗",
+)
+
+registry.register(
+    name="kanban_unlink",
+    toolset="kanban",
+    schema=KANBAN_UNLINK_SCHEMA,
+    handler=_handle_unlink,
+    check_fn=_check_kanban_mode,
+    emoji="⛓️",
 )

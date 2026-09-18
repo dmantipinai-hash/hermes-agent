@@ -12885,6 +12885,21 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
             )
             lines.append("")
 
+    # Turn protocol (2026-09-19, diagnostics triage П3): a clean exit without
+    # a terminal call is recorded as a protocol violation and the task is
+    # restarted from scratch — workers learned this only after losing a run
+    # (#73 and two more violations on 18–19.09). Every worker reads this
+    # context at spawn, so the rule travels with the task. Constant string —
+    # the render stays deterministic for a given board snapshot.
+    lines.append("## Turn protocol")
+    lines.append(
+        "End EVERY run with a terminal call: kanban_complete (with summary), "
+        "kanban_block (with kind+reason), or kanban_request_review. Ending "
+        "your turn without one is a protocol violation: the run is marked "
+        "and the task restarts from scratch, discarding this run's work."
+    )
+    lines.append("")
+
     return "\n".join(lines).rstrip() + "\n"
 
 

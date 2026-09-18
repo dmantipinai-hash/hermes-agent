@@ -1602,6 +1602,32 @@ def _cmd_create(args: argparse.Namespace) -> int:
     else:
         print(f"Created {task_id}  ({task.status}, assignee={task.assignee or '-'})")
 
+        # Diagnostics П1 (2026-09-19): an unknown assignee is silently
+        # unspawnable (the dispatcher filters by profile_exists). Warn on
+        # every surface; not an error — cards may legitimately precede
+        # their profiles.
+        try:
+            from hermes_cli.profiles import (
+                list_profiles,
+                normalize_profile_name,
+                profile_exists,
+            )
+
+            if not profile_exists(normalize_profile_name(task.assignee or "")):
+                known = ", ".join(
+                    sorted(p.name for p in list_profiles())
+                )
+                print(
+                    f"kanban: WARNING: assignee '{task.assignee}' is not an "
+                    f"existing profile (known: {known}). The dispatcher only "
+                    f"spawns tasks for existing profiles — this card will "
+                    f"sit unclaimed until the profile is created or the "
+                    f"assignee is corrected.",
+                    file=sys.stderr,
+                )
+        except Exception:
+            pass
+
         # Warn when the task would sit in `ready` because no dispatcher is
         # present. Only warn on ready+assigned tasks — triage/todo are
         # expected to sit idle until promoted, and unassigned tasks
