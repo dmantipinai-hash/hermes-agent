@@ -10819,6 +10819,21 @@ def _record_task_failure(
         ).fetchone()
         if row is None:
             return False
+        # Terminal-task guard (2026-09-19, phantom-timeout bug): a done task
+        # must never receive failure events, counter bumps or retry planning
+        # from LATE observers of an already-closed run. Field case
+        # t_3326ae69: the worker landed kanban_complete on its final budget
+        # iteration, then finalize_turn's budget-exhausted fallback recorded
+        # a ``timed_out`` 8 seconds AFTER ``completed`` — the CAS in
+        # ``_end_run`` kept the run closed (the event carried run_id NULL),
+        # but the event, a fresh ``consecutive_failures`` bump (the counter
+        # had just been cleared by the completion) and the retry_status
+        # still landed on the done task and later woke the orchestrator
+        # with a false timeout. Guarding here closes the whole class: a
+        # failure recorded against a terminal task is noise by definition —
+        # its lifecycle is over and no retry will ever be dispatched.
+        if row["status"] in ("done", "archived"):
+            return False
         retry_status = (
             _retry_status_for_run(conn, task_id, row["current_run_id"])
             if release_claim
