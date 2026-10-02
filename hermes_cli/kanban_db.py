@@ -6889,7 +6889,7 @@ def _complete_task(
     )
     with write_txn(conn):
         task_row = conn.execute(
-            "SELECT status, current_run_id FROM tasks WHERE id = ?",
+            "SELECT status, current_run_id, assignee FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
         if task_row is None or task_row["status"] not in {
@@ -6906,12 +6906,41 @@ def _complete_task(
             and current_run_id != int(expected_run_id)
         ):
             return False
-        pending_message_ids = _unresponded_mailbox_message_ids(
-            conn,
-            task_id=task_id,
-            run_id=current_run_id,
-            blocking_only=True,
-        )
+        # Mailbox gate recipient scoping (field deadlock 29.09, t_ffd496a5):
+        # the gate demands a response attempt FROM THE CURRENT RUN, but mail
+        # is addressed per-profile — a guidance sent to the previous owner
+        # (pre-reassign) can never be delivered to or answered by this run,
+        # so counting it blocked kanban_complete forever (4× blocked events
+        # on Forseti's run; Loki had to reassign back to Tor to release the
+        # card). Scope the gate to mail addressed to the CURRENT run's
+        # profile (falling back to the task's canonical assignee for manual
+        # CLI completions with no live run) — mirroring the recipient filter
+        # try_close_mailbox_intake already applies. Same-profile retries keep
+        # the existing semantics: mail is re-delivered each run and each run
+        # must acknowledge it. No live addressee at all → skip the gate.
+        gate_recipient = None
+        if current_run_id is not None:
+            run_row = conn.execute(
+                "SELECT profile FROM task_runs WHERE id = ?",
+                (current_run_id,),
+            ).fetchone()
+            gate_recipient = (
+                str(run_row["profile"]).strip()
+                if run_row is not None and run_row["profile"]
+                else None
+            )
+        if gate_recipient is None:
+            gate_recipient = _canonical_assignee(task_row["assignee"])
+        if gate_recipient is not None:
+            pending_message_ids = _unresponded_mailbox_message_ids(
+                conn,
+                task_id=task_id,
+                run_id=current_run_id,
+                recipient_profile=gate_recipient,
+                blocking_only=True,
+            )
+        else:
+            pending_message_ids = []
         if pending_message_ids:
             _append_event(
                 conn,
