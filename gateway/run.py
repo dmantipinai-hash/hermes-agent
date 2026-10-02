@@ -13582,9 +13582,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 for key, entry in list(self.session_store._entries.items()):
                     if entry.expiry_finalized:
                         continue
-                    if not await self.async_session_store._is_session_expired(entry):
+                    # The reason ("idle"/"daily") drives the loud warning
+                    # below: the daily leg wipes mid-work autonomous sessions
+                    # by wall clock (field case 27–28.09.2026, ~04:00 — the
+                    # orchestrator lost context AND granted approvals while
+                    # kanban workers ran in separate processes).
+                    _reason = self.session_store.session_expiry_reason(entry)
+                    if _reason is None:
                         continue
-                    _expired_entries.append((key, entry))
+                    _expired_entries.append((key, entry, _reason))
 
                 if _expired_entries:
                     # Extract platform names from session keys for a compact summary.
@@ -13602,7 +13608,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         len(_expired_entries), _plat_summary,
                     )
 
-                for key, entry in _expired_entries:
+                for key, entry, _reason in _expired_entries:
+                    if _reason == "daily":
+                        # Visibility (field case 27–28.09.2026): the daily leg
+                        # fires by wall clock and finalization drops context
+                        # AND granted approvals — for an autonomously working
+                        # session (board workers live in separate processes)
+                        # this reads as a random 4am wipe. WARN so the cause
+                        # lands in errors.log instead of an INFO line nobody
+                        # reads, with the config knob that turns it off.
+                        logger.warning(
+                            "Session expiry: finalizing %s by the DAILY leg of "
+                            "session_reset (at_hour leg fires by wall clock). "
+                            "Conversation context AND granted approvals are "
+                            "dropped — an autonomously working session loses "
+                            "its permissions and starts re-requesting them. "
+                            "If that is unwanted, set session_reset.mode: none "
+                            "(or idle-only) in config.yaml.",
+                            entry.session_key,
+                        )
                     try:
                         try:
                             _parts = key.split(":")

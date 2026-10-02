@@ -2323,19 +2323,23 @@ class SessionStore:
                     entry.session_id, exc,
                 )
     
-    def _is_session_expired(self, entry: SessionEntry) -> bool:
-        """Check if a session has expired based on its reset policy.
-        
-        Works from the entry alone — no SessionSource needed.
-        Used by the background expiry watcher to proactively flush memories.
-        Sessions with active background processes are never considered expired.
+    def session_expiry_reason(self, entry: SessionEntry) -> Optional[str]:
+        """Return which reset-policy leg expires ``entry``: "idle", "daily", or None.
+
+        Same logic as :meth:`_is_session_expired` (which delegates here), split
+        out so the expiry watcher can tell the legs apart: the ``daily`` leg
+        fires by wall clock even while an autonomous overnight session is
+        mid-work (kanban/board workers are separate processes, so the
+        active-process guard can't see them) and finalization drops the
+        conversation context AND granted approvals. The watcher warns loudly
+        on that leg; idle expiry is routine and stays quiet.
         """
         if self._has_active_processes_safe(entry.session_key, context="expiry"):
             logger.debug(
                 "Session %s not expired — active background processes",
                 entry.session_key,
             )
-            return False
+            return None
 
         policy = self.config.get_reset_policy(
             platform=entry.platform,
@@ -2343,14 +2347,14 @@ class SessionStore:
         )
 
         if policy.mode == "none":
-            return False
+            return None
 
         now = _now()
 
         if policy.mode in {"idle", "both"}:
             idle_deadline = entry.updated_at + timedelta(minutes=policy.idle_minutes)
             if now > idle_deadline:
-                return True
+                return "idle"
 
         if policy.mode in {"daily", "both"}:
             today_reset = now.replace(
@@ -2360,9 +2364,18 @@ class SessionStore:
             if now.hour < policy.at_hour:
                 today_reset -= timedelta(days=1)
             if entry.updated_at < today_reset:
-                return True
+                return "daily"
 
-        return False
+        return None
+
+    def _is_session_expired(self, entry: SessionEntry) -> bool:
+        """Check if a session has expired based on its reset policy.
+
+        Works from the entry alone — no SessionSource needed.
+        Used by the background expiry watcher to proactively flush memories.
+        Sessions with active background processes are never considered expired.
+        """
+        return self.session_expiry_reason(entry) is not None
 
     def is_session_finalizable(self, entry: SessionEntry) -> bool:
         """Return True if the expiry watcher will *ever* finalize this session.
