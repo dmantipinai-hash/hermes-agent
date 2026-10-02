@@ -218,6 +218,10 @@ class GatewayKanbanWatchersMixin:
         # archived, so the subscription stays alive and later review
         # cycles keep notifying.
         TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked", "block_loop_detected", "review_requested")
+        # Event kinds that participate in the agent wake. Anything NOT in
+        # this tuple notifies via text ping only (see the dedup block in the
+        # notifier loop). Kept a tuple: membership tests only.
+        _NOTIFIER_WAKE_KINDS = ("completed", "gave_up", "crashed", "timed_out", "blocked")
         # Subscriptions are removed only when the task reaches the irreversible
         # archived status. ``done`` is reversible in review/controller flows,
         # so removing its subscription would silence a later reopen. We used
@@ -648,7 +652,8 @@ class GatewayKanbanWatchersMixin:
                         # creator is woken via the self-post below instead.
                         from gateway.wake import adapter_supports_push
 
-                        if not adapter_supports_push(adapter) and wake_agent:
+                        _push_ok = adapter_supports_push(adapter)
+                        if not _push_ok and wake_agent:
                             logger.debug(
                                 "kanban notifier: adapter %s has no push "
                                 "channel; skipping text ping for %s, relying "
@@ -666,6 +671,36 @@ class GatewayKanbanWatchersMixin:
                             # below is the sole delivery — the failure counter
                             # is resolved (reset or bumped) by the wake
                             # outcome there, not by skipping the send here.
+                            continue
+                        # Dedup (Рост feedback №5/№6, 27.09.2026): on a push
+                        # adapter whose subscription wakes an agent, the
+                        # woken agent's reply IS the user-facing notification
+                        # — a separate text ping delivered the same status
+                        # twice (measured ~0.4M tokens/week of redundant ack
+                        # turns). Suppress the ping for wake-covered kinds;
+                        # kinds that never wake (status / review_requested /
+                        # block_loop_detected) keep their ping, and completed
+                        # artifacts still upload below. The wake below becomes
+                        # the cursor anchor (rewind on failure), so a failed
+                        # wake retries instead of silently dropping the event.
+                        _ping_suppressed = (
+                            _push_ok and wake_agent and kind in _NOTIFIER_WAKE_KINDS
+                        )
+                        if _ping_suppressed:
+                            if kind == "completed":
+                                try:
+                                    await self._deliver_kanban_artifacts(
+                                        adapter=adapter,
+                                        chat_id=sub["chat_id"],
+                                        metadata=metadata,
+                                        event_payload=getattr(ev, "payload", None),
+                                        task=task,
+                                    )
+                                except Exception as art_exc:
+                                    logger.debug(
+                                        "kanban notifier: artifact delivery for %s failed: %s",
+                                        sub["task_id"], art_exc,
+                                    )
                             continue
                         try:
                             _send_res = await adapter.send(
@@ -759,9 +794,8 @@ class GatewayKanbanWatchersMixin:
                         #   claim exactly like a failed send() above, so the
                         #   next tick retries.
                         task_terminal = task and task.status == "archived"
-                        _WAKE_KINDS = ("completed", "gave_up", "crashed", "timed_out", "blocked")
                         _wake_kinds = (
-                            {ev.kind for ev in d["events"] if ev.kind in _WAKE_KINDS}
+                            {ev.kind for ev in d["events"] if ev.kind in _NOTIFIER_WAKE_KINDS}
                             if wake_agent
                             else set()
                         )
@@ -923,15 +957,18 @@ class GatewayKanbanWatchersMixin:
                                 sub["task_id"], platform_str, sub["chat_id"], sub_profile or "default", _wake_kinds,
                             )
 
-                        if _is_push_adapter and not send_passive and _wake_kinds:
-                            # Wake-only (delivery_mode='wake') push sub: the
-                            # text ping was intentionally skipped above, so
-                            # the wake IS the sole delivery. It must succeed
-                            # BEFORE the cursor advances — advancing first
-                            # would let a failed wake (previously swallowed
-                            # by the best-effort except below) permanently
-                            # lose the event. Mirrors the non-push
-                            # (api_server) self-post ordering above.
+                        if _is_push_adapter and wake_agent and _wake_kinds:
+                            # Wake delivery anchor (Рост feedback №5/№6,
+                            # 27.09.2026): on push adapters every
+                            # wake-capable subscription — wake-only AND
+                            # notify+wake (whose text ping for wake kinds is
+                            # suppressed above) — anchors the cursor on the
+                            # wake injection succeeding. Advancing first
+                            # would let a failed wake permanently lose the
+                            # event; a failure here rewinds the claim exactly
+                            # like a failed send(), so the next tick retries.
+                            # Mirrors the non-push (api_server) self-post
+                            # ordering above.
                             try:
                                 await _push_wake()
                                 sub_fail_counts.pop(sub_key, None)
@@ -965,11 +1002,12 @@ class GatewayKanbanWatchersMixin:
                                     )
                                 continue
 
-                        # Delivery complete (text ping for push adapters, wake
-                        # self-post for non-push, wake injection for wake-only
-                        # push subs): advance cursor. The cursor is the dedup
-                        # mechanism — it prevents re-delivery of the same
-                        # event on subsequent ticks.
+                        # Delivery complete (wake injection for wake-capable
+                        # push subs, text ping for ping-only kinds and plain
+                        # notify subs, wake self-post for non-push): advance
+                        # cursor. The cursor is the dedup mechanism — it
+                        # prevents re-delivery of the same event on
+                        # subsequent ticks.
                         await asyncio.to_thread(
                             self._kanban_advance, sub, d["cursor"], board_slug,
                         )
@@ -977,28 +1015,6 @@ class GatewayKanbanWatchersMixin:
                             # Nothing left to deliver on this path (the wake,
                             # if any, already succeeded above).
                             sub_fail_counts.pop(sub_key, None)
-                        # Unsubscribe only on archive. Completion (``done``)
-                        # remains reversible: controllers reopen completed
-                        # work for review corrections and continuation. The
-                        # retained cursor prevents replay while preserving the
-                        # original delivery and wake ownership for that cycle.
-                        if _is_push_adapter and send_passive and _wake_kinds:
-                            # notify+wake: the text ping above was the
-                            # delivery and the cursor has advanced; the wake
-                            # injection stays best-effort.
-                            try:
-                                await _push_wake()
-                            except Exception as _wk_err:
-                                # Best-effort: the notification itself already
-                                # delivered and the cursor has advanced, so a
-                                # broken wake path must not wedge the tick — but
-                                # log at WARNING with a traceback rather than
-                                # DEBUG so a persistently-failing wake is visible
-                                # in normal logs instead of silently no-op'ing.
-                                logger.warning(
-                                    "kanban notifier: wakeup injection failed for %s: %s",
-                                    sub["task_id"], _wk_err, exc_info=True,
-                                )
                         if task_terminal:
                             await asyncio.to_thread(
                                 self._kanban_unsub, sub, board_slug,

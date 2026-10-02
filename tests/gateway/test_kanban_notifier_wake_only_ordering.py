@@ -155,9 +155,33 @@ def test_wake_only_failure_rewinds_and_redelivers(tmp_path, monkeypatch):
     assert list(runner2._kanban_sub_fail_counts.values()) == [2]
 
 
-def test_notify_wake_failure_stays_best_effort(tmp_path, monkeypatch):
-    """notify+wake: text ping IS the delivery; failed wake must NOT rewind."""
-    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "notify-wake.db"))
+def test_notify_wake_dedups_ping_and_anchors_on_wake(tmp_path, monkeypatch):
+    """notify+wake (Рост feedback №5/№6, 27.09.2026): on a push adapter the
+    woken agent's reply IS the user-facing notification — the text ping for
+    wake-covered kinds is suppressed (it used to duplicate every status
+    message), and the cursor anchors on the wake succeeding."""
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "notify-wake-ok.db"))
+    kb.init_db()
+    tid = _make_completed_task("notify+wake")
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert adapter.sent == [], (
+        "notify+wake must not send a duplicate text ping for wake kinds"
+    )
+    assert len(adapter.handled) == 1, "wake injection is the delivery"
+    assert _unseen_terminal_events(tid) == [], (
+        "cursor must advance after a successful wake"
+    )
+    assert runner._kanban_sub_fail_counts == {}
+
+
+def test_notify_wake_failure_rewinds_and_retries(tmp_path, monkeypatch):
+    """notify+wake: a failed wake rewinds the claim (event retried next
+    tick) instead of advancing on a text ping that no longer exists."""
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "notify-wake-fail.db"))
     kb.init_db()
     tid = _make_completed_task("notify+wake")
 
@@ -165,17 +189,48 @@ def test_notify_wake_failure_stays_best_effort(tmp_path, monkeypatch):
     runner = _make_runner(adapter)
     asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
 
-    assert len(adapter.sent) == 1, "text ping delivered"
-    assert len(adapter.handled) == 1, "wake attempted best-effort"
-    assert _unseen_terminal_events(tid) == [], (
-        "notify+wake: cursor advances on text delivery; a failed wake is "
-        "best-effort and must not rewind"
+    assert adapter.sent == [], "no ping in the deduped notify+wake mode"
+    assert len(adapter.handled) == 1, "one wake attempt"
+    assert len(_unseen_terminal_events(tid)) == 1, (
+        "failed wake must rewind so the event is redelivered, not lost"
     )
-    assert runner._kanban_sub_fail_counts == {}, (
-        "best-effort wake failure must not bump the send-failure counter"
+    assert list(runner._kanban_sub_fail_counts.values()) == [1]
+    assert len(_subs(tid)) == 1, "one transient failure must not drop the sub"
+
+
+def test_notify_wake_ping_only_kinds_still_ping(tmp_path, monkeypatch):
+    """Kinds that never wake (status/review_requested/block_loop_detected)
+    keep their visible text ping — the dedup must not silence them."""
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "notify-wake-status.db"))
+    kb.init_db()
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn,
+            title="status ping task",
+            assignee="worker",
+            session_id="agent:main:telegram:dm:chat-1",
+        )
+        kb.add_notify_sub(
+            conn,
+            task_id=tid,
+            platform="telegram",
+            chat_id="chat-1",
+            chat_type="dm",
+            delivery_mode="notify+wake",
+        )
+        kb._append_event(conn, tid, "status", {"status": "review"})
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert len(adapter.sent) == 1, (
+        "non-wake kinds keep their text ping under the dedup"
     )
-    # (The sub itself unsubscribes because the task reached 'done' —
-    # pre-existing task_terminal behavior, unrelated to the wake outcome.)
+    assert adapter.handled == [], "a status event must not wake the agent"
 
 
 def test_wake_only_failure_cap_drops_subscription(tmp_path, monkeypatch):

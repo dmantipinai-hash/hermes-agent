@@ -117,14 +117,9 @@ def test_kanban_notifier_replays_telegram_dm_topic_delivery_metadata(tmp_path, m
     runner = _make_runner(adapter)
     asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
 
-    assert len(adapter.sent) == 1
-    assert adapter.sent[0]["metadata"] == {
-        "chat_type": "dm",
-        "direct_messages_topic_id": "20197",
-        "telegram_dm_topic_reply_fallback": True,
-        "telegram_reply_to_message_id": "462",
-        "thread_id": "20197",
-    }
+    # Dedup (Рост feedback 27.09): notify+wake sends no text ping for wake
+    # kinds — the wake must carry the DM-topic routing from the sub row.
+    assert adapter.sent == []
     assert len(adapter.handled) == 1
     assert adapter.handled[0].source.chat_type == "dm"
     assert adapter.handled[0].source.thread_id == "20197"
@@ -390,10 +385,9 @@ def test_notifier_subscription_survives_done_reopen_until_archive(
     runner._active_profile_name = lambda: "reviewer"
     asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
 
-    assert len(adapter.sent) == 1
+    # Dedup (27.09): the completion is a wake kind — wake only, no ping.
+    assert adapter.sent == []
     assert len(adapter.handled) == 1
-    assert adapter.sent[0]["chat_id"] == "origin-chat"
-    assert adapter.sent[0]["metadata"]["thread_id"] == "origin-thread"
     assert adapter.handled[0].source.thread_id == "origin-thread"
     assert adapter.handled[0].source.profile == "reviewer"
 
@@ -410,7 +404,7 @@ def test_notifier_subscription_survives_done_reopen_until_archive(
     runner = _make_runner(adapter)
     runner._active_profile_name = lambda: "reviewer"
     asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
-    assert len(adapter.sent) == 1
+    assert adapter.sent == []
     assert len(adapter.handled) == 1
 
     conn = kb.connect()
@@ -426,9 +420,9 @@ def test_notifier_subscription_survives_done_reopen_until_archive(
     runner._active_profile_name = lambda: "reviewer"
     asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
 
-    # The reopen status and second completion each deliver once, while only
-    # completion wakes the exact original session/thread.
-    assert len(adapter.sent) == 3
+    # The reopen 'status' event is a ping-only kind (one visible ping, no
+    # wake); the second completion is a wake kind (wake, no ping).
+    assert len(adapter.sent) == 1
     assert len(adapter.handled) == 2
     assert all(item["chat_id"] == "origin-chat" for item in adapter.sent)
     assert adapter.handled[-1].source.thread_id == "origin-thread"
@@ -449,7 +443,7 @@ def test_notifier_subscription_survives_done_reopen_until_archive(
 
     # Archive itself is intentionally silent, but consumes its event and
     # removes the subscription so no later historical event can replay.
-    assert len(adapter.sent) == 3
+    assert len(adapter.sent) == 1
     assert len(adapter.handled) == 2
     conn = kb.connect()
     try:
@@ -486,7 +480,8 @@ def test_notifier_wakeup_uses_subscription_chat_type(tmp_path, monkeypatch):
     adapter = RecordingAdapter()
     asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
 
-    assert len(adapter.sent) == 1
+    # Dedup (27.09): wake kind — no text ping, the wake is the delivery.
+    assert adapter.sent == []
     assert len(adapter.handled) == 1
     assert adapter.handled[0].source.chat_type == "dm"
 

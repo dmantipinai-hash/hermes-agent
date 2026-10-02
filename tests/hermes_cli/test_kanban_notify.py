@@ -204,8 +204,10 @@ def test_child_task_inherits_parent_chat_type(kanban_home):
 
 @pytest.mark.asyncio
 async def test_notifier_notify_plus_wake_sends_and_wakes(kanban_home):
-    """notify+wake delivers the passive message AND wakes the agent; a plain
-    notify sub only sends. The agent is woken only for the notify+wake sub."""
+    """notify+wake (dedup, Рост feedback 27.09): the wake is the sole
+    delivery for wake kinds — no duplicate passive ping; a plain notify sub
+    still sends its passive message. The agent is woken only for the
+    notify+wake sub."""
     import hermes_cli.kanban_db as kb
     from gateway.run import GatewayRunner
     from gateway.config import Platform
@@ -256,10 +258,13 @@ async def test_notifier_notify_plus_wake_sends_and_wakes(kanban_home):
             timeout=10.0,
         )
 
-    # Both subs still get a passive send (notify AND notify+wake send).
-    assert len(sent_msgs) == 2
+    # Dedup (Рост feedback №5/№6, 27.09): only the plain notify sub sends a
+    # passive ping; the notify+wake sub's wake turn IS its notification.
+    assert len(sent_msgs) == 1
     assert any("passive block" in m for m in sent_msgs)
-    assert any("active block" in m for m in sent_msgs)
+    assert not any("active block" in m for m in sent_msgs), (
+        "notify+wake must not duplicate the status with a text ping"
+    )
     # Only the notify+wake sub woke the agent, exactly once.
     wake_mock.assert_awaited_once()
     assert active_tid in wake_mock.await_args.kwargs["text"]
