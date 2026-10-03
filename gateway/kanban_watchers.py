@@ -217,11 +217,11 @@ class GatewayKanbanWatchersMixin:
         # but is not a block (see kanban_db.request_review); the task is not
         # archived, so the subscription stays alive and later review
         # cycles keep notifying.
-        TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked", "block_loop_detected", "review_requested")
+        TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked", "block_loop_detected", "review_requested", "blocker_triage_done")
         # Event kinds that participate in the agent wake. Anything NOT in
         # this tuple notifies via text ping only (see the dedup block in the
         # notifier loop). Kept a tuple: membership tests only.
-        _NOTIFIER_WAKE_KINDS = ("completed", "gave_up", "crashed", "timed_out", "blocked")
+        _NOTIFIER_WAKE_KINDS = ("completed", "gave_up", "crashed", "timed_out", "blocked", "blocker_triage_done")
         # Subscriptions are removed only when the task reaches the irreversible
         # archived status. ``done`` is reversible in review/controller flows,
         # so removing its subscription would silence a later reopen. We used
@@ -564,6 +564,28 @@ class GatewayKanbanWatchersMixin:
                             if ev.payload and ev.payload.get("reason"):
                                 reason = f": {str(ev.payload['reason'])[:160]}"
                             msg = f"⏸ {board_tag}{tag}Kanban {sub['task_id']} blocked{reason}"
+                        elif kind == "blocker_triage_done":
+                            # Ф2: the async digest pass answered a needs_input
+                            # block. Subscribers (the orchestrator among them)
+                            # get the SHORT digest instead of dissecting the
+                            # raw thread themselves.
+                            if ev.payload and ev.payload.get("skipped"):
+                                continue  # dedup/stale markers carry no news
+                            from hermes_cli.kanban_triage import (
+                                render_triage_wake_message,
+                            )
+                            digest = ""
+                            if ev.payload and ev.payload.get("digest"):
+                                digest = str(ev.payload["digest"])
+                            if not digest:
+                                digest = "(дайджест недоступен — открой трейд карточки)"
+                            msg = render_triage_wake_message(
+                                digest,
+                                task_id=sub["task_id"],
+                                board_tag=board_tag,
+                                assignee_tag=tag,
+                            )
+                            wake_handoff = digest[:200]
                         elif kind == "gave_up":
                             err = ""
                             if ev.payload and ev.payload.get("error"):
@@ -1493,7 +1515,7 @@ class GatewayKanbanWatchersMixin:
                 # re-ran the migration on a second connection, racing
                 # the first. See the matching comment in
                 # `_kanban_notifier_watcher` and issue #21378.
-                return _kb.dispatch_once(
+                result = _kb.dispatch_once(
                     conn,
                     board=slug,
                     max_spawn=max_spawn,
@@ -1504,6 +1526,26 @@ class GatewayKanbanWatchersMixin:
                     max_in_progress_per_profile=max_in_progress_per_profile,
                     reconcile_orphans=reconcile_orphans,
                 )
+                # Ф2 (Локи 03.10): answer pending blocker_needs_triage events
+                # with a heuristic digest comment + a blocker_triage_done
+                # event the notifier wakes subscribers with. Same conn and
+                # board scope as the tick; its own try so a triage failure
+                # never fails the tick itself.
+                if _kb.blocker_triage_enabled():
+                    try:
+                        from hermes_cli import kanban_triage as _kt
+                        _triaged = _kt.process_pending_triage(conn, board=slug)
+                        for _t in _triaged:
+                            if not _t.get("skipped"):
+                                logger.info(
+                                    "kanban triage: digest posted for %s (comment %s)",
+                                    _t.get("task_id"), _t.get("comment_id"),
+                                )
+                    except Exception:
+                        logger.exception(
+                            "kanban triage: pass failed on board %s", slug
+                        )
+                return result
             except sqlite3.DatabaseError as exc:
                 if _is_corrupt_board_db_error(exc):
                     disabled_corrupt_boards[slug] = (fingerprint, time.monotonic())

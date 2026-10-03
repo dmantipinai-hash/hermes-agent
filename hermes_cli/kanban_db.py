@@ -8046,6 +8046,18 @@ def block_task(
                 },
                 run_id=run_id,
             )
+            # Ф2 (Локи 03.10): a needs_input block carries the worker's own
+            # analysis (options, prices, risks) that the orchestrator then
+            # has to dissect from the raw thread. Flag the block for the
+            # async triage digest (kanban_triage.process_pending_triage);
+            # loop-detected blocks above intentionally skip this — triage
+            # routing already forces a human decision there.
+            if kind == "needs_input" and blocker_triage_enabled():
+                _append_event(
+                    conn, task_id, "blocker_needs_triage",
+                    {"reason": reason, "run_id": run_id},
+                    run_id=run_id,
+                )
         _blocked_task = get_task(conn, task_id)
     _fire_kanban_lifecycle_hook(
         "kanban_task_blocked",
@@ -8487,6 +8499,25 @@ def autounblock_on_guidance_enabled() -> bool:
         return bool(
             (load_config() or {}).get("kanban", {}).get(
                 "autounblock_on_guidance", True
+            )
+        )
+    except Exception:
+        return True
+
+
+def blocker_triage_enabled() -> bool:
+    """Return whether needs_input blocks get an async digest (Ф2, Локи 03.10).
+
+    Default true. When on, ``block_task(kind='needs_input')`` also emits a
+    ``blocker_needs_triage`` event; the dispatcher tick's triage pass answers
+    it with a structured digest comment + a ``blocker_triage_done`` event that
+    the notifier delivers (with wake) to the card's subscribers.
+    """
+    try:
+        from hermes_cli.config import load_config
+        return bool(
+            (load_config() or {}).get("kanban", {}).get(
+                "blocker_triage_enabled", True
             )
         )
     except Exception:
