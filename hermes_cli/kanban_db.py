@@ -8474,6 +8474,153 @@ def _landing_status_after_parents(conn: sqlite3.Connection, task_id: str) -> str
     return "todo" if undone_parents else "ready"
 
 
+def autounblock_on_guidance_enabled() -> bool:
+    """Return whether a guidance comment auto-resolves its card (Ф1, Локи 03.10).
+
+    Default true: the second gesture (explicit ``kanban_unblock`` after the
+    decision is already published as a guidance comment) is the redundant hop
+    this closes. Operators can disable it for boards where every transition
+    must stay manual.
+    """
+    try:
+        from hermes_cli.config import load_config
+        return bool(
+            (load_config() or {}).get("kanban", {}).get(
+                "autounblock_on_guidance", True
+            )
+        )
+    except Exception:
+        return True
+
+
+def guidance_unblock_in_txn(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    comment_id: int,
+    author: str,
+    body: str,
+) -> Optional[dict]:
+    """Apply the side effect of a ``guidance`` comment (Ф1, nested in the
+    caller's write txn).
+
+    Two transitions, both keyed to who the commenter is relative to the card:
+
+    * ``blocked`` + ``block_kind='needs_input'`` + commenter ≠ assignee → the
+      guidance IS the decision the card was waiting for: same core as
+      :func:`unblock_task` (dangling-run reclaim, parent re-gating, failure
+      counter reset, recurrence counter preserved) + an ``unblocked`` event
+      carrying ``via='guidance'`` and the comment id.
+    * ``review`` + commenter == the reviewer provenance of the latest
+      ``review_requested`` event → route the card back to the implementer
+      (``changes_requested`` semantics, no active reviewer run to close).
+
+    Only ``needs_input`` auto-unblocks: ``dependency`` waits on a foreign card
+    (a decision here changes nothing) and ``transient``/``capability`` may need
+    the live world, not text. A worker commenting guidance on its own blocked
+    card is refused (self-service would bypass the authority the block exists
+    to demand). Idempotency is the status itself: the transition runs inside
+    the comment's transaction, so one comment → at most one transition, and a
+    repeat guidance lands on an already-resumed card as a no-op (None).
+    """
+    author_canonical = _canonical_assignee(author) or (author or "").strip()
+    with write_txn(conn, allow_nested=True):
+        row = conn.execute(
+            "SELECT status, block_kind, assignee FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if row is None:
+            return None
+
+        if row["status"] == "blocked" and row["block_kind"] == "needs_input":
+            assignee = _canonical_assignee(row["assignee"])
+            if not author_canonical or author_canonical == assignee:
+                return None
+            now = int(time.time())
+            _reclaim_dangling_run(
+                conn, task_id, statuses=("blocked", "scheduled"), now=now,
+                note="invariant recovery on guidance unblock",
+            )
+            new_status = _landing_status_after_parents(conn, task_id)
+            cur = conn.execute(
+                "UPDATE tasks SET status = ?, current_run_id = NULL, "
+                "consecutive_failures = 0, last_failure_error = NULL "
+                "WHERE id = ? AND status = 'blocked'",
+                (new_status, task_id),
+            )
+            if cur.rowcount != 1:
+                return None
+            _append_event(
+                conn, task_id, "unblocked",
+                {
+                    "via": "guidance",
+                    "comment_id": int(comment_id),
+                    "author": author,
+                    "status": new_status,
+                },
+            )
+            return {"effect": "unblocked", "status": new_status}
+
+        if row["status"] == "review":
+            requested_event = conn.execute(
+                "SELECT payload FROM task_events "
+                "WHERE task_id = ? AND kind = 'review_requested' "
+                "ORDER BY id DESC LIMIT 1",
+                (task_id,),
+            ).fetchone()
+            if requested_event is None:
+                return None
+            try:
+                payload = (
+                    json.loads(requested_event["payload"])
+                    if requested_event["payload"]
+                    else {}
+                )
+            except (json.JSONDecodeError, TypeError):
+                payload = {}
+            if not isinstance(payload, dict):
+                payload = {}
+            implementer = payload.get("implementer")
+            reviewer = payload.get("reviewer")
+            if not isinstance(implementer, str) or not implementer.strip():
+                return None
+            reviewer_canonical = _canonical_assignee(reviewer)
+            # Only the reviewer's guidance routes the card back — the
+            # implementer commenting on their own review request must not.
+            if not author_canonical or author_canonical != reviewer_canonical:
+                return None
+            new_status = _landing_status_after_parents(conn, task_id)
+            cur = conn.execute(
+                "UPDATE tasks SET status = ?, assignee = ?, "
+                "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL "
+                "WHERE id = ? AND status = 'review'",
+                (new_status, implementer.strip(), task_id),
+            )
+            if cur.rowcount != 1:
+                return None
+            reason_line = next(
+                (ln.strip() for ln in (body or "").strip().splitlines() if ln.strip()),
+                "",
+            )[:200]
+            _append_event(
+                conn, task_id, "changes_requested",
+                {
+                    "via": "guidance_comment",
+                    "comment_id": int(comment_id),
+                    "reason": reason_line or None,
+                    "implementer": implementer.strip(),
+                    "reviewer": reviewer,
+                    "status": new_status,
+                },
+            )
+            return {
+                "effect": "returned_for_rework",
+                "status": new_status,
+                "implementer": implementer.strip(),
+            }
+        return None
+
+
 def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
     """Transition ``blocked``/``scheduled`` to its safe resumable phase.
 
@@ -12742,6 +12889,7 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     # attempts get collapsed into a one-line marker so the worker knows
     # more exist without bloating the prompt.
     all_prior = [r for r in list_runs(conn, task_id) if r.ended_at is not None]
+
     # list_runs returns ascending by started_at; "most recent" = last N
     if len(all_prior) > _CTX_MAX_PRIOR_ATTEMPTS:
         omitted = len(all_prior) - _CTX_MAX_PRIOR_ATTEMPTS

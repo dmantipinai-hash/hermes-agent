@@ -1319,12 +1319,35 @@ def _handle_comment(args: dict, **kw) -> str:
                     )
                     wake_payload["effect"] = sent.wake_effect
 
+                # Ф1 (Локи 03.10): a guidance comment IS the decision a
+                # needs_input block (or a review handoff) was waiting for —
+                # resolve the card in the same transaction instead of making
+                # the orchestrator repeat itself with kanban_unblock /
+                # kanban_request_changes. None = comment landed on a card in
+                # a state where guidance has no transition to make.
+                guidance_effect = None
+                if kind == "guidance" and kb.autounblock_on_guidance_enabled():
+                    try:
+                        guidance_effect = kb.guidance_unblock_in_txn(
+                            conn,
+                            tid,
+                            comment_id=cid,
+                            author=author,
+                            body=str(body),
+                        )
+                    except Exception:
+                        logger.exception(
+                            "kanban_comment: guidance auto-resolve failed"
+                        )
+
             response: dict[str, Any] = {
                 "task_id": tid,
                 "comment_id": cid,
                 "kind": kind,
                 "wake": wake_payload,
             }
+            if guidance_effect is not None:
+                response["guidance_effect"] = guidance_effect
             if superseded_old is not None:
                 response["superseded"] = superseded_old
             if in_reply_to is not None:
