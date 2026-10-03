@@ -8352,6 +8352,38 @@ class AIAgent:
                     function_result = f"{function_result}\n\n{note}"
             except Exception:
                 logger.debug("awareness: observe_tool_result failed", exc_info=True)
+        # Ф3 (Локи 03.10): kanban worker checkpoint reminder. At ≥2/3 of the
+        # iteration budget, once per session, the worker is nudged to commit
+        # its work-in-progress and leave a handoff comment — so a budget/timeout
+        # death hands the retry a starting point instead of a blind restart.
+        # Same delivery shape as the awareness note above: new tokens in this
+        # NEW tool result, past context untouched (prompt cache invariant).
+        # Non-kanban agents skip on the env check alone.
+        if (
+            not getattr(self, "_kanban_checkpoint_reminded", False)
+            and os.environ.get("HERMES_KANBAN_TASK")
+        ):
+            try:
+                from hermes_cli.kanban_db import timeout_handoff_enabled
+
+                if timeout_handoff_enabled():
+                    budget = getattr(self, "iteration_budget", None)
+                    used = getattr(budget, "used", 0) or 0
+                    max_total = getattr(budget, "max_total", 0) or 0
+                    if max_total >= 3 and used * 3 >= max_total * 2:
+                        self._kanban_checkpoint_reminded = True
+                        note = (
+                            f"⚠ Бюджет итераций на исходе ({used}/{max_total}). "
+                            "Закончи текущий шаг и сразу зафиксируй состояние: "
+                            "1) закоммить всё сделанное в git воркспейса; "
+                            "2) оставь комментарий в карточке задачи "
+                            "(kanban_comment): что сделано, где остановился, "
+                            "что делать дальше. Если бюджета не хватит — "
+                            "следующий ран начнёт с твоей передатки, а не с нуля."
+                        )
+                        function_result = f"{function_result}\n\n{note}"
+            except Exception:
+                logger.debug("kanban checkpoint reminder failed", exc_info=True)
         return function_result
 
     def _guardrail_block_result(self, decision: ToolGuardrailDecision) -> str:

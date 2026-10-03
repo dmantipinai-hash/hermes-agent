@@ -8524,6 +8524,24 @@ def blocker_triage_enabled() -> bool:
         return True
 
 
+def timeout_handoff_enabled() -> bool:
+    """Return whether timeout retries get a handoff (Ф3, Локи 03.10).
+
+    Default true. Two parts, one flag: the ≥2/3-budget checkpoint reminder the
+    worker's own loop injects (see run_agent._append_guardrail_observation),
+    and the «ПЕРЕДАТКА» section build_worker_context prepends for a retry
+    after a non-completed run (last comment + workspace git status + worker
+    log tail).
+    """
+    try:
+        from hermes_cli.config import load_config
+        return bool(
+            (load_config() or {}).get("kanban", {}).get("timeout_handoff", True)
+        )
+    except Exception:
+        return True
+
+
 def guidance_unblock_in_txn(
     conn: sqlite3.Connection,
     task_id: str,
@@ -12828,6 +12846,102 @@ def run_daemon(
 # Worker context builder (what a spawned worker sees)
 # ---------------------------------------------------------------------------
 
+def _redact_handoff_text(text: str) -> str:
+    """Redact secrets from handoff lines (git status / log tail)."""
+    try:
+        from agent.redact import redact_sensitive_text
+
+        return redact_sensitive_text(text or "", force=True)
+    except Exception:
+        return text or ""
+
+
+def _build_timeout_handoff_section(
+    conn: sqlite3.Connection, task: Task, prior_runs: list
+) -> list[str]:
+    """«ПЕРЕДАТКА» lines for a retry after a non-completed run (Ф3.2).
+
+    Returns [] when the latest finished run ended in a sane handoff state
+    (completed / blocked / changes_requested / review_requested) — those
+    already carry their own handoff. Only timeout / budget-death / crash /
+    reclaim style outcomes get the section. Everything here is best-effort
+    and bounded: the caller wraps it so a broken workspace or a missing log
+    can never break the spawn.
+    """
+    if not prior_runs:
+        return []
+    last = prior_runs[-1]
+    outcome = (last.outcome or "").strip()
+    _HANDOFF_OUTCOMES = {
+        "timed_out", "failed", "crashed", "reclaimed", "interrupted",
+    }
+    if outcome not in _HANDOFF_OUTCOMES:
+        return []
+
+    lines: list[str] = [
+        "## ПЕРЕДАТКА (предыдущий ран умер без завершения)",
+        f"Последний ран завершился как `{outcome}` — его наработка может лежать "
+        "в воркспейсе незакоммиченной. Начни с осмотра состояния ниже, не с нуля:",
+        "",
+    ]
+
+    comments = list_comments(conn, task.id)
+    if comments:
+        last_c = comments[-1]
+        first_line = next(
+            (ln.strip() for ln in (last_c.body or "").splitlines() if ln.strip()),
+            "",
+        )
+        if first_line:
+            lines.append(
+                f"- последний комментарий (#{last_c.id} от {last_c.author}): "
+                f"{first_line[:200]}"
+            )
+    else:
+        lines.append("- комментариев в карточке нет")
+
+    workspace = resolve_workspace(task)
+    if workspace and os.path.isdir(workspace):
+        git_dir = workspace / ".git"
+        if git_dir.exists():
+            try:
+                proc = subprocess.run(
+                    ["git", "-C", str(workspace), "status", "--short", "--branch"],
+                    capture_output=True, text=True, timeout=10, check=False,
+                )
+                status_out = (proc.stdout or "").strip()
+                if status_out:
+                    lines.append("- git воркспейса (не всё закоммичено):")
+                    for ln in status_out.splitlines()[:15]:
+                        lines.append(f"      {_redact_handoff_text(ln)[:160]}")
+                else:
+                    lines.append("- git воркспейса: чисто (наработка, возможно, закоммичена)")
+            except Exception:
+                lines.append("- git воркспейса: status недоступен")
+        else:
+            lines.append("- воркспейс не является git-репозиторием")
+
+    log_path = worker_logs_dir() / f"{task.id}.log"
+    if log_path.exists():
+        try:
+            raw = log_path.read_bytes()[-4000:]
+            tail = raw.decode("utf-8", errors="replace").splitlines()[-30:]
+            tail = [ln.rstrip() for ln in tail if ln.strip()]
+            if tail:
+                lines.append(f"- хвост лога прошлого рана ({log_path.name}):")
+                for ln in tail:
+                    lines.append(f"      {_redact_handoff_text(ln)[:200]}")
+        except Exception:
+            pass
+
+    lines.append(
+        "- если наработка валидна — переиспользуй её и закоммить; если нет — "
+        "кратко зафиксируй в комментарии, что именно негодно."
+    )
+    lines.append("")
+    return lines
+
+
 def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     """Return the full text a worker should read to understand its task.
 
@@ -12921,6 +13035,21 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     # more exist without bloating the prompt.
     all_prior = [r for r in list_runs(conn, task_id) if r.ended_at is not None]
 
+    # Ф3 (Локи 03.10): «ПЕРЕДАТКА» — retry handoff after a run that died
+    # without completing (timeout/budget/crash/reclaim). The previous worker's
+    # on-disk legacy exists but was invisible: the retry started blind and
+    # humans bridged the gap with manual comment handoffs. This section
+    # surfaces the three things the задание named — last comment, workspace
+    # git status, tail of the worker log — before the prior-attempts detail,
+    # so the retry starts from a handoff. Best-effort: any failure here must
+    # never break the spawn itself.
+    if timeout_handoff_enabled():
+        try:
+            _handoff_lines = _build_timeout_handoff_section(conn, task, all_prior)
+            if _handoff_lines:
+                lines.extend(_handoff_lines)
+        except Exception:
+            _log.debug("worker context: handoff section failed", exc_info=True)
     # list_runs returns ascending by started_at; "most recent" = last N
     if len(all_prior) > _CTX_MAX_PRIOR_ATTEMPTS:
         omitted = len(all_prior) - _CTX_MAX_PRIOR_ATTEMPTS
