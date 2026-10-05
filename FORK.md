@@ -12,14 +12,21 @@ upstream release**.
 ## Version lineage — read this before touching versions
 
 - **The fork has its own release line: `v1.1` and onward** (GitHub Releases
-  of this repository). Current release: **`v1.11` (2026-09-17) — the
-  typed-orchestration release**: typed kanban comments (info / guidance /
-  question / correction, machine question-gate on completion, supersede,
-  in-reply threads), profile attribution in worker threads, wake delivery
-  of course corrections to running workers through the mailbox circuit,
-  card-body readback hashes, and locale catalogs shipped in wheels (kanban
-  wake notes arrive with their full payload). `v1.1` (2026-08-31) was the
-  first released snapshot carrying Architecture 2.0 — memory v2, soft
+  of this repository). Current release: **`v1.12` (2026-10-05) — the
+  orchestration-autonomy release**: guidance comments auto-resolve
+  `needs_input` blocks (and route a reviewer's guidance back to the
+  implementer), `needs_input` blockers get a structured triage digest
+  posted to the card plus a short digest wake to subscribers, and workers
+  get a ≥2/3-budget checkpoint reminder plus a retry handoff (last comment
+  + workspace git status + worker log tail) after a run dies mid-work.
+  Also carries the late-September/early-October delivery fixes (deduped
+  notify+wake, leg-aware session expiry, mailbox completion-gate deadlock)
+  and the published kanban/memory maintenance skills. `v1.11` (2026-09-17)
+  — the typed-orchestration release (typed kanban comments, machine
+  question-gate, supersede, in-reply threads, profile attribution, wake
+  delivery of course corrections, card-body readback hashes, locale
+  catalogs in wheels). `v1.1` (2026-08-31) was
+  the first released snapshot carrying Architecture 2.0 — memory v2, soft
   message delivery, orchestration, awareness (DETECT→RECORD + tension
   map), and token-economy insights.
   Future releases continue this line; users update **from this repository
